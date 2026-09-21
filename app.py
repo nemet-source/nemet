@@ -511,8 +511,8 @@ elif menu == "📋 Historial de Cotizaciones (Folios)":
             busqueda = st.text_input("🔍 Buscar por Folio o Cliente:")
             if busqueda:
                 df_hist = df_hist[
-                    df_hist["Funcionario"].astype(str).str.contains(busqueda, case=False, na=False) |
-                    df_hist["Cliente"].astype(str).str.contains(busqueda, case=False, na=False)
+                    df_hist["Cliente"].astype(str).str.contains(busqueda, case=False, na=False) |
+                    df_hist["Folio"].astype(str).str.contains(busqueda, case=False, na=False)
                 ]
             st.dataframe(df_hist, use_container_width=True)
             st.metric("Total de Cotizaciones Emitidas", len(df_hist))
