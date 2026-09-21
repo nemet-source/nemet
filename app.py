@@ -44,10 +44,9 @@ if "carrito_area" not in st.session_state:
 
 df_inv = st.session_state["inventario"]
 
-# Función auxiliar para enviar correos electrónicos con PDF adjunto
+# Función robusta para envío de correos con Gmail (Puerto 587 + STARTTLS + UTF-8)
 def enviar_correo_cotizacion(destinatario, nombre_cliente, pdf_bytes, nombre_archivo):
     try:
-        # Obtenemos las credenciales desde los secretos seguros de Streamlit o variables de entorno
         remitente = st.secrets["email"]["remitente"]
         password = st.secrets["email"]["password"]
         
@@ -56,17 +55,16 @@ def enviar_correo_cotizacion(destinatario, nombre_cliente, pdf_bytes, nombre_arc
         msg['To'] = destinatario
         msg['Subject'] = f"Cotización Oficial - Sistema Maestro NEMET ({nombre_cliente})"
         
-        cuerpo = f"""
-        Estimado/a {nombre_cliente},
-        
-        Adjunto a este correo encontrará la cotización oficial solicitada con los detalles de nuestros productos químicos y especialidades epóxicas de Sistema Maestro NEMET.
-        
-        Agradecemos su preferencia. Quedamos a sus órdenes para cualquier duda o aclaración.
-        
-        Atentamente,
-        Sistema Maestro NEMET
-        """
-        msg.attach(MIMEText(cuerpo, 'plain'))
+        cuerpo = f"""Estimado/a {nombre_cliente},
+
+Adjunto a este correo encontrará la cotización oficial solicitada con los detalles de nuestros productos químicos y especialidades epóxicas de Sistema Maestro NEMET.
+
+Agradecemos su preferencia. Quedamos a sus órdenes para cualquier duda o aclaración.
+
+Atentamente,
+Sistema Maestro NEMET
+"""
+        msg.attach(MIMEText(cuerpo, 'plain', 'utf-8'))
         
         # Adjuntar PDF
         parte_adjunta = MIMEBase('application', 'octet-stream')
@@ -75,7 +73,7 @@ def enviar_correo_cotizacion(destinatario, nombre_cliente, pdf_bytes, nombre_arc
         parte_adjunta.add_header('Content-Disposition', f'attachment; filename="{nombre_archivo}"')
         msg.attach(parte_adjunta)
         
-        # Conexión SMTP (Ejemplo configurado para Gmail)
+        # Conexión SMTP segura con puerto 587 y STARTTLS
         servidor = smtplib.SMTP('smtp.gmail.com', 587)
         servidor.starttls()
         servidor.login(remitente, password)
