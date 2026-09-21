@@ -42,7 +42,6 @@ def cargar_inventario():
             except Exception:
                 df = pd.read_excel(EXCEL_FILE, header=1)
             
-            # Limpiar columnas vacías o Unnamed
             df = df.loc[:, ~df.columns.str.contains("^Unnamed", na=False)]
             df.columns = df.columns.astype(str).str.strip()
             
@@ -441,6 +440,18 @@ elif menu == "📝 Cotizador Comercial Profesional":
 
 elif menu == "📋 Historial de Cotizaciones (Folios)":
     st.subheader("Historial y Auditoría de Cotizaciones")
+    
+    # Botón para limpiar todo el historial de Excel
+    if st.button("🗑️ Borrar Todo el Historial de Cotizaciones"):
+        try:
+            df_vacio = pd.DataFrame(columns=["Folio", "Fecha", "Cliente", "Detalle_Productos", "Total"])
+            with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+                df_vacio.to_excel(writer, sheet_name="Historial_Cotizaciones", index=False)
+            st.success("¡Historial de cotizaciones limpiado exitosamente!")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Error al limpiar el historial: {e}")
+
     try:
         df_hist = pd.read_excel(EXCEL_FILE, sheet_name="Historial_Cotizaciones")
         if not df_hist.empty:
