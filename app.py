@@ -20,10 +20,10 @@ st.set_page_config(
 EXCEL_FILE = "Sistema_Inventario_NEMET_Final.xlsx"
 
 # ==========================================
-# FUNCIONES DE CARGA Y GESTIÓN DE DATOS
+# FUNCIONES DE CARGA Y GESTIÓN DE DATOS (BLINDADA)
 # ==========================================
 def cargar_inventario():
-    """Carga de forma inteligente el inventario desde Excel sincronizando encabezados."""
+    """Carga de forma inteligente el inventario normalizando nombres de columnas."""
     try:
         if os.path.exists(EXCEL_FILE):
             try:
@@ -31,8 +31,44 @@ def cargar_inventario():
             except Exception:
                 df = pd.read_excel(EXCEL_FILE)
             
-            if not df.empty and 'SKU' in df.columns:
+            # Limpiar espacios en nombres de columnas si los hay
+            df.columns = df.columns.astype(str).str.strip()
+            
+            # Mapeo inteligente de columnas comunes por si varían en el Excel
+            renombres = {}
+            for col in df.columns:
+                col_lower = col.lower()
+                if 'sku' in col_lower:
+                    renombres[col] = 'SKU'
+                elif 'desc' in col_lower:
+                    renombres[col] = 'Descripcion'
+                elif 'presentacion' in col_lower or 'presentación' in col_lower:
+                    renombres[col] = 'Presentacion'
+                elif 'precio' in col_lower and ('publico' in col_lower or 'iva' in col_lower or 'venta' in col_lower):
+                    renombres[col] = 'PrecioPublicoIVA'
+                elif 'stock' in col_lower and 'actual' in col_lower:
+                    renombres[col] = 'StockActual'
+                elif 'stock' in col_lower and 'inicial' in col_lower:
+                    renombres[col] = 'StockInicial'
+                elif 'entrada' in col_lower:
+                    renombres[col] = 'Entradas'
+                elif 'salida' in col_lower:
+                    renombres[col] = 'Salidas'
+            
+            df = df.rename(columns=renombres)
+            
+            # Asegurar columnas mínimas requeridas para que no falle nada
+            if 'SKU' in df.columns:
                 df['SKU'] = df['SKU'].astype(str)
+            if 'PrecioPublicoIVA' not in df.columns:
+                # Buscar cualquier columna numérica de precio si no se mapeó exacto
+                for c in df.columns:
+                    if 'precio' in c.lower():
+                        df['PrecioPublicoIVA'] = pd.to_numeric(df[c], errors='coerce').fillna(0.0)
+                        break
+                if 'PrecioPublicoIVA' not in df.columns:
+                    df['PrecioPublicoIVA'] = 0.0
+
             return df
         else:
             st.error(f"No se encontró el archivo {EXCEL_FILE} en la carpeta.")
@@ -42,7 +78,6 @@ def cargar_inventario():
         return pd.DataFrame()
 
 def obtener_siguiente_folio():
-    """Genera un folio consecutivo basado en el historial guardado en Excel."""
     try:
         df_hist = pd.read_excel(EXCEL_FILE, sheet_name="Historial_Cotizaciones")
         num = len(df_hist) + 1
@@ -52,7 +87,6 @@ def obtener_siguiente_folio():
     return f"COT-{anio_actual}-{num:03d}"
 
 def registrar_cotizacion_en_excel(folio, cliente, items_carrito, total_general):
-    """Registra la cotización generada en una hoja del archivo Excel de inventario."""
     try:
         try:
             df_hist = pd.read_excel(EXCEL_FILE, sheet_name="Historial_Cotizaciones")
@@ -80,7 +114,7 @@ def registrar_cotizacion_en_excel(folio, cliente, items_carrito, total_general):
         print(f"Error al guardar historial: {e}")
         return False
 
-# Inicializar estados de sesión
+# Inicializar estados
 if "inventario" not in st.session_state or st.session_state["inventario"].empty:
     st.session_state["inventario"] = cargar_inventario()
 
@@ -93,15 +127,8 @@ if "carrito_area" not in st.session_state:
 df_inv = st.session_state["inventario"]
 
 # ==========================================
-# ESTILOS Y MENÚ PRINCIPAL
+# MENÚ Y NAVEGACIÓN
 # ==========================================
-st.markdown("""
-    <style>
-    .main-header { font-size: 2.2rem; color: #1E3A8A; font-weight: bold; }
-    .sub-header { font-size: 1.3rem; color: #3B82F6; font-weight: 600; }
-    </style>
-""", unsafe_allow_html=True)
-
 st.sidebar.title("📂 Menú Principal")
 menu = st.sidebar.selectbox("Navegación", [
     "📊 Dashboard & Resumen", 
@@ -111,12 +138,9 @@ menu = st.sidebar.selectbox("Navegación", [
     "📋 Historial de Cotizaciones (Folios)"
 ])
 
-# ==========================================
-# 1. DASHBOARD & RESUMEN
-# ==========================================
 if menu == "📊 Dashboard & Resumen":
-    st.markdown('<p class="main-header">🧪 SISTEMA MAESTRO NEMET</p>', unsafe_allow_html=True)
-    st.markdown('<p class="sub-header">Panel General de Control y Logística</p>', unsafe_allow_html=True)
+    st.title("🧪 Sistema Maestro NEMET")
+    st.subheader("Panel General de Control y Logística")
     
     if st.button("🔄 Sincronizar Datos con Excel"):
         st.session_state["inventario"] = cargar_inventario()
@@ -136,56 +160,21 @@ if menu == "📊 Dashboard & Resumen":
     st.markdown("### 🔍 Vista Rápida del Inventario Sincronizado")
     st.dataframe(df_inv, use_container_width=True)
 
-# ==========================================
-# 2. CONTROL DE INVENTARIO Y EDICIÓN
-# ==========================================
 elif menu == "📦 Control de Inventario y Edición":
-    st.markdown('<p class="sub-header">Gestión, Entradas, Salidas y Edición Directa</p>', unsafe_allow_html=True)
+    st.subheader("Gestión, Entradas, Salidas y Edición Directa")
+    df_editado = st.data_editor(df_inv, num_rows="dynamic", use_container_width=True, key="editor_inv")
     
-    tab1, tab2 = st.tabs(["✏️ Editor Directo de Inventario", "➕ Registrar Movimiento Rápido"])
-    
-    with tab1:
-        st.markdown("Modifica celdas, existencias o precios directamente y guarda los cambios de inmediato en Excel.")
-        df_editado = st.data_editor(df_inv, num_rows="dynamic", use_container_width=True, key="editor_inv")
-        
-        if st.button("💾 Guardar Cambios en Excel"):
-            try:
-                with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
-                    df_editado.to_excel(writer, sheet_name="Inventario", index=False)
-                st.session_state["inventario"] = df_editado
-                st.success("¡Inventario actualizado y guardado exitosamente!")
-            except Exception as e:
-                st.error(f"Error al guardar: {e}")
+    if st.button("💾 Guardar Cambios en Excel"):
+        try:
+            with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+                df_editado.to_excel(writer, sheet_name="Inventario", index=False)
+            st.session_state["inventario"] = df_editado
+            st.success("¡Inventario actualizado y guardado exitosamente!")
+        except Exception as e:
+            st.error(f"Error al guardar: {e}")
 
-    with tab2:
-        if not df_inv.empty and 'SKU' in df_inv.columns:
-            opciones_sku = [f"{row['SKU']} - {row['Descripcion']} ({row['Presentacion']})" for _, row in df_inv.iterrows()]
-            sku_sel = st.selectbox("Seleccione el Producto", opciones_sku)
-            sku_codigo = sku_sel.split(" - ")[0]
-            
-            tipo_mov = st.radio("Tipo de Movimiento", ["Entrada (Compra/Producción)", "Salida (Venta/Merma)"])
-            cantidad = st.number_input("Cantidad", min_value=1, value=1)
-            
-            if st.button("Aplicar Movimiento al Stock"):
-                idx = df_inv[df_inv['SKU'].astype(str) == sku_codigo].index[0]
-                if "Entrada" in tipo_mov:
-                    df_inv.loc[idx, 'Entradas'] += cantidad
-                else:
-                    df_inv.loc[idx, 'Salidas'] += cantidad
-                
-                df_inv.loc[idx, 'StockActual'] = df_inv.loc[idx, 'StockInicial'] + df_inv.loc[idx, 'Entradas'] - df_inv.loc[idx, 'Salidas']
-                
-                st.session_state["inventario"] = df_inv
-                with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
-                    df_inv.to_excel(writer, sheet_name="Inventario", index=False)
-                st.success("¡Movimiento registrado y guardado en Excel con éxito!")
-                st.rerun()
-
-# ==========================================
-# 3. COTIZADOR POR ÁREA Y MILIMÉTRICO
-# ==========================================
 elif menu == "📏 Cotizador por Área y Milimétrico":
-    st.markdown('<p class="sub-header">Cotizador por Área, Espesor y Proporción de Mezcla</p>', unsafe_allow_html=True)
+    st.subheader("Cotizador por Área, Espesor y Proporción de Mezcla")
     
     with st.expander("📦 Consultar Inventario General"):
         st.dataframe(df_inv, use_container_width=True)
@@ -203,31 +192,33 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
 
     st.info(f"📐 **Área Total Calculada:** **{area_total:.2f} m²**")
 
-    familias = df_inv['Descripcion'].unique() if 'Descripcion' in df_inv.columns else []
+    # Asegurar columna Descripción válida
+    col_desc = 'Descripcion' if 'Descripcion' in df_inv.columns else df_inv.columns[1]
+    familias = df_inv[col_desc].unique() if col_desc in df_inv.columns else []
     prod_familia = st.selectbox("Seleccionar Línea de Producto", [f for f in familias if isinstance(f, str)])
 
-    # Extracción numérica de kilogramos para optimización
     def extraer_kg(pres_str):
         import re
         nums = re.findall(r"[\d\.]+", str(pres_str))
         return float(nums[0]) if nums else 0.0
 
-    df_familia = df_inv[df_inv['Descripcion'] == prod_familia].copy()
-    df_familia['Kg_Num'] = df_familia['Presentacion'].apply(extraer_kg)
+    df_familia = df_inv[df_inv[col_desc] == prod_familia].copy()
+    col_pres = 'Presentacion' if 'Presentacion' in df_familia.columns else df_familia.columns[2]
+    df_familia['Kg_Num'] = df_familia[col_pres].apply(extraer_kg)
     df_familia = df_familia[df_familia['Kg_Num'] > 0].sort_values(by='Kg_Num', ascending=False)
 
-    kg_necesarios = area_m2 = area_total * espesor_mm * 1.2 # Rendimiento estándar
+    kg_necesarios = area_total * espesor_mm * 1.2
 
     if not df_familia.empty:
         resultados = []
         for _, row in df_familia.iterrows():
             pres_kg = row['Kg_Num']
-            precio_pub = row['PrecioPublicoIVA']
+            precio_pub = row.get('PrecioPublicoIVA', 0.0)
             unidades = int((kg_necesarios // pres_kg) + (1 if kg_necesarios % pres_kg > 0 else 0))
             costo_total = unidades * precio_pub
             resultados.append({
-                "SKU": row['SKU'],
-                "Presentación": row['Presentacion'],
+                "SKU": row.get('SKU', ''),
+                "Presentación": row[col_pres],
                 "Precio Público": precio_pub,
                 "Unidades": unidades,
                 "Costo Total": costo_total
@@ -247,7 +238,6 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
             st.session_state["carrito_area"] = pd.concat([st.session_state["carrito_area"], nuevo_item], ignore_index=True)
             st.rerun()
 
-    # Visualización del Carrito de Área
     if not st.session_state["carrito_area"].empty:
         st.markdown("### 🛒 Carrito de Cotización por Área")
         st.dataframe(st.session_state["carrito_area"], use_container_width=True)
@@ -263,7 +253,6 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
 
         col_b1, col_b2, col_b3 = st.columns(3)
 
-        # Botón PDF
         with col_b1:
             if st.button("📄 Descargar PDF"):
                 pdf = FPDF()
@@ -300,10 +289,8 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
                 os.unlink(tmp_path)
 
                 registrar_cotizacion_en_excel(folio_actual, cliente_area, st.session_state["carrito_area"], total_c)
-
                 st.download_button("📥 Descargar Archivo PDF", pdf_bytes, file_name=f"{folio_actual}.pdf", mime="application/pdf")
 
-        # Botón Enviar Correo
         with col_b2:
             if st.button("📧 Enviar por Correo"):
                 try:
@@ -368,27 +355,27 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
                 st.session_state["carrito_area"] = pd.DataFrame(columns=["SKU", "Descripcion", "Presentacion", "Cantidad", "Subtotal"])
                 st.rerun()
 
-# ==========================================
-# 4. COTIZADOR COMERCIAL PROFESIONAL
-# ==========================================
 elif menu == "📝 Cotizador Comercial Profesional":
-    st.markdown('<p class="sub-header">Generador de Cotizaciones Comerciales</p>', unsafe_allow_html=True)
-    
+    st.subheader("Generador de Cotizaciones Comerciales")
     cliente_comercial = st.text_input("Cliente / Empresa", "Cliente General", key="cli_com")
     
-    opciones_cot = [f"{row['SKU']} - {row['Descripcion']} ({row['Presentacion']}) - ${row['PrecioPublicoIVA']:,.2f}" for _, row in df_inv.iterrows()]
+    col_desc = 'Descripcion' if 'Descripcion' in df_inv.columns else df_inv.columns[1]
+    col_sku = 'SKU' if 'SKU' in df_inv.columns else df_inv.columns[0]
+    col_pres = 'Presentacion' if 'Presentacion' in df_inv.columns else df_inv.columns[2]
+    
+    opciones_cot = [f"{row[col_sku]} - {row[col_desc]} ({row[col_pres]}) - ${row.get('PrecioPublicoIVA', 0):,.2f}" for _, row in df_inv.iterrows()]
     prod_sel = st.selectbox("Seleccionar Producto", opciones_cot)
     cant = st.number_input("Cantidad", min_value=1, value=1)
     
     if st.button("Agregar al Carrito Comercial"):
         sku_c = prod_sel.split(" - ")[0]
-        fila = df_inv[df_inv['SKU'].astype(str) == sku_c].iloc[0]
-        subtotal = cant * fila['PrecioPublicoIVA']
+        fila = df_inv[df_inv[col_sku].astype(str) == sku_c].iloc[0]
+        subtotal = cant * fila.get('PrecioPublicoIVA', 0)
         
         nuevo_item = {
             "SKU": sku_c,
-            "Descripcion": fila['Descripcion'],
-            "Presentacion": fila['Presentacion'],
+            "Descripcion": fila[col_desc],
+            "Presentacion": fila[col_pres],
             "Cantidad": cant,
             "Subtotal": subtotal
         }
@@ -398,7 +385,6 @@ elif menu == "📝 Cotizador Comercial Profesional":
     if st.session_state["carrito"]:
         df_car = pd.DataFrame(st.session_state["carrito"])
         st.dataframe(df_car, use_container_width=True)
-        
         total_com = df_car['Subtotal'].sum()
         st.markdown(f"### **Total: ${total_com:,.2f} MXN**")
         
@@ -407,12 +393,8 @@ elif menu == "📝 Cotizador Comercial Profesional":
             registrar_cotizacion_en_excel(folio_com, cliente_comercial, df_car, total_com)
             st.success(f"¡Cotización {folio_com} registrada con éxito en el historial de Excel!")
 
-# ==========================================
-# 5. HISTORIAL DE COTIZACIONES (FOLIOS)
-# ==========================================
 elif menu == "📋 Historial de Cotizaciones (Folios)":
-    st.markdown('<p class="sub-header">Historial y Auditoría de Cotizaciones</p>', unsafe_allow_html=True)
-    
+    st.subheader("Historial y Auditoría de Cotizaciones")
     try:
         df_hist = pd.read_excel(EXCEL_FILE, sheet_name="Historial_Cotizaciones")
         if not df_hist.empty:
