@@ -62,7 +62,6 @@ def registrar_cotizacion_en_excel(folio, cliente, items_carrito, total_general):
         return False
 
 # Cargar inventario principal desde Excel
-@st.cache_data(ttl=60)
 def cargar_inventario():
     try:
         df = pd.read_excel(EXCEL_FILE, sheet_name="Inventario")
@@ -71,13 +70,15 @@ def cargar_inventario():
         df = pd.read_excel(EXCEL_FILE)
         return df
 
-df_inventario = cargar_inventario()
-
 # ==========================================
 # MENÚ DE NAVEGACIÓN
 # ==========================================
 st.sidebar.title("Menú Principal")
-menu = st.sidebar.radio("Navegación", ["Cotizador por Área y Milimétrico", "📋 Historial de Cotizaciones"])
+menu = st.sidebar.radio("Navegación", [
+    "Cotizador por Área y Milimétrico", 
+    "📦 Editar y Gestionar Inventario", 
+    "📋 Historial de Cotizaciones"
+])
 
 # ==========================================
 # MÓDULO 1: COTIZADOR POR ÁREA Y INVENTARIO
@@ -85,6 +86,8 @@ menu = st.sidebar.radio("Navegación", ["Cotizador por Área y Milimétrico", "�
 if menu == "Cotizador por Área y Milimétrico":
     st.title("🧪 Sistema Maestro NEMET - Cotizador Profesional")
     
+    df_inventario = cargar_inventario()
+
     # Inicializar carrito en sesión
     if "carrito_area" not in st.session_state:
         st.session_state["carrito_area"] = pd.DataFrame(columns=["SKU", "Descripcion", "Presentacion", "Cantidad", "Subtotal"])
@@ -263,7 +266,33 @@ if menu == "Cotizador por Área y Milimétrico":
         st.info("El carrito está vacío. Agrega una recomendación o producto para comenzar.")
 
 # ==========================================
-# MÓDULO 2: HISTORIAL DE COTIZACIONES
+# MÓDULO 2: EDITAR Y GESTIONAR INVENTARIO (NUEVO / RECUPERADO)
+# ==========================================
+elif menu == "📦 Editar y Gestionar Inventario":
+    st.title("📦 Gestión y Edición de Inventario NEMET")
+    st.markdown("Modifica directamente los datos, existencias y precios de tus productos. Los cambios se sincronizarán en tu archivo Excel.")
+
+    df_inventario = cargar_inventario()
+
+    # Tabla interactiva editable en Streamlit
+    df_editado = st.data_editor(df_inventario, num_rows="dynamic", use_container_width=True, key="editor_inventario")
+
+    if st.button("💾 Guardar Cambios en el Inventario"):
+        try:
+            with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+                df_editado.to_excel(writer, sheet_name="Inventario", index=False)
+            st.success("¡Inventario actualizado y guardado en Excel exitosamente!")
+        except Exception as e:
+            # Si la hoja principal no se llama 'Inventario' explícitamente, guardamos en la primera hoja por defecto
+            try:
+                with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl", mode="w") as writer:
+                    df_editado.to_excel(writer, sheet_name="Inventario", index=False)
+                st.success("¡Inventario guardado exitosamente!")
+            except Exception as err:
+                st.error(f"Error al guardar el inventario: {err}")
+
+# ==========================================
+# MÓDULO 3: HISTORIAL DE COTIZACIONES
 # ==========================================
 elif menu == "📋 Historial de Cotizaciones":
     st.title("📋 Historial y Registro de Cotizaciones")
