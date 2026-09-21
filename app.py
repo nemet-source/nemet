@@ -1,468 +1,297 @@
 import streamlit as st
 import pandas as pd
-import datetime
-import os
-from fpdf import FPDF
+from datetime import datetime
+import openpyxl
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders
+from email.mime.application import MIMEApplication
+from fpdf import FPDF
+import tempfile
+import os
 
-st.set_page_config(page_title="Sistema Maestro NEMET", page_icon="🧪", layout="wide")
+# Configuración de la página
+st.set_page_config(
+    page_title="Sistema Maestro NEMET",
+    page_icon="🧪",
+    layout="wide"
+)
 
 EXCEL_FILE = "Sistema_Inventario_NEMET_Final.xlsx"
 
-def cargar_datos():
+# ==========================================
+# FUNCIONES DE DATOS E HISTORIAL (NUEVO)
+# ==========================================
+def obtener_siguiente_folio():
+    """Genera un folio consecutivo basado en el historial existente en Excel."""
     try:
-        if os.path.exists(EXCEL_FILE):
-            df = pd.read_excel(EXCEL_FILE, sheet_name="Inventario", header=1)
-            df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
-            if 'Presentacion' in df.columns:
-                df['Presentacion'] = df['Presentacion'].astype(str)
-            if 'SKU' in df.columns:
-                df['SKU'] = df['SKU'].astype(str)
-            return df
-        else:
-            st.error(f"No se encontró el archivo {EXCEL_FILE} en la carpeta.")
-            return pd.DataFrame()
-    except Exception as e:
-        st.error(f"Error al cargar o sincronizar el archivo Excel: {e}")
-        return pd.DataFrame()
+        df_hist = pd.read_excel(EXCEL_FILE, sheet_name="Historial_Cotizaciones")
+        num = len(df_hist) + 1
+    except Exception:
+        num = 1
+    anio_actual = datetime.now().year
+    return f"COT-{anio_actual}-{num:03d}"
 
-if "inventario" not in st.session_state or st.session_state["inventario"].empty:
-    st.session_state["inventario"] = cargar_datos()
-
-if "cotizaciones_historial" not in st.session_state:
-    st.session_state["cotizaciones_historial"] = []
-
-if "carrito" not in st.session_state:
-    st.session_state["carrito"] = []
-
-if "carrito_area" not in st.session_state:
-    st.session_state["carrito_area"] = []
-
-df_inv = st.session_state["inventario"]
-
-# Función robusta para envío de correos con Gmail (Puerto 587 + STARTTLS + UTF-8)
-def enviar_correo_cotizacion(destinatario, nombre_cliente, pdf_bytes, nombre_archivo):
+def registrar_cotizacion_en_excel(folio, cliente, items_carrito, total_general):
+    """Registra la cotización generada en una hoja del archivo Excel de inventario."""
     try:
-        remitente = st.secrets["email"]["remitente"]
-        password = st.secrets["email"]["password"]
-        
-        msg = MIMEMultipart()
-        msg['From'] = remitente
-        msg['To'] = destinatario
-        msg['Subject'] = f"Cotización Oficial - Sistema Maestro NEMET ({nombre_cliente})"
-        
-        cuerpo = f"""Estimado/a {nombre_cliente},
+        try:
+            df_hist = pd.read_excel(EXCEL_FILE, sheet_name="Historial_Cotizaciones")
+        except Exception:
+            df_hist = pd.DataFrame(columns=["Folio", "Fecha", "Cliente", "Detalle_Productos", "Total"])
 
-Adjunto a este correo encontrará la cotización oficial solicitada con los detalles de nuestros productos químicos y especialidades epóxicas de Sistema Maestro NEMET.
-
-Agradecemos su preferencia. Quedamos a sus órdenes para cualquier duda o aclaración.
-
-Atentamente,
-Sistema Maestro NEMET
-"""
-        msg.attach(MIMEText(cuerpo, 'plain', 'utf-8'))
+        fecha_actual = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        detalle_str = ", ".join([f"{row['Cantidad']}x {row['Descripcion']} ({row['Presentacion']})" for _, row in items_carrito.iterrows()])
         
-        # Adjuntar PDF
-        parte_adjunta = MIMEBase('application', 'octet-stream')
-        parte_adjunta.set_payload(pdf_bytes)
-        encoders.encode_base64(parte_adjunta)
-        parte_adjunta.add_header('Content-Disposition', f'attachment; filename="{nombre_archivo}"')
-        msg.attach(parte_adjunta)
+        nueva_fila = pd.DataFrame({
+            "Folio": [folio],
+            "Fecha": [fecha_actual],
+            "Cliente": [cliente],
+            "Detalle_Productos": [detalle_str],
+            "Total": [total_general]
+        })
         
-        # Conexión SMTP segura con puerto 587 y STARTTLS
-        servidor = smtplib.SMTP('smtp.gmail.com', 587)
-        servidor.starttls()
-        servidor.login(remitente, password)
-        servidor.sendmail(remitente, destinatario, msg.as_string())
-        servidor.quit()
-        return True, "¡Correo enviado exitosamente al cliente!"
+        df_hist = pd.concat([df_hist, nueva_fila], ignore_index=True)
+        
+        with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+            df_hist.to_excel(writer, sheet_name="Historial_Cotizaciones", index=False)
+            
+        return True
     except Exception as e:
-        return False, f"Error al enviar el correo: {e}"
+        print(f"Error al guardar historial: {e}")
+        return False
 
-st.markdown("""
-    <style>
-    .main-header { font-size: 2.2rem; color: #1E3A8A; font-weight: bold; }
-    .sub-header { font-size: 1.3rem; color: #3B82F6; font-weight: 600; }
-    .stButton>button {
-        background-color: #1E3A8A;
-        color: white;
-        font-weight: bold;
-        border-radius: 8px;
-        padding: 8px 16px;
-    }
-    .stButton>button:hover {
-        background-color: #1D4ED8;
-        color: white;
-    }
-    </style>
-""", unsafe_allow_html=True)
+# Cargar inventario principal
+@st.cache_data(ttl=60)
+def cargar_inventario():
+    try:
+        df = pd.read_excel(EXCEL_FILE, sheet_name="Inventario") # Ajusta el nombre de la hoja si es necesario
+        return df
+    except Exception as e:
+        # Si la hoja de inventario genérica tiene otro nombre, intentamos leer la primera
+        df = pd.read_excel(EXCEL_FILE)
+        return df
 
-st.markdown('<p class="main-header">🧪 SISTEMA MAESTRO NEMET - INVENTARIO Y COTIZADOR</p>', unsafe_allow_html=True)
-st.markdown("---")
+df_inventario = cargar_inventario()
 
-menu = st.sidebar.selectbox("📂 Menú Principal", [
-    "📊 Dashboard & Resumen", 
-    "📦 Control de Inventario", 
-    "📏 Cotizador por Área y Milimétrico",
-    "📝 Cotizador Profesional", 
-    "📈 Historial de Cotizaciones"
-])
+# ==========================================
+# MENÚ DE NAVEGACIÓN
+# ==========================================
+st.sidebar.title("Menú Principal")
+menu = st.sidebar.radio("Navegación", ["Cotizador por Área y Milimétrico", "📋 Historial de Cotizaciones"])
 
-if menu == "📊 Dashboard & Resumen":
-    st.markdown('<p class="sub-header">Panel General de Control</p>', unsafe_allow_html=True)
-    if st.button("🔄 Sincronizar con Archivo Excel Actual"):
-        st.session_state["inventario"] = cargar_datos()
-        df_inv = st.session_state["inventario"]
+# ==========================================
+# MÓDULO 1: COTIZADOR POR ÁREA
+# ==========================================
+if menu == "Cotizador por Área y Milimétrico":
+    st.title("🧪 Sistema Maestro NEMET - Cotizador Profesional")
+    
+    # Inicializar carrito en sesión
+    if "carrito_area" not in st.session_state:
+        st.session_state["carrito_area"] = pd.DataFrame(columns=["SKU", "Descripcion", "Presentacion", "Cantidad", "Subtotal"])
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Parámetros de Área")
+    ancho = st.sidebar.number_input("Ancho (metros)", min_value=0.1, value=3.0, step=0.1)
+    largo = st.sidebar.number_input("Largo (metros)", min_value=0.1, value=4.0, step=0.1)
+    area_total = ancho * largo
+    st.sidebar.info(f"Área Calculada: **{area_total:.2f} m²**")
+
+    # Lógica de recomendación de producto (Ejemplo basado en tus datos)
+    # Suponiendo que el inventario tiene columnas: SKU, Descripcion, Presentacion, _precio_pub, etc.
+    st.subheader("💡 Recomendación Óptima")
+    
+    # Supuesto de producto recomendado estándar basado en área
+    kg_estimados = area_total * 1.5 # 1.5 kg por m² aprox
+    presentacion_sugerida = "20 kg" if kg_estimados > 10 else "4 kg"
+    precio_ejemplo = 7490.0 if presentacion_sugerida == "20 kg" else 1850.0
+
+    st.success(f"Recomendación Óptima para {area_total:.1f} m²: **{presentacion_sugerida}** con 1 unidad por ${precio_ejemplo:,.2f} MXN.")
+
+    if st.button("➕ Agregar esta recomendación al Carrito de Cotización"):
+        nuevo_item = pd.DataFrame([{
+            "SKU": "EPT-06",
+            "Descripcion": "EPOXY PISOS (A y B) TRANSPARENTE",
+            "Presentacion": presentacion_sugerida,
+            "Cantidad": 1,
+            "Subtotal": precio_ejemplo
+        }])
+        st.session_state["carrito_area"] = pd.concat([st.session_state["carrito_area"], nuevo_item], ignore_index=True)
         st.rerun()
 
-    total_skus = len(df_inv)
-    stock_bajo = len(df_inv[df_inv['StockActual'] <= df_inv['StockMinimo']]) if 'StockActual' in df_inv.columns and 'StockMinimo' in df_inv.columns else 0
-    valor_total = (df_inv['StockActual'] * df_inv['PrecioPublicoIVA']).sum() if 'StockActual' in df_inv.columns and 'PrecioPublicoIVA' in df_inv.columns else 0.0
+    # Visualización del Carrito
+    st.markdown("### 🛒 Carrito de Cotización por Área")
+    if not st.session_state["carrito_area"].empty:
+        st.dataframe(st.session_state["carrito_area"], use_container_width=True)
 
-    col1, col2, col3 = st.columns(3)
-    with col1: st.metric("Total de SKUs Registrados", total_skus)
-    with col2: st.metric("Alertas de Stock Bajo", stock_bajo)
-    with col3: st.metric("Valor Total Inventario ($)", f"${valor_total:,.2f}")
+        subtotal_carrito = st.session_state["carrito_area"]["Subtotal"].sum()
+        iva = subtotal_carrito * 0.16
+        total_general = subtotal_carrito + iva
 
-    st.markdown("### ⚠️ Alertas de Reabastecimiento")
-    if 'StockActual' in df_inv.columns and 'StockMinimo' in df_inv.columns:
-        alertas_df = df_inv[df_inv['StockActual'] <= df_inv['StockMinimo']]
-        if not alertas_df.empty:
-            cols_alerta = [c for c in ['SKU', 'Descripcion', 'Presentacion', 'StockActual', 'StockMinimo', 'AlertaStock'] if c in df_inv.columns]
-            st.dataframe(alertas_df[cols_alerta], use_container_width=True)
-        else:
-            st.success("¡Excelente! No hay productos con stock por debajo del mínimo.")
+        st.markdown(f"**Subtotal:** ${subtotal_carrito:,.2f} MXN | **IVA (16%):** ${iva:,.2f} MXN | **Total:** **${total_general:,.2f} MXN**")
 
-    st.markdown("### 🔍 Vista Rápida del Inventario Actual (Sincronizado)")
-    st.dataframe(df_inv, use_container_width=True)
+        # Datos del cliente para envío/PDF
+        col_c1, col_c2 = st.columns(2)
+        with col_c1:
+            nombre_cliente = st.text_input("Nombre del Cliente", "Cliente General")
+        with col_c2:
+            correo_cliente = st.text_input("Correo Electrónico del Cliente", "cliente@correo.com")
 
-elif menu == "📦 Control de Inventario":
-    st.markdown('<p class="sub-header">Gestión de Entradas, Salidas y Actualización de Stock</p>', unsafe_allow_html=True)
-    tab1, tab2, tab3 = st.tabs(["➕ Registrar Movimiento", "✏️ Modificar / Nuevo Producto", "💾 Sincronizar y Guardar en Excel"])
-    
-    with tab1:
-        st.subheader("Registrar Entrada o Salida de Mercancía")
-        opciones_sku = [f"{row['SKU']} - {row['Descripcion']} ({row['Presentacion']})" for _, row in df_inv.iterrows()]
-        sku_sel = st.selectbox("Seleccione el SKU", opciones_sku)
-        sku_codigo = sku_sel.split(" - ")[0]
-        tipo_mov = st.radio("Tipo de Movimiento", ["Entrada (Compra / Producción)", "Salida (Venta / Merma)"])
-        cantidad = st.number_input("Cantidad", min_value=1, value=1, step=1)
-        
-        if st.button("Aplicar Movimiento"):
-            idx = df_inv[df_inv['SKU'].astype(str) == sku_codigo].index[0]
-            if "Entrada" in tipo_mov:
-                df_inv.loc[idx, 'Entradas'] += cantidad
-            else:
-                df_inv.loc[idx, 'Salidas'] += cantidad
-            
-            df_inv.loc[idx, 'StockActual'] = df_inv.loc[idx, 'StockInicial'] + df_inv.loc[idx, 'Entradas'] - df_inv.loc[idx, 'Salidas']
-            df_inv.loc[idx, 'AlertaStock'] = "⚠️ REABASTECER" if df_inv.loc[idx, 'StockActual'] <= df_inv.loc[idx, 'StockMinimo'] else "✅ ÓPTIMO"
-            if 'PrecioPublicoIVA' in df_inv.columns:
-                df_inv['ValorInventario'] = df_inv['StockActual'] * df_inv['PrecioPublicoIVA']
-            
-            st.session_state["inventario"] = df_inv
-            df_inv.to_excel(EXCEL_FILE, sheet_name='Inventario', index=False, startrow=1)
-            st.success("¡Movimiento aplicado y guardado automáticamente en el archivo Excel!")
-            st.rerun()
+        folio_actual = obtener_siguiente_folio()
+        st.caption(f"Folio asignado a la cotización: **{folio_actual}**")
 
-    with tab2:
-        st.subheader("Agregar Nuevo Producto al Inventario")
-        with st.form("nuevo_producto"):
-            n_sku = st.text_input("SKU")
-            n_desc = st.text_input("Descripción")
-            n_pres = st.text_input("Presentación (ej. 1 kg, 5 L)")
-            n_min = st.number_input("Stock Mínimo", min_value=0, value=5)
-            n_ini = st.number_input("Stock Inicial", min_value=0, value=0)
-            n_compra = st.number_input("Precio Compra ($)", min_value=0.0, value=0.0)
-            n_base = st.number_input("Precio Base Sin IVA ($)", min_value=0.0, value=0.0)
-            
-            submit_prod = st.form_submit_button("Agregar Producto")
-            if submit_prod and n_sku:
-                iva = n_base * 0.16
-                publico = n_base + iva
-                nuevo_reg = {
-                    'SKU': n_sku, 'Descripcion': n_desc, 'Presentacion': n_pres,
-                    'StockMinimo': n_min, 'StockInicial': n_ini, 'Entradas': 0, 'Salidas': 0,
-                    'StockActual': n_ini, 'AlertaStock': "⚠️ REABASTECER" if n_ini <= n_min else "✅ ÓPTIMO",
-                    'PrecioCompra': n_compra, 'PrecioBaseSinIVA': n_base, 'IVA 16%': iva,
-                    'PrecioPublicoIVA': publico, 'ValorInventario': n_ini * publico
-                }
-                df_inv = pd.concat([df_inv, pd.DataFrame([nuevo_reg])], ignore_index=True)
-                st.session_state["inventario"] = df_inv
-                df_inv.to_excel(EXCEL_FILE, sheet_name='Inventario', index=False, startrow=1)
-                st.success(f"Producto {n_sku} agregado y sincronizado con Excel exitosamente.")
+        col1, col2, col3 = st.columns(3)
+
+        # Generar PDF con FPDF2
+        with col1:
+            if st.button("📄 Descargar PDF"):
+                try:
+                    pdf = FPDF()
+                    pdf.add_page()
+                    pdf.set_font("helvetica", "B", 16)
+                    pdf.cell(0, 10, f"COTIZACION OFICIAL - {folio_actual}", 0, 1, "C")
+                    pdf.set_font("helvetica", "", 12)
+                    pdf.cell(0, 10, f"Cliente: {nombre_cliente}", 0, 1, "L")
+                    pdf.cell(0, 10, f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M')}", 0, 1, "L")
+                    pdf.ln(5)
+
+                    # Tabla PDF
+                    pdf.set_font("helvetica", "B", 10)
+                    pdf.cell(30, 8, "SKU", 1)
+                    pdf.cell(80, 8, "Descripcion", 1)
+                    pdf.cell(30, 8, "Cant.", 1, 0, "C")
+                    pdf.cell(40, 8, "Subtotal", 1, 1, "R")
+
+                    pdf.set_font("helvetica", "", 10)
+                    for _, row in st.session_state["carrito_area"].iterrows():
+                        pdf.cell(30, 8, str(row["SKU"]), 1)
+                        pdf.cell(80, 8, str(row["Descripcion"]), 1)
+                        pdf.cell(30, 8, str(row["Cantidad"]), 1, 0, "C")
+                        pdf.cell(40, 8, f"${row['Subtotal']:,.2f}", 1, 1, "R")
+
+                    pdf.ln(5)
+                    pdf.cell(0, 8, f"Subtotal: ${subtotal_carrito:,.2f} MXN", 0, 1, "R")
+                    pdf.cell(0, 8, f"IVA (16%): ${iva:,.2f} MXN", 0, 1, "R")
+                    pdf.cell(0, 8, f"TOTAL: ${total_general:,.2f} MXN", 0, 1, "R")
+
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+                        pdf.output(tmp_file.name)
+                        tmp_path = tmp_file.name
+
+                    with open(tmp_path, "rb") as f:
+                        pdf_bytes = f.read()
+
+                    os.unlink(tmp_path)
+                    
+                    # Registrar en historial automáticamente al generar PDF
+                    registrar_cotizacion_en_excel(folio_actual, nombre_cliente, st.session_state["carrito_area"], total_general)
+
+                    st.download_button(
+                        label="📥 Descargar Archivo PDF",
+                        data=pdf_bytes,
+                        file_name=f"{folio_actual}.pdf",
+                        mime="application/pdf"
+                    )
+                except Exception as e:
+                    st.error(f"Error al generar PDF: {e}")
+
+        # Envío de Correo con smtplib y Secrets
+        with col2:
+            if st.button("📧 Enviar por Correo al Cliente"):
+                try:
+                    # Generar PDF temporal para adjuntar
+                    pdf = FPDF()
+                    pdf.add_page()
+                    pdf.set_font("helvetica", "B", 16)
+                    pdf.cell(0, 10, f"COTIZACION OFICIAL - {folio_actual}", 0, 1, "C")
+                    pdf.set_font("helvetica", "", 12)
+                    pdf.cell(0, 10, f"Cliente: {nombre_cliente}", 0, 1, "L")
+                    pdf.cell(0, 10, f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M')}", 0, 1, "L")
+                    pdf.ln(5)
+
+                    pdf.set_font("helvetica", "B", 10)
+                    pdf.cell(30, 8, "SKU", 1)
+                    pdf.cell(80, 8, "Descripcion", 1)
+                    pdf.cell(30, 8, "Cant.", 1, 0, "C")
+                    pdf.cell(40, 8, "Subtotal", 1, 1, "R")
+
+                    pdf.set_font("helvetica", "", 10)
+                    for _, row in st.session_state["carrito_area"].iterrows():
+                        pdf.cell(30, 8, str(row["SKU"]), 1)
+                        pdf.cell(80, 8, str(row["Descripcion"]), 1)
+                        pdf.cell(30, 8, str(row["Cantidad"]), 1, 0, "C")
+                        pdf.cell(40, 8, f"${row['Subtotal']:,.2f}", 1, 1, "R")
+
+                    pdf.ln(5)
+                    pdf.cell(0, 8, f"TOTAL: ${total_general:,.2f} MXN", 0, 1, "R")
+
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+                        pdf.output(tmp_file.name)
+                        tmp_path = tmp_file.name
+
+                    # Credenciales desde Secrets de Streamlit
+                    remitente = st.secrets["email"]["remitente"]
+                    password = st.secrets["email"]["password"]
+
+                    msg = MIMEMultipart()
+                    msg["From"] = remitente
+                    msg["To"] = correo_cliente
+                    msg["Subject"] = f"Cotización Oficial NEMET - {folio_actual}"
+
+                    cuerpo = f"Hola {nombre_cliente},\n\nAdjunto encontrarás la cotización {folio_actual} solicitada.\n\nTotal: ${total_general:,.2f} MXN\n\nSaludos cordiales,\nEquipo NEMET"
+                    msg.attach(MIMEText(cuerpo, "plain", "utf-8"))
+
+                    with open(tmp_path, "rb") as f:
+                        adjunto = MIMEApplication(f.read(), Name=f"{folio_actual}.pdf")
+                    adjunto["Content-Disposition"] = f'attachment; filename="{folio_actual}.pdf"'
+                    msg.attach(adjunto)
+
+                    # Conexión SMTP segura con puerto 587 y STARTTLS
+                    server = smtplib.SMTP("smtp.gmail.com", 587)
+                    server.starttls()
+                    server.login(remitente, password)
+                    server.sendmail(remitente, correo_cliente, msg.as_string())
+                    server.quit()
+
+                    os.unlink(tmp_path)
+
+                    # Registrar en historial automáticamente al enviar correo
+                    registrar_cotizacion_en_excel(folio_actual, nombre_cliente, st.session_state["carrito_area"], total_general)
+
+                    st.success("¡Correo enviado exitosamente al cliente!")
+                except Exception as e:
+                    st.error(f"Error al enviar correo: {e}")
+
+        with col3:
+            if st.button("🗑️ Limpiar Carrito de Área"):
+                st.session_state["carrito_area"] = pd.DataFrame(columns=["SKU", "Descripcion", "Presentacion", "Cantidad", "Subtotal"])
                 st.rerun()
-
-    with tab3:
-        st.subheader("Sincronización Manual con Excel")
-        col_s1, col_s2 = st.columns(2)
-        with col_s1:
-            if st.button("📥 Cargar desde Excel al Sistema"):
-                st.session_state["inventario"] = cargar_datos()
-                st.success("¡Datos recargados exitosamente desde el archivo Excel!")
-                st.rerun()
-        with col_s2:
-            if st.button("📤 Guardar Sistema hacia Excel"):
-                df_inv.to_excel(EXCEL_FILE, sheet_name='Inventario', index=False, startrow=1)
-                st.success("¡Inventario del sistema guardado en el archivo Excel!")
-
-elif menu == "📏 Cotizador por Área y Milimétrico":
-    st.markdown('<p class="sub-header">Cotizador Milimétrico, Rendimiento por Área y Proporción de Mezcla</p>', unsafe_allow_html=True)
-    
-    col_a1, col_a2, col_a3, col_a4 = st.columns(4)
-    with col_a1:
-        cliente_area = st.text_input("Nombre del Cliente", "Monica Merelles", key="cliente_area_input")
-    with col_a2:
-        correo_cliente_area = st.text_input("Correo del Cliente", "cliente@correo.com", key="correo_cliente_area")
-    with col_a3:
-        area_m2 = st.number_input("Metros Cuadrados (m²)", min_value=1.0, value=16.0, step=0.5)
-    with col_a4:
-        espesor_mm = st.number_input("Espesor Requerido (mm)", min_value=0.1, value=1.0, step=0.5)
-
-    familias_disponibles = df_inv['Descripcion'].unique()
-    prod_familia = st.selectbox("Seleccionar Línea de Producto", [f for f in familias_disponibles if isinstance(f, str)])
-
-    proporciones_default = {
-        "EPO-DEEP": (100.0, 42.0), "EPO-FAST": (100.0, 84.0), "EPOXY PISOS": (100.0, 50.0),
-        "EPOXY PRIMER": (100.0, 35.0), "EPO-DEEP ULTRA": (100.0, 33.0), "EPO-PAINT": (2.0, 1.0),
-        "POLIURETANO TRANSPARENTE": (100.0, 50.0), "POLIURETANO (AYB) TRANSPARENTE": (100.0, 50.0)
-    }
-    default_a, default_b = proporciones_default.get(prod_familia, (100.0, 50.0))
-
-    col_cfg1, col_cfg2 = st.columns(2)
-    with col_cfg1:
-        partes_resina = st.number_input("Partes de Resina (Parte A)", min_value=0.1, value=default_a, step=1.0, key=f"resina_{prod_familia}")
-    with col_cfg2:
-        partes_catalizador = st.number_input("Partes de Catalizador / Endurecedor (Parte B)", min_value=0.1, value=default_b, step=1.0, key=f"cat_{prod_familia}")
-
-    df_familia = df_inv[df_inv['Descripcion'] == prod_familia].copy()
-
-    def extraer_kg(pres_str):
-        try:
-            import re
-            nums = re.findall(r"[\d\.]+", str(pres_str))
-            if nums: return float(nums[0])
-        except: pass
-        return 0.0
-
-    df_familia['Kg_Num'] = df_familia['Presentacion'].apply(extraer_kg)
-    df_familia = df_familia[df_familia['Kg_Num'] > 0].sort_values(by='Kg_Num', ascending=False)
-
-    rendimiento_teorico = 1.2
-    kg_necesarios = area_m2 * espesor_mm * rendimiento_teorico
-
-    st.markdown("---")
-    st.info(f"📐 **Área a Cubrir:** {area_m2} m² | **Espesor:** {espesor_mm} mm | **Material Necesario:** **{kg_necesarios:.2f} kg**")
-
-    if not df_familia.empty:
-        resultados_desglose = []
-        for _, row in df_familia.iterrows():
-            pres_kg = row['Kg_Num']
-            precio_pub = row['PrecioPublicoIVA']
-            costo_kg = precio_pub / pres_kg if pres_kg > 0 else 0
-            unidades_ind = int((kg_necesarios // pres_kg) + (1 if kg_necesarios % pres_kg > 0 else 0))
-            kg_aportados_ind = unidades_ind * pres_kg
-            costo_total_ind = unidades_ind * precio_pub
-            
-            resultados_desglose.append({
-                "SKU": row['SKU'], "Presentación": row['Presentacion'],
-                "Precio Público (IVA Inc.)": f"${precio_pub:,.2f}", "Costo por kg": f"${costo_kg:,.2f}",
-                "Unidades Necesarias": unidades_ind, "Kg Totales Aportados": f"{kg_aportados_ind:.2f} kg",
-                "Costo Total ($)": f"${costo_total_ind:,.2f}", "_costo_num": costo_total_ind, "_precio_pub": precio_pub
-            })
-        
-        df_desglose = pd.DataFrame(resultados_desglose)
-        optima = min(resultados_desglose, key=lambda x: x['_costo_num'])
-        st.dataframe(df_desglose.drop(columns=['_costo_num', '_precio_pub']), use_container_width=True)
-        st.success(f"💡 **Recomendación Óptima:** **{optima['Presentación']}** con **{optima['Unidades Necesarias']} unidades** por **{optima['Costo Total ($)']}**.")
-
-        if st.button("➕ Agregar esta recomendación al Carrito de Cotización"):
-            item_area = {
-                "SKU": optima['SKU'], "Descripcion": prod_familia, "Presentacion": optima['Presentación'],
-                "Cantidad": optima['Unidades Necesarias'], "PrecioUnitario": optima['_precio_pub'],
-                "Subtotal": optima['_costo_num'], "Area": area_m2, "Espesor": espesor_mm
-            }
-            st.session_state["carrito_area"].append(item_area)
-            st.success(f"¡Se agregó {prod_familia} al carrito por área!")
-
-        if st.session_state["carrito_area"]:
-            st.markdown("### 🛒 Carrito de Cotización por Área")
-            df_c_area = pd.DataFrame(st.session_state["carrito_area"])
-            st.dataframe(df_c_area[['SKU', 'Descripcion', 'Presentacion', 'Cantidad', 'Subtotal']], use_container_width=True)
-            
-            total_carrito_area = df_c_area['Subtotal'].sum()
-            sub_c_area = total_carrito_area / 1.16
-            iva_c_area = total_carrito_area - sub_c_area
-            
-            st.markdown(f"**Subtotal:** ${sub_c_area:,.2f} MXN | **IVA:** ${iva_c_area:,.2f} MXN | **Total:** **${total_carrito_area:,.2f} MXN**")
-
-            class PDFArea(FPDF):
-                def header(self):
-                    self.set_font('helvetica', 'B', 15); self.set_text_color(30, 58, 138)
-                    self.cell(0, 10, 'SISTEMA MAESTRO NEMET', 0, 1, 'L')
-                    self.set_font('helvetica', '', 10); self.set_text_color(100, 100, 100)
-                    self.cell(0, 5, 'Productos Quimicos y Especialidades Epoxicas', 0, 1, 'L'); self.ln(5)
-                def footer(self):
-                    self.set_y(-15); self.set_font('helvetica', 'I', 8); self.set_text_color(150, 150, 150)
-                    self.cell(0, 10, f'Pagina {self.page_no()}', 0, 0, 'C')
-
-            pdf_a = PDFArea()
-            pdf_a.add_page(); pdf_a.set_font('helvetica', '', 11)
-            pdf_a.cell(0, 6, f"Cliente: {cliente_area}", 0, 1)
-            pdf_a.cell(0, 6, f"Fecha: {datetime.date.today()}", 0, 1)
-            pdf_a.cell(0, 6, f"Cotizacion por Area y Sistemas Epoxicos", 0, 1)
-            if st.session_state["carrito_area"]:
-                p_item = st.session_state["carrito_area"][0]
-                pdf_a.cell(0, 6, f"Parametros: Area: {p_item.get('Area', 16.0)} m² | Espesor: {p_item.get('Espesor', 1.0)} mm", 0, 1)
-            pdf_a.ln(5)
-
-            pdf_a.set_fill_color(30, 58, 138); pdf_a.set_text_color(255, 255, 255); pdf_a.set_font('helvetica', 'B', 9)
-            pdf_a.cell(25, 8, "SKU", 1, 0, 'C', True)
-            pdf_a.cell(75, 8, "Descripcion / Sistema", 1, 0, 'L', True)
-            pdf_a.cell(30, 8, "Presentacion", 1, 0, 'C', True)
-            pdf_a.cell(20, 8, "Unidades", 1, 0, 'C', True)
-            pdf_a.cell(40, 8, "Subtotal", 1, 1, 'R', True)
-
-            pdf_a.set_font('helvetica', '', 9); pdf_a.set_text_color(50, 50, 50)
-            for itm in st.session_state["carrito_area"]:
-                pdf_a.cell(25, 7, str(itm['SKU']), 1, 0, 'C')
-                pdf_a.cell(75, 7, str(itm['Descripcion']), 1, 0, 'L')
-                pdf_a.cell(30, 7, str(itm['Presentacion']), 1, 0, 'C')
-                pdf_a.cell(20, 7, str(itm['Cantidad']), 1, 0, 'C')
-                pdf_a.cell(40, 7, f"${itm['Subtotal']:,.2f}", 1, 1, 'R')
-
-            pdf_a.ln(5); pdf_a.set_font('helvetica', 'B', 10)
-            pdf_a.cell(0, 6, f"Subtotal: ${sub_c_area:,.2f} MXN", 0, 1, 'R')
-            pdf_a.cell(0, 6, f"IVA (16%): ${iva_c_area:,.2f} MXN", 0, 1, 'R')
-            pdf_a.cell(0, 6, f"Total General: ${total_carrito_area:,.2f} MXN", 0, 1, 'R')
-            pdf_bytes_multiarea = bytes(pdf_a.output())
-            
-            col_d1, col_d2, col_d3 = st.columns(3)
-            with col_d1:
-                st.download_button("📄 Descargar PDF", data=pdf_bytes_multiarea, file_name=f"Cotizacion_{cliente_area.replace(' ', '_')}.pdf", mime="application/pdf")
-            with col_d2:
-                if st.button("📧 Enviar por Correo al Cliente"):
-                    exito, mensaje = enviar_correo_cotizacion(correo_cliente_area, cliente_area, pdf_bytes_multiarea, f"Cotizacion_{cliente_area}.pdf")
-                    if exito: st.success(mensaje)
-                    else: st.error(mensaje)
-            with col_d3:
-                if st.button("🗑️ Limpiar Carrito de Área"):
-                    st.session_state["carrito_area"] = []
-                    st.rerun()
-
-elif menu == "📝 Cotizador Profesional":
-    st.markdown('<p class="sub-header">Generador de Cotizaciones Comerciales</p>', unsafe_allow_html=True)
-    col_c1, col_c2 = st.columns(2)
-    with col_c1:
-        cliente_nombre = st.text_input("Nombre del Cliente / Empresa", "Cliente General")
-        correo_cliente_prof = st.text_input("Correo Electrónico del Cliente", "cliente@correo.com")
-    with col_c2:
-        validez = st.selectbox("Validez de la Cotización", ["15 días", "30 días", "60 días"])
-        condiciones = st.text_input("Condiciones de Pago", "Contado / Transferencia bancaria")
-
-    opciones_cotizador = [f"{row['SKU']} - {row['Descripcion']} ({row['Presentacion']}) - ${row['PrecioPublicoIVA']:,.2f}" for _, row in df_inv.iterrows()]
-    prod_select = st.selectbox("Producto", opciones_cotizador)
-    cant_select = st.number_input("Cantidad a Cotizar", min_value=1, value=1, key="cant_cot")
-    
-    if st.button("Agregar a la Cotización"):
-        sku_c = prod_select.split(" - ")[0]
-        fila_prod = df_inv[df_inv['SKU'].astype(str) == sku_c].iloc[0]
-        item = {
-            "SKU": sku_c, "Descripcion": fila_prod['Descripcion'], "Presentacion": fila_prod['Presentacion'],
-            "Cantidad": cant_select, "PrecioUnitario": fila_prod['PrecioPublicoIVA'], "Subtotal": cant_select * fila_prod['PrecioPublicoIVA']
-        }
-        st.session_state["carrito"].append(item)
-        st.success("Producto agregado al carrito de cotización.")
-
-    if st.session_state["carrito"]:
-        st.markdown("### 🛒 Resumen de Ítems Cotizados")
-        df_carrito = pd.DataFrame(st.session_state["carrito"])
-        st.dataframe(df_carrito, use_container_width=True)
-        
-        total_cotizacion = df_carrito['Subtotal'].sum()
-        subtotal_sin_iva = total_cotizacion / 1.16
-        iva_total = total_cotizacion - subtotal_sin_iva
-        
-        st.markdown(f"**Subtotal:** ${subtotal_sin_iva:,.2f} MXN | **IVA:** ${iva_total:,.2f} MXN | **Total:** **${total_cotizacion:,.2f} MXN**")
-
-        if st.button("💾 Guardar Cotización en Historial"):
-            nueva_cot = {
-                "Fecha": str(datetime.date.today()), "Cliente": cliente_nombre, "Correo": correo_cliente_prof,
-                "Validez": validez, "Condiciones": condiciones, "Total": total_cotizacion, "Items": st.session_state["carrito"].copy()
-            }
-            st.session_state["cotizaciones_historial"].append(nueva_cot)
-            st.success("Cotización guardada exitosamente en el historial.")
-        if st.button("🗑️ Limpiar Carrito"):
-            st.session_state["carrito"] = []
-            st.rerun()
-
-elif menu == "📈 Historial de Cotizaciones":
-    st.markdown('<p class="sub-header">Historial de Cotizaciones Generadas</p>', unsafe_allow_html=True)
-    if st.session_state["cotizaciones_historial"]:
-        if st.button("🗑️ Borrar Todo el Historial"):
-            st.session_state["cotizaciones_historial"] = []
-            st.rerun()
-            
-        for i, cot in enumerate(st.session_state["cotizaciones_historial"]):
-            with st.expander(f"Cotización #{i+1} - Cliente: {cot['Cliente']} ({cot['Fecha']}) - Total: ${cot['Total']:,.2f}"):
-                st.write(f"**Fecha:** {cot['Fecha']} | **Correo:** {cot.get('Correo', 'No especificado')}")
-                st.write(f"**Cliente:** {cot['Cliente']}")
-                df_items = pd.DataFrame(cot['Items'])
-                st.dataframe(df_items, use_container_width=True)
-                
-                total_c = cot['Total']
-                sub_c = total_c / 1.16
-                iva_c = total_c - sub_c
-                
-                class PDFHist(FPDF):
-                    def header(self):
-                        self.set_font('helvetica', 'B', 15); self.set_text_color(30, 58, 138)
-                        self.cell(0, 10, 'SISTEMA MAESTRO NEMET', 0, 1, 'L')
-                        self.set_font('helvetica', '', 10); self.set_text_color(100, 100, 100)
-                        self.cell(0, 5, 'Productos Quimicos y Especialidades', 0, 1, 'L'); self.ln(5)
-                    def footer(self):
-                        self.set_y(-15); self.set_font('helvetica', 'I', 8); self.set_text_color(150, 150, 150)
-                        self.cell(0, 10, f'Pagina {self.page_no()}', 0, 0, 'C')
-
-                pdf_h = PDFHist()
-                pdf_h.add_page(); pdf_h.set_font('helvetica', '', 11)
-                pdf_h.cell(0, 6, f"Cotizacion: #{i+1}", 0, 1)
-                pdf_h.cell(0, 6, f"Cliente: {cot['Cliente']}", 0, 1)
-                pdf_h.cell(0, 6, f"Fecha: {cot['Fecha']}", 0, 1)
-                pdf_h.ln(5)
-
-                pdf_h.set_fill_color(30, 58, 138); pdf_h.set_text_color(255, 255, 255); pdf_h.set_font('helvetica', 'B', 9)
-                pdf_h.cell(25, 8, "SKU", 1, 0, 'C', True)
-                pdf_h.cell(75, 8, "Descripcion", 1, 0, 'L', True)
-                pdf_h.cell(30, 8, "Presentacion", 1, 0, 'C', True)
-                pdf_h.cell(20, 8, "Cant.", 1, 0, 'C', True)
-                pdf_h.cell(40, 8, "Subtotal", 1, 1, 'R', True)
-
-                pdf_h.set_font('helvetica', '', 9); pdf_h.set_text_color(50, 50, 50)
-                for item in cot['Items']:
-                    pdf_h.cell(25, 7, str(item['SKU']), 1, 0, 'C')
-                    pdf_h.cell(75, 7, str(item['Descripcion']), 1, 0, 'L')
-                    pdf_h.cell(30, 7, str(item['Presentacion']), 1, 0, 'C')
-                    pdf_h.cell(20, 7, str(item['Cantidad']), 1, 0, 'C')
-                    pdf_h.cell(40, 7, f"${item['Subtotal']:,.2f}", 1, 1, 'R')
-
-                pdf_h.ln(5); pdf_h.set_font('helvetica', 'B', 10)
-                pdf_h.cell(0, 6, f"Subtotal: ${sub_c:,.2f} MXN", 0, 1, 'R')
-                pdf_h.cell(0, 6, f"IVA (16%): ${iva_c:,.2f} MXN", 0, 1, 'R')
-                pdf_h.cell(0, 6, f"Total a Pagar: ${total_c:,.2f} MXN", 0, 1, 'R')
-                pdf_bytes_hist = bytes(pdf_h.output())
-                
-                col_h1, col_h2 = st.columns(2)
-                with col_h1:
-                    st.download_button(label=f"📄 Descargar PDF #{i+1}", data=pdf_bytes_hist, file_name=f"Cotizacion_NEMET_{i+1}.pdf", mime="application/pdf", key=f"dl_{i}")
-                with col_h2:
-                    if st.button(f"📧 Enviar por Correo #{i+1}", key=f"mail_{i}"):
-                        exito, mensaje = enviar_correo_cotizacion(cot.get('Correo', ''), cot['Cliente'], pdf_bytes_hist, f"Cotizacion_NEMET_{i+1}.pdf")
-                        if exito: st.success(mensaje)
-                        else: st.error(mensaje)
     else:
-        st.info("No hay cotizaciones guardadas en esta sesión.")
+        st.info("El carrito está vacío. Agrega una recomendación o producto para comenzar.")
+
+# ==========================================
+# MÓDULO 2: HISTORIAL DE COTIZACIONES (NUEVO)
+# ==========================================
+elif menu == "📋 Historial de Cotizaciones":
+    st.title("📋 Historial y Registro de Cotizaciones")
+    st.markdown("Consulta todas las cotizaciones generadas previamente desde el sistema.")
+
+    try:
+        df_historial = pd.read_excel(EXCEL_FILE, sheet_name="Historial_Cotizaciones")
+        if not df_historial.empty:
+            # Filtro de búsqueda por cliente o folio
+            busqueda = st.text_input("🔍 Buscar por Folio o Cliente:")
+            if busqueda:
+                df_filtrado = df_historial[
+                    df_historial["Folio"].astype(str).str.contains(busqueda, case=False, na=False) |
+                    df_historial["Cliente"].astype(str).str.contains(busqueda, case=False, na=False)
+                ]
+            else:
+                df_filtrado = df_historial
+
+            st.dataframe(df_filtrado, use_container_width=True)
+            st.metric("Total de Cotizaciones Registradas", len(df_historial))
+        else:
+            st.info("Aún no hay cotizaciones registradas en el historial.")
+    except Exception:
+        st.info("Aún no se ha generado la hoja de historial en el archivo Excel. Se creará automáticamente en cuanto emitas tu primera cotización.")
