@@ -96,7 +96,6 @@ def cargar_clientes():
             return df_cli
     except Exception:
         pass
-    # DataFrame por defecto si no existe la hoja
     return pd.DataFrame(columns=["Nombre", "Empresa", "Correo", "Teléfono", "Dirección"])
 
 def obtener_siguiente_folio():
@@ -224,16 +223,16 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
     with st.expander("📦 Consultar Inventario General"):
         st.dataframe(df_inv, use_container_width=True)
 
-    # Selección de Cliente (desde base de datos o manual)
+    df_cli_actual = st.session_state["clientes"]
     col_a1, col_a2, col_a3 = st.columns(3)
     with col_a1:
-        nombres_clientes = df_cli_editado['Nombre'].tolist() if not df_cli_editado.empty and 'Nombre' in df_cli_editado.columns else []
+        nombres_clientes = df_cli_actual['Nombre'].tolist() if not df_cli_actual.empty and 'Nombre' in df_cli_actual.columns else []
         nombres_clientes.insert(0, "Otro / Cliente General")
         
         sel_cliente = st.selectbox("Seleccionar Cliente Registrado", nombres_clientes)
         
         if sel_cliente != "Otro / Cliente General":
-            fila_cli = df_cli_editado[df_cli_editado['Nombre'] == sel_cliente].iloc[0]
+            fila_cli = df_cli_actual[df_cli_actual['Nombre'] == sel_cliente].iloc[0]
             cliente_area = sel_cliente
             correo_area = fila_cli.get('Correo', 'cliente@correo.com')
         else:
@@ -449,7 +448,8 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
 elif menu == "📝 Cotizador Comercial Profesional":
     st.subheader("Generador de Cotizaciones Comerciales")
     
-    nombres_clientes = df_cli_editado['Nombre'].tolist() if not df_cli_editado.empty and 'Nombre' in df_cli_editado.columns else []
+    df_cli_actual = st.session_state["clientes"]
+    nombres_clientes = df_cli_actual['Nombre'].tolist() if not df_cli_actual.empty and 'Nombre' in df_cli_actual.columns else []
     nombres_clientes.insert(0, "Otro / Cliente General")
     sel_cli_com = st.selectbox("Seleccionar Cliente", nombres_clientes, key="sel_cli_com")
     
@@ -511,7 +511,7 @@ elif menu == "📋 Historial de Cotizaciones (Folios)":
             busqueda = st.text_input("🔍 Buscar por Folio o Cliente:")
             if busqueda:
                 df_hist = df_hist[
-                    df_hist["Folio"].astype(str).str.contains(busqueda, case=False, na=False) |
+                    df_hist["Funcionario"].astype(str).str.contains(busqueda, case=False, na=False) |
                     df_hist["Cliente"].astype(str).str.contains(busqueda, case=False, na=False)
                 ]
             st.dataframe(df_hist, use_container_width=True)
