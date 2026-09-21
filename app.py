@@ -20,10 +20,22 @@ st.set_page_config(
 EXCEL_FILE = "Sistema_Inventario_NEMET_Final.xlsx"
 
 # ==========================================
-# FUNCIONES DE CARGA Y GESTIÓN DE DATOS (BLINDADA)
+# FUNCIONES DE CARGA Y LIMPIEZA DE DATOS
 # ==========================================
+def limpiar_precio(val):
+    """Limpia cadenas de texto con $, comas y espacios para convertirlas a número flotante."""
+    if pd.isna(val):
+        return 0.0
+    if isinstance(val, (int, float)):
+        return float(val)
+    val_str = str(val).replace('$', '').replace(',', '').strip()
+    try:
+        return float(val_str)
+    except:
+        return 0.0
+
 def cargar_inventario():
-    """Carga de forma inteligente el inventario normalizando nombres de columnas."""
+    """Carga inteligente de inventario normalizando nombres y limpiando precios."""
     try:
         if os.path.exists(EXCEL_FILE):
             try:
@@ -31,43 +43,45 @@ def cargar_inventario():
             except Exception:
                 df = pd.read_excel(EXCEL_FILE)
             
-            # Limpiar espacios en nombres de columnas si los hay
             df.columns = df.columns.astype(str).str.strip()
             
-            # Mapeo inteligente de columnas comunes por si varían en el Excel
             renombres = {}
             for col in df.columns:
-                col_lower = col.lower()
-                if 'sku' in col_lower:
+                cl = col.lower()
+                if 'codigo' in cl or 'sku' in cl:
                     renombres[col] = 'SKU'
-                elif 'desc' in col_lower:
+                elif 'descripcion' in cl:
                     renombres[col] = 'Descripcion'
-                elif 'presentacion' in col_lower or 'presentación' in col_lower:
+                elif 'presentacion' in cl or 'kg / l' in cl:
                     renombres[col] = 'Presentacion'
-                elif 'precio' in col_lower and ('publico' in col_lower or 'iva' in col_lower or 'venta' in col_lower):
+                elif 'precio de venta' in cl or ('precio' in cl and 'venta' in cl):
                     renombres[col] = 'PrecioPublicoIVA'
-                elif 'stock' in col_lower and 'actual' in col_lower:
+                elif 'precio' in cl and 'publico' in cl:
+                    renombres[col] = 'PrecioPublicoIVA'
+                elif 'stock actual' in cl:
                     renombres[col] = 'StockActual'
-                elif 'stock' in col_lower and 'inicial' in col_lower:
-                    renombres[col] = 'StockInicial'
-                elif 'entrada' in col_lower:
-                    renombres[col] = 'Entradas'
-                elif 'salida' in col_lower:
-                    renombres[col] = 'Salidas'
             
             df = df.rename(columns=renombres)
             
-            # Asegurar columnas mínimas requeridas para que no falle nada
-            if 'SKU' in df.columns:
-                df['SKU'] = df['SKU'].astype(str)
-            if 'PrecioPublicoIVA' not in df.columns:
-                # Buscar cualquier columna numérica de precio si no se mapeó exacto
+            # Limpiar y convertir la columna de precios a numérica real
+            if 'PrecioPublicoIVA' in df.columns:
+                df['PrecioPublicoIVA'] = df['PrecioPublicoIVA'].apply(limpiar_precio)
+            else:
+                found = False
                 for c in df.columns:
                     if 'precio' in c.lower():
-                        df['PrecioPublicoIVA'] = pd.to_numeric(df[c], errors='coerce').fillna(0.0)
+                        df['PrecioPublicoIVA'] = df[c].apply(limpiar_precio)
+                        found = True
                         break
-                if 'PrecioPublicoIVA' not in df.columns:
+                if not found:
                     df['PrecioPublicoIVA'] = 0.0
+
+            if 'SKU' in df.columns:
+                df['SKU'] = df['SKU'].astype(str)
+            if 'Descripcion' not in df.columns and len(df.columns) > 1:
+                df['Descripcion'] = df.iloc[:, 1].astype(str)
+            if 'Presentacion' not in df.columns and len(df.columns) > 2:
+                df['Presentacion'] = df.iloc[:, 2].astype(str)
 
             return df
         else:
@@ -192,7 +206,6 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
 
     st.info(f"📐 **Área Total Calculada:** **{area_total:.2f} m²**")
 
-    # Asegurar columna Descripción válida
     col_desc = 'Descripcion' if 'Descripcion' in df_inv.columns else df_inv.columns[1]
     familias = df_inv[col_desc].unique() if col_desc in df_inv.columns else []
     prod_familia = st.selectbox("Seleccionar Línea de Producto", [f for f in familias if isinstance(f, str)])
@@ -213,12 +226,12 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
         resultados = []
         for _, row in df_familia.iterrows():
             pres_kg = row['Kg_Num']
-            precio_pub = row.get('PrecioPublicoIVA', 0.0)
+            precio_pub = float(row.get('PrecioPublicoIVA', 0.0))
             unidades = int((kg_necesarios // pres_kg) + (1 if kg_necesarios % pres_kg > 0 else 0))
             costo_total = unidades * precio_pub
             resultados.append({
-                "SKU": row.get('SKU', ''),
-                "Presentación": row[col_pres],
+                "SKU": str(row.get('SKU', '')),
+                "Presentación": str(row[col_pres]),
                 "Precio Público": precio_pub,
                 "Unidades": unidades,
                 "Costo Total": costo_total
@@ -257,28 +270,46 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
             if st.button("📄 Descargar PDF"):
                 pdf = FPDF()
                 pdf.add_page()
-                pdf.set_font("helvetica", "B", 16)
-                pdf.cell(0, 10, f"COTIZACION OFICIAL - {folio_actual}", 0, 1, "C")
-                pdf.set_font("helvetica", "", 11)
-                pdf.cell(0, 6, f"Cliente: {cliente_area}", 0, 1)
-                pdf.cell(0, 6, f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M')}", 0, 1)
-                pdf.ln(5)
-
-                pdf.set_font("helvetica", "B", 10)
-                pdf.cell(25, 8, "SKU", 1)
-                pdf.cell(85, 8, "Descripcion", 1)
-                pdf.cell(30, 8, "Cant.", 1, 0, "C")
-                pdf.cell(40, 8, "Subtotal", 1, 1, "R")
-
+                pdf.set_font("helvetica", "B", 15)
+                pdf.set_text_color(30, 58, 138)
+                pdf.cell(0, 10, "SISTEMA MAESTRO NEMET", 0, 1, "L")
                 pdf.set_font("helvetica", "", 10)
+                pdf.set_text_color(100, 100, 100)
+                pdf.cell(0, 5, "Productos Quimicos y Especialidades Epoxicas", 0, 1, "L")
+                pdf.ln(5)
+
+                pdf.set_font("helvetica", "", 11)
+                pdf.set_text_color(0, 0, 0)
+                pdf.cell(0, 6, f"Cliente: {cliente_area}", 0, 1)
+                pdf.cell(0, 6, f"Fecha: {datetime.now().strftime('%Y-%m-%d')}", 0, 1)
+                pdf.cell(0, 6, f"Cotizacion por Area y Sistemas Epoxicos ({folio_actual})", 0, 1)
+                pdf.cell(0, 6, f"Parametros: Area: {area_total:.1f} m² | Espesor: {espesor_mm} mm", 0, 1)
+                pdf.ln(5)
+
+                # Tabla PDF
+                pdf.set_fill_color(30, 58, 138)
+                pdf.set_text_color(255, 255, 255)
+                pdf.set_font("helvetica", "B", 9)
+                pdf.cell(25, 8, "SKU", 1, 0, "C", True)
+                pdf.cell(75, 8, "Descripcion / Sistema", 1, 0, "L", True)
+                pdf.cell(30, 8, "Presentacion", 1, 0, "C", True)
+                pdf.cell(20, 8, "Unidades", 1, 0, "C", True)
+                pdf.cell(40, 8, "Subtotal", 1, 1, "R", True)
+
+                pdf.set_font("helvetica", "", 9)
+                pdf.set_text_color(50, 50, 50)
                 for _, row in st.session_state["carrito_area"].iterrows():
-                    pdf.cell(25, 7, str(row["SKU"]), 1)
-                    pdf.cell(85, 7, str(row["Descripcion"]), 1)
-                    pdf.cell(30, 7, str(row["Cantidad"]), 1, 0, "C")
-                    pdf.cell(40, 7, f"${row['Subtotal']:,.2f}", 1, 1, "R")
+                    pdf.cell(25, 7, str(row["SKU"]), 1, 0, "C")
+                    pdf.cell(75, 7, str(row["Descripcion"]), 1, 0, "L")
+                    pdf.cell(30, 7, str(row["Presentacion"]), 1, 0, "C")
+                    pdf.cell(20, 7, str(row["Cantidad"]), 1, 0, "C")
+                    pdf.cell(40, 7, f"${float(row['Subtotal']):,.2f}", 1, 1, "R")
 
                 pdf.ln(5)
-                pdf.cell(0, 6, f"TOTAL: ${total_c:,.2f} MXN", 0, 1, "R")
+                pdf.set_font("helvetica", "B", 10)
+                pdf.cell(0, 6, f"Subtotal: ${subtotal_c:,.2f} MXN", 0, 1, "R")
+                pdf.cell(0, 6, f"IVA (16%): ${iva_c:,.2f} MXN", 0, 1, "R")
+                pdf.cell(0, 6, f"Total General: ${total_c:,.2f} MXN", 0, 1, "R")
 
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                     pdf.output(tmp.name)
@@ -296,27 +327,45 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
                 try:
                     pdf = FPDF()
                     pdf.add_page()
-                    pdf.set_font("helvetica", "B", 16)
-                    pdf.cell(0, 10, f"COTIZACION OFICIAL - {folio_actual}", 0, 1, "C")
-                    pdf.set_font("helvetica", "", 11)
-                    pdf.cell(0, 6, f"Cliente: {cliente_area}", 0, 1)
-                    pdf.ln(5)
-
-                    pdf.set_font("helvetica", "B", 10)
-                    pdf.cell(25, 8, "SKU", 1)
-                    pdf.cell(85, 8, "Descripcion", 1)
-                    pdf.cell(30, 8, "Cant.", 1, 0, "C")
-                    pdf.cell(40, 8, "Subtotal", 1, 1, "R")
-
+                    pdf.set_font("helvetica", "B", 15)
+                    pdf.set_text_color(30, 58, 138)
+                    pdf.cell(0, 10, "SISTEMA MAESTRO NEMET", 0, 1, "L")
                     pdf.set_font("helvetica", "", 10)
+                    pdf.set_text_color(100, 100, 100)
+                    pdf.cell(0, 5, "Productos Quimicos y Especialidades Epoxicas", 0, 1, "L")
+                    pdf.ln(5)
+
+                    pdf.set_font("helvetica", "", 11)
+                    pdf.set_text_color(0, 0, 0)
+                    pdf.cell(0, 6, f"Cliente: {cliente_area}", 0, 1)
+                    pdf.cell(0, 6, f"Fecha: {datetime.now().strftime('%Y-%m-%d')}", 0, 1)
+                    pdf.cell(0, 6, f"Cotizacion por Area y Sistemas Epoxicos ({folio_actual})", 0, 1)
+                    pdf.cell(0, 6, f"Parametros: Area: {area_total:.1f} m² | Espesor: {espesor_mm} mm", 0, 1)
+                    pdf.ln(5)
+
+                    pdf.set_fill_color(30, 58, 138)
+                    pdf.set_text_color(255, 255, 255)
+                    pdf.set_font("helvetica", "B", 9)
+                    pdf.cell(25, 8, "SKU", 1, 0, "C", True)
+                    pdf.cell(75, 8, "Descripcion / Sistema", 1, 0, "L", True)
+                    pdf.cell(30, 8, "Presentacion", 1, 0, "C", True)
+                    pdf.cell(20, 8, "Unidades", 1, 0, "C", True)
+                    pdf.cell(40, 8, "Subtotal", 1, 1, "R", True)
+
+                    pdf.set_font("helvetica", "", 9)
+                    pdf.set_text_color(50, 50, 50)
                     for _, row in st.session_state["carrito_area"].iterrows():
-                        pdf.cell(25, 7, str(row["SKU"]), 1)
-                        pdf.cell(85, 7, str(row["Descripcion"]), 1)
-                        pdf.cell(30, 7, str(row["Cantidad"]), 1, 0, "C")
-                        pdf.cell(40, 7, f"${row['Subtotal']:,.2f}", 1, 1, "R")
+                        pdf.cell(25, 7, str(row["SKU"]), 1, 0, "C")
+                        pdf.cell(75, 7, str(row["Descripcion"]), 1, 0, "L")
+                        pdf.cell(30, 7, str(row["Presentacion"]), 1, 0, "C")
+                        pdf.cell(20, 7, str(row["Cantidad"]), 1, 0, "C")
+                        pdf.cell(40, 7, f"${float(row['Subtotal']):,.2f}", 1, 1, "R")
 
                     pdf.ln(5)
-                    pdf.cell(0, 6, f"TOTAL: ${total_c:,.2f} MXN", 0, 1, "R")
+                    pdf.set_font("helvetica", "B", 10)
+                    pdf.cell(0, 6, f"Subtotal: ${subtotal_c:,.2f} MXN", 0, 1, "R")
+                    pdf.cell(0, 6, f"IVA (16%): ${iva_c:,.2f} MXN", 0, 1, "R")
+                    pdf.cell(0, 6, f"Total General: ${total_c:,.2f} MXN", 0, 1, "R")
 
                     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                         pdf.output(tmp.name)
@@ -330,7 +379,7 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
                     msg["To"] = correo_area
                     msg["Subject"] = f"Cotización Oficial NEMET - {folio_actual}"
                     
-                    cuerpo = f"Hola {cliente_area},\n\nAdjunto encontrarás la cotización {folio_actual}.\n\nTotal: ${total_c:,.2f} MXN\n\nSaludos cordiales,\nEquipo NEMET"
+                    cuerpo = f"Hola {cliente_area},\n\nAdjunto encontrarás la cotización oficial {folio_actual}.\n\nTotal: ${total_c:,.2f} MXN\n\nSaludos cordiales,\nEquipo NEMET"
                     msg.attach(MIMEText(cuerpo, "plain", "utf-8"))
 
                     with open(tmp_path, "rb") as f:
@@ -363,14 +412,14 @@ elif menu == "📝 Cotizador Comercial Profesional":
     col_sku = 'SKU' if 'SKU' in df_inv.columns else df_inv.columns[0]
     col_pres = 'Presentacion' if 'Presentacion' in df_inv.columns else df_inv.columns[2]
     
-    opciones_cot = [f"{row[col_sku]} - {row[col_desc]} ({row[col_pres]}) - ${row.get('PrecioPublicoIVA', 0):,.2f}" for _, row in df_inv.iterrows()]
+    opciones_cot = [f"{row[col_sku]} - {row[col_desc]} ({row[col_pres]}) - ${float(row.get('PrecioPublicoIVA', 0)):,.2f}" for _, row in df_inv.iterrows()]
     prod_sel = st.selectbox("Seleccionar Producto", opciones_cot)
     cant = st.number_input("Cantidad", min_value=1, value=1)
     
     if st.button("Agregar al Carrito Comercial"):
         sku_c = prod_sel.split(" - ")[0]
         fila = df_inv[df_inv[col_sku].astype(str) == sku_c].iloc[0]
-        subtotal = cant * fila.get('PrecioPublicoIVA', 0)
+        subtotal = cant * float(fila.get('PrecioPublicoIVA', 0))
         
         nuevo_item = {
             "SKU": sku_c,
