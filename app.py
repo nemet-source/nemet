@@ -20,7 +20,7 @@ st.set_page_config(
 EXCEL_FILE = "Sistema_Inventario_NEMET_Final.xlsx"
 
 # ==========================================
-# FUNCIONES DE DATOS E HISTORIAL (NUEVO)
+# FUNCIONES DE DATOS E HISTORIAL
 # ==========================================
 def obtener_siguiente_folio():
     """Genera un folio consecutivo basado en el historial existente en Excel."""
@@ -61,14 +61,13 @@ def registrar_cotizacion_en_excel(folio, cliente, items_carrito, total_general):
         print(f"Error al guardar historial: {e}")
         return False
 
-# Cargar inventario principal
+# Cargar inventario principal desde Excel
 @st.cache_data(ttl=60)
 def cargar_inventario():
     try:
-        df = pd.read_excel(EXCEL_FILE, sheet_name="Inventario") # Ajusta el nombre de la hoja si es necesario
+        df = pd.read_excel(EXCEL_FILE, sheet_name="Inventario")
         return df
-    except Exception as e:
-        # Si la hoja de inventario genérica tiene otro nombre, intentamos leer la primera
+    except Exception:
         df = pd.read_excel(EXCEL_FILE)
         return df
 
@@ -81,7 +80,7 @@ st.sidebar.title("Menú Principal")
 menu = st.sidebar.radio("Navegación", ["Cotizador por Área y Milimétrico", "📋 Historial de Cotizaciones"])
 
 # ==========================================
-# MÓDULO 1: COTIZADOR POR ÁREA
+# MÓDULO 1: COTIZADOR POR ÁREA Y INVENTARIO
 # ==========================================
 if menu == "Cotizador por Área y Milimétrico":
     st.title("🧪 Sistema Maestro NEMET - Cotizador Profesional")
@@ -90,6 +89,10 @@ if menu == "Cotizador por Área y Milimétrico":
     if "carrito_area" not in st.session_state:
         st.session_state["carrito_area"] = pd.DataFrame(columns=["SKU", "Descripcion", "Presentacion", "Cantidad", "Subtotal"])
 
+    # Mostrar inventario general cargado de Excel para consulta
+    with st.expander("📦 Ver Inventario General Sincronizado"):
+        st.dataframe(df_inventario, use_container_width=True)
+
     st.sidebar.markdown("---")
     st.sidebar.subheader("Parámetros de Área")
     ancho = st.sidebar.number_input("Ancho (metros)", min_value=0.1, value=3.0, step=0.1)
@@ -97,12 +100,9 @@ if menu == "Cotizador por Área y Milimétrico":
     area_total = ancho * largo
     st.sidebar.info(f"Área Calculada: **{area_total:.2f} m²**")
 
-    # Lógica de recomendación de producto (Ejemplo basado en tus datos)
-    # Suponiendo que el inventario tiene columnas: SKU, Descripcion, Presentacion, _precio_pub, etc.
+    # Lógica de recomendación de producto
     st.subheader("💡 Recomendación Óptima")
-    
-    # Supuesto de producto recomendado estándar basado en área
-    kg_estimados = area_total * 1.5 # 1.5 kg por m² aprox
+    kg_estimados = area_total * 1.5 
     presentacion_sugerida = "20 kg" if kg_estimados > 10 else "4 kg"
     precio_ejemplo = 7490.0 if presentacion_sugerida == "20 kg" else 1850.0
 
@@ -130,7 +130,6 @@ if menu == "Cotizador por Área y Milimétrico":
 
         st.markdown(f"**Subtotal:** ${subtotal_carrito:,.2f} MXN | **IVA (16%):** ${iva:,.2f} MXN | **Total:** **${total_general:,.2f} MXN**")
 
-        # Datos del cliente para envío/PDF
         col_c1, col_c2 = st.columns(2)
         with col_c1:
             nombre_cliente = st.text_input("Nombre del Cliente", "Cliente General")
@@ -155,7 +154,6 @@ if menu == "Cotizador por Área y Milimétrico":
                     pdf.cell(0, 10, f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M')}", 0, 1, "L")
                     pdf.ln(5)
 
-                    # Tabla PDF
                     pdf.set_font("helvetica", "B", 10)
                     pdf.cell(30, 8, "SKU", 1)
                     pdf.cell(80, 8, "Descripcion", 1)
@@ -183,7 +181,6 @@ if menu == "Cotizador por Área y Milimétrico":
 
                     os.unlink(tmp_path)
                     
-                    # Registrar en historial automáticamente al generar PDF
                     registrar_cotizacion_en_excel(folio_actual, nombre_cliente, st.session_state["carrito_area"], total_general)
 
                     st.download_button(
@@ -199,7 +196,6 @@ if menu == "Cotizador por Área y Milimétrico":
         with col2:
             if st.button("📧 Enviar por Correo al Cliente"):
                 try:
-                    # Generar PDF temporal para adjuntar
                     pdf = FPDF()
                     pdf.add_page()
                     pdf.set_font("helvetica", "B", 16)
@@ -229,7 +225,6 @@ if menu == "Cotizador por Área y Milimétrico":
                         pdf.output(tmp_file.name)
                         tmp_path = tmp_file.name
 
-                    # Credenciales desde Secrets de Streamlit
                     remitente = st.secrets["email"]["remitente"]
                     password = st.secrets["email"]["password"]
 
@@ -246,7 +241,6 @@ if menu == "Cotizador por Área y Milimétrico":
                     adjunto["Content-Disposition"] = f'attachment; filename="{folio_actual}.pdf"'
                     msg.attach(adjunto)
 
-                    # Conexión SMTP segura con puerto 587 y STARTTLS
                     server = smtplib.SMTP("smtp.gmail.com", 587)
                     server.starttls()
                     server.login(remitente, password)
@@ -255,7 +249,6 @@ if menu == "Cotizador por Área y Milimétrico":
 
                     os.unlink(tmp_path)
 
-                    # Registrar en historial automáticamente al enviar correo
                     registrar_cotizacion_en_excel(folio_actual, nombre_cliente, st.session_state["carrito_area"], total_general)
 
                     st.success("¡Correo enviado exitosamente al cliente!")
@@ -270,7 +263,7 @@ if menu == "Cotizador por Área y Milimétrico":
         st.info("El carrito está vacío. Agrega una recomendación o producto para comenzar.")
 
 # ==========================================
-# MÓDULO 2: HISTORIAL DE COTIZACIONES (NUEVO)
+# MÓDULO 2: HISTORIAL DE COTIZACIONES
 # ==========================================
 elif menu == "📋 Historial de Cotizaciones":
     st.title("📋 Historial y Registro de Cotizaciones")
@@ -279,7 +272,6 @@ elif menu == "📋 Historial de Cotizaciones":
     try:
         df_historial = pd.read_excel(EXCEL_FILE, sheet_name="Historial_Cotizaciones")
         if not df_historial.empty:
-            # Filtro de búsqueda por cliente o folio
             busqueda = st.text_input("🔍 Buscar por Folio o Cliente:")
             if busqueda:
                 df_filtrado = df_historial[
