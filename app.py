@@ -23,7 +23,6 @@ EXCEL_FILE = "Sistema_Inventario_NEMET_Final.xlsx"
 # FUNCIONES DE CARGA Y LIMPIEZA DE DATOS
 # ==========================================
 def limpiar_precio(val):
-    """Limpia cadenas de texto con $, comas y espacios para convertirlas a número flotante."""
     if pd.isna(val):
         return 0.0
     if isinstance(val, (int, float)):
@@ -35,14 +34,16 @@ def limpiar_precio(val):
         return 0.0
 
 def cargar_inventario():
-    """Carga inteligente de inventario normalizando nombres y limpiando precios."""
+    """Carga inteligente usando header=1 para saltar el título del Excel."""
     try:
         if os.path.exists(EXCEL_FILE):
             try:
-                df = pd.read_excel(EXCEL_FILE, sheet_name="Inventario")
+                df = pd.read_excel(EXCEL_FILE, sheet_name="Inventario", header=1)
             except Exception:
-                df = pd.read_excel(EXCEL_FILE)
+                df = pd.read_excel(EXCEL_FILE, header=1)
             
+            # Limpiar columnas vacías o Unnamed
+            df = df.loc[:, ~df.columns.str.contains("^Unnamed", na=False)]
             df.columns = df.columns.astype(str).str.strip()
             
             renombres = {}
@@ -63,17 +64,14 @@ def cargar_inventario():
             
             df = df.rename(columns=renombres)
             
-            # Limpiar y convertir la columna de precios a numérica real
             if 'PrecioPublicoIVA' in df.columns:
                 df['PrecioPublicoIVA'] = df['PrecioPublicoIVA'].apply(limpiar_precio)
             else:
-                found = False
                 for c in df.columns:
                     if 'precio' in c.lower():
                         df['PrecioPublicoIVA'] = df[c].apply(limpiar_precio)
-                        found = True
                         break
-                if not found:
+                if 'PrecioPublicoIVA' not in df.columns:
                     df['PrecioPublicoIVA'] = 0.0
 
             if 'SKU' in df.columns:
@@ -181,7 +179,7 @@ elif menu == "📦 Control de Inventario y Edición":
     if st.button("💾 Guardar Cambios en Excel"):
         try:
             with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
-                df_editado.to_excel(writer, sheet_name="Inventario", index=False)
+                df_editado.to_excel(writer, sheet_name="Inventario", index=False, startrow=1)
             st.session_state["inventario"] = df_editado
             st.success("¡Inventario actualizado y guardado exitosamente!")
         except Exception as e:
@@ -286,7 +284,6 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
                 pdf.cell(0, 6, f"Parametros: Area: {area_total:.1f} m² | Espesor: {espesor_mm} mm", 0, 1)
                 pdf.ln(5)
 
-                # Tabla PDF
                 pdf.set_fill_color(30, 58, 138)
                 pdf.set_text_color(255, 255, 255)
                 pdf.set_font("helvetica", "B", 9)
