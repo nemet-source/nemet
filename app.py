@@ -9,6 +9,37 @@ from email.mime.application import MIMEApplication
 from fpdf import FPDF
 import tempfile
 import os
+import git
+import os
+
+def guardar_cambios_github(mensaje="Actualización automática de datos"):
+    try:
+        repo_dir = os.getcwd()
+        repo = git.Repo(repo_dir)
+        
+        # Configurar identidad de Git
+        with repo.config_writer() as git_config:
+            git_config.set_value('user', 'name', 'Streamlit Bot')
+            git_config.set_value('user', 'email', 'bot@streamlit.app')
+        
+        # Leer credenciales desde los Secrets
+        token = st.secrets["git"]["token"]
+        repo_name = st.secrets["git"]["repo"]
+        
+        # Configurar URL remota con autenticación
+        origin = repo.remote(name='origin')
+        origin.set_url(f"https://{token}@github.com/{repo_name}.git")
+        
+        # Añadir tu archivo de Excel modificado
+        repo.index.add(["Sistema_Inventario_NEMET_Final.xlsx"])
+        
+        # Hacer commit y push
+        repo.index.commit(mensaje)
+        origin.push(refspec='main:main')
+        
+        st.success("¡Datos guardados y respaldados en GitHub correctamente!")
+    except Exception as e:
+        st.error(f"Error al sincronizar con GitHub: {e}")
 
 # Configuración de la página
 st.set_page_config(
