@@ -439,7 +439,7 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
                 except Exception as e:
                     st.error(f"Error al enviar correo: {e}")
 
-        with col_b3:
+    with col_b3:
             if st.button("🗑️ Limpiar Carrito"):
                 st.session_state["carrito_area"] = pd.DataFrame(columns=["SKU", "Descripcion", "Presentacion", "Cantidad", "Subtotal"])
                 st.rerun()
