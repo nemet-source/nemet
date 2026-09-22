@@ -302,7 +302,7 @@ total_c = subtotal_c
 base_c = total_c / 1.16
 iva_c = total_c - base_c
 
-        st.markdown(f"**Subtotal:** ${subtotal_c:,.2f} MXN | **IVA (16%):** ${iva_c:,.2f} MXN | **Total:** ${total_c:,.2f} MXN")
+        st.markdown(f"**Subtotal (Base):** ${base_c:,.2f} MXN | **IVA (16% incl.):** ${iva_c:,.2f} MXN | **Total Final:** ${total_c:,.2f} MXN")
     folio_actual = obtener_siguiente_folio()
     st.caption(f"Folio consecutivo asignado: **{folio_actual}**")
 
