@@ -362,7 +362,7 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
                 registrar_cotizacion_en_excel(folio_actual, cliente_area, st.session_state["carrito_area"], total_c)
                 st.download_button("📥 Descargar Archivo PDF", pdf_bytes, file_name=f"{folio_actual}.pdf", mime="application/pdf")
 
-        with col_b2:
+    with col_b2:
             if st.button("📧 Enviar por Correo"):
                 try:
                     pdf = FPDF()
