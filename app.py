@@ -303,7 +303,8 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
     iva_c = total_c - base_c
     st.markdown(f"**Subtotal (Base):** ${base_c:,.2f} MXN | **IVA (16% incl.):** ${iva_c:,.2f} MXN | **Total Final:** ${total_c:,.2f} MXN")
     folio_actual = obtener_siguiente_folio()
-    st.caption(f"Folio consecutivo asignado: **{folio_actual}**")    col_b1, col_b2, col_b3 = st.columns(3)
+    st.caption(f"Folio consecutivo asignado: **{folio_actual}**")    
+    col_b1, col_b2, col_b3 = st.columns(3)
 
     with col_b1:
             if st.button("📄 Descargar PDF"):
