@@ -305,7 +305,7 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
     folio_actual = obtener_siguiente_folio()
     st.caption(f"Folio consecutivo asignado: **{folio_actual}**")
 
-        col_b1, col_b2, col_b3 = st.columns(3)
+    col_b1, col_b2, col_b3 = st.columns(3)
 
         with col_b1:
             if st.button("📄 Descargar PDF"):
