@@ -298,8 +298,9 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
         st.dataframe(st.session_state["carrito_area"], use_container_width=True)
 
         subtotal_c = st.session_state["carrito_area"]["Subtotal"].sum()
-        iva_c = subtotal_c * 0.16
-        total_c = subtotal_c + iva_c
+total_c = subtotal_c 
+base_c = total_c / 1.16
+iva_c = total_c - base_c
 
         st.markdown(f"**Subtotal:** ${subtotal_c:,.2f} MXN | **IVA (16%):** ${iva_c:,.2f} MXN | **Total:** ${total_c:,.2f} MXN")
     folio_actual = obtener_siguiente_folio()
