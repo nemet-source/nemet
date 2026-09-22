@@ -307,7 +307,7 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
 
     col_b1, col_b2, col_b3 = st.columns(3)
 
-        with col_b1:
+    with col_b1:
             if st.button("📄 Descargar PDF"):
                 pdf = FPDF()
                 pdf.add_page()
