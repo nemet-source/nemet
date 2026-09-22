@@ -303,7 +303,7 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
 
     st.markdown(f"**Subtotal:** ${subtotal_c:,.2f} MXN  |  **IVA (16%):** ${iva_c:,.2f} MXN  |  **Total:** **${total_c:,.2f} MXN**")
     folio_actual = obtener_siguiente_folio()
-        st.caption(f"Folio consecutivo asignado: **{folio_actual}**")
+    st.caption(f"Folio consecutivo asignado: **{folio_actual}**")
 
         col_b1, col_b2, col_b3 = st.columns(3)
 
