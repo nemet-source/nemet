@@ -1,0 +1,12 @@
+# Entornos y caché de Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Secretos locales de Streamlit (nunca subir credenciales)
+.streamlit/secrets.toml
+
+# Archivos temporales de Excel/SO
+~$*.xlsx
+.DS_Store
