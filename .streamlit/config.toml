@@ -1,0 +1,11 @@
+# Tema de marca NEMET — "Naturaleza que habita"
+# Colores tomados de los logos originales (PALETA_NEMET en app.py).
+[theme]
+base = "light"
+primaryColor = "#B4552D"
+backgroundColor = "#F5EFE6"
+secondaryBackgroundColor = "#EFE7DB"
+textColor = "#26231F"
+
+[browser]
+gatherUsageStats = false

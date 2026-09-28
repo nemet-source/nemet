@@ -18,11 +18,35 @@ cotizaciones de productos químicos y sistemas epóxicos de NEMET. Usa el archiv
 Ambos cotizadores generan el PDF, lo envían por correo y registran el folio en la hoja
 `Historial_Cotizaciones` (una sola vez por carrito, aunque se descargue o envíe varias veces).
 
+## Identidad de marca NEMET
+
+Los cuatro assets de la app viven en `assets/` y se generan a partir de los logos originales
+con la herramienta del repo (auto-detecta el fondo de la imagen de entrada):
+
+| Asset | Uso |
+|---|---|
+| `assets/logo_claro.png` | Logotipo en relieve (transparente) — cabecera en tema claro, barra lateral. |
+| `assets/logo_oscuro.png` | Letterpress — cabecera en tema oscuro. |
+| `assets/favicon.png` | Isotipo sobre pastilla crema — icono de pestaña. |
+| `assets/hero_oscuro.png` | Portada letterpress 1600×900 — apertura del dashboard. |
+
+```bash
+# Regenerar los 4 assets desde los originales (el script auto-detecta el fondo)
+python herramientas/procesar_logo.py /ruta/logo_claro.png          # -> logo_claro + favicon
+python herramientas/procesar_logo.py /ruta/logo_oscuro.png --dark  # -> logo_oscuro + hero_oscuro
+```
+
+La paleta (`PALETA_NEMET` en `app.py`) y el tema (`assets` en `.streamlit/config.toml`) comparten
+los colores de los logos: crema `#F5EFE6`, tinta `#26231F`, barro `#B4552D`, verde `#2F5D3A`.
+
 ## Ejecución local
 
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
+
+# Batería de pruebas del sistema de marca (24/24)
+python tests_bateria.py
 ```
 
 ## Secrets (opcionales)
