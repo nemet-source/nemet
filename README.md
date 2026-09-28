@@ -20,21 +20,22 @@ Ambos cotizadores generan el PDF, lo envían por correo y registran el folio en 
 
 ## Identidad de marca NEMET
 
-Los cuatro assets de la app viven en `assets/` y se generan a partir de los logos originales
+Los tres assets de la app viven en `assets/` y se generan a partir del logo original
 con la herramienta del repo (auto-detecta el fondo de la imagen de entrada):
 
 | Asset | Uso |
 |---|---|
-| `assets/logo_claro.png` | Logotipo en relieve (transparente) — cabecera en tema claro, barra lateral. |
-| `assets/logo_oscuro.png` | Letterpress — cabecera en tema oscuro. |
+| `assets/logo_claro.png` | Logotipo en relieve (transparente) — cabecera y barra lateral. |
 | `assets/favicon.png` | Isotipo sobre pastilla crema — icono de pestaña. |
-| `assets/hero_oscuro.png` | Portada letterpress 1600×900 — apertura del dashboard. |
+| `assets/hero_claro.png` | Portada crema 1600×900 — apertura del dashboard. |
 
 ```bash
-# Regenerar los 4 assets desde los originales (el script auto-detecta el fondo)
-python herramientas/procesar_logo.py /ruta/logo_claro.png          # -> logo_claro + favicon
-python herramientas/procesar_logo.py /ruta/logo_oscuro.png --dark  # -> logo_oscuro + hero_oscuro
+# Regenerar los 3 assets desde el logo original (el script auto-detecta el fondo)
+python herramientas/procesar_logo.py /ruta/logo_claro.png   # -> logo_claro + favicon + hero_claro
 ```
+
+La app usa **solo el logo claro**: el letterpress oscuro (`logo_oscuro.png` /
+`hero_oscuro.png`) se retiró de la interfaz y ya no se genera.
 
 La paleta (`PALETA_NEMET` en `app.py`) y el tema (`assets` en `.streamlit/config.toml`) comparten
 los colores de los logos: crema `#F5EFE6`, tinta `#26231F`, barro `#B4552D`, verde `#2F5D3A`.
