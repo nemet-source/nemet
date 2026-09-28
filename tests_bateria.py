@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Batería de pruebas del sistema de marca NEMET (24 pruebas).
 
-Cubre la herramienta de procesado (herramientas/procesar_logo.py), los 4 assets
+Cubre la herramienta de procesado (herramientas/procesar_logo.py), los 3 assets
 generados, la integración de marca en app.py y la configuración del repo.
 
 Uso:  python tests_bateria.py     →  "24/24 OK" si todo pasa.
@@ -106,30 +106,31 @@ class TestHerramienta(unittest.TestCase):
         self.assertLess(int(fa[0, 0, 3]), 60)            # esquina redondeada casi transparente
         self.assertGreater(int(fa[32, 32, 3]), 200)     # centro opaco
 
-    def test_10_hero_dimension_y_oscuro(self):
-        logo = Image.new("RGBA", (400, 200), (30, 30, 30, 255))
+    def test_10_hero_dimension_y_claro(self):
+        logo = Image.new("RGBA", (400, 200), (38, 35, 31, 255))
         hero = pl.generar_hero(logo, ancho=800, alto=450)
         self.assertEqual(hero.size, (800, 450))
         ha = np.array(hero)[..., :3]
-        self.assertLess(float(ha.mean()), 80)
+        self.assertGreater(float(ha[4, 4].mean()), 220)      # borde crema (viñeta suave)
+        self.assertLess(float(ha[225, 400].mean()), 80)      # el logo sí va compuesto al centro
+        self.assertGreater(float(ha.mean()), 150)            # lienzo claro, no letterpress
 
-    def test_11_cli_genera_pares_correctos(self):
+    def test_11_cli_genera_el_trio_claro_y_rechaza_el_oscuro(self):
         with tempfile.TemporaryDirectory() as tdir:
             claro_in = os.path.join(tdir, "claro.png")
             Image.fromarray(img_claro_sintetica(), "RGB").save(claro_in)
             sal = os.path.join(tdir, "assets")
             rc = pl.main([claro_in, "--salida", sal])
             self.assertEqual(rc, 0)
-            self.assertEqual(sorted(os.listdir(sal)), ["favicon.png", "logo_claro.png"])
+            self.assertEqual(sorted(os.listdir(sal)), ["favicon.png", "hero_claro.png", "logo_claro.png"])
+            # la marca ya no genera letterpress: una entrada con fondo negro se rechaza
             osc_in = os.path.join(tdir, "oscuro.png")
-            arr = np.zeros((100, 140, 4), np.uint8)
-            arr[20:80, 30:110, :3] = (150, 90, 60)
-            arr[20:80, 30:110, 3] = 255
+            arr = np.dstack([np.full((100, 140, 3), (4, 4, 5), np.uint8),
+                             np.full((100, 140), 255, np.uint8)])
             Image.fromarray(arr, "RGBA").save(osc_in)
-            sal2 = os.path.join(tdir, "assets2")
-            rc = pl.main([osc_in, "--dark", "--salida", sal2])
-            self.assertEqual(rc, 0)
-            self.assertEqual(sorted(os.listdir(sal2)), ["hero_oscuro.png", "logo_oscuro.png"])
+            with self.assertRaises(SystemExit):
+                pl.main([osc_in, "--salida", os.path.join(tdir, "assets2")])
+            self.assertFalse(os.path.exists(os.path.join(tdir, "assets2")))
 
     def test_12_lado_maximo_respetado(self):
         foto = img_claro_sintetica(alto=600, ancho=800)
@@ -143,9 +144,12 @@ class TestAssets(unittest.TestCase):
 
     ASSETS = os.path.join(BASE, "assets")
 
-    def test_13_existen_los_cuatro_assets(self):
-        for n in ("logo_claro.png", "logo_oscuro.png", "favicon.png", "hero_oscuro.png"):
+    def test_13_existen_los_tres_assets(self):
+        for n in ("logo_claro.png", "favicon.png", "hero_claro.png"):
             self.assertTrue(os.path.exists(os.path.join(self.ASSETS, n)), f"falta assets/{n}")
+        # el letterpress oscuro se retiró de la interfaz
+        for n in ("logo_oscuro.png", "hero_oscuro.png"):
+            self.assertFalse(os.path.exists(os.path.join(self.ASSETS, n)), f"assets/{n} ya no debe existir")
 
     def test_14_logo_claro_transparente_con_contenido(self):
         a = np.array(Image.open(os.path.join(self.ASSETS, "logo_claro.png")))
@@ -153,9 +157,9 @@ class TestAssets(unittest.TestCase):
         self.assertEqual(int(a[0, 0, 3]), 0)
         self.assertGreater(float((a[..., 3] > 200).mean()), 0.15)
 
-    def test_15_logo_oscuro_lado_maximo(self):
-        im = Image.open(os.path.join(self.ASSETS, "logo_oscuro.png"))
-        self.assertEqual(max(im.size), 1400)
+    def test_15_logo_claro_lado_maximo(self):
+        im = Image.open(os.path.join(self.ASSETS, "logo_claro.png"))
+        self.assertLessEqual(max(im.size), 1400)
         a = np.array(im)
         self.assertEqual(int(a[0, 0, 3]), 0)
 
@@ -166,10 +170,13 @@ class TestAssets(unittest.TestCase):
         self.assertLess(int(a[0, 0, 3]), 100)
         self.assertGreater(int(a[64, 64, 3]), 150)
 
-    def test_17_hero_oscuro_1600x900(self):
-        im = Image.open(os.path.join(self.ASSETS, "hero_oscuro.png"))
+    def test_17_hero_claro_1600x900(self):
+        im = Image.open(os.path.join(self.ASSETS, "hero_claro.png"))
         self.assertEqual(im.size, (1600, 900))
-        self.assertLess(float(np.array(im)[..., :3].mean()), 80)
+        a = np.array(im)[..., :3].astype(np.float64)
+        luma = a @ np.array([0.299, 0.587, 0.114])
+        self.assertGreater(float(a.mean()), 150)             # portada crema, no letterpress
+        self.assertGreater(float((luma < 200).mean()), 0.05)  # el logo ocupa el centro
 
     def test_18_originales_fuera_del_repo(self):
         for n in ("Logo NEMET.png", "Logo NEMET 3.png"):
@@ -195,9 +202,11 @@ class TestApp(unittest.TestCase):
                       "def estilos_marca", "def cabecera_marca", "def portada_marca"):
             self.assertIn(token, self.src, f"falta {token} en app.py")
 
-    def test_21_app_referencia_los_cuatro_assets(self):
-        for n in ("logo_claro.png", "logo_oscuro.png", "favicon.png", "hero_oscuro.png"):
+    def test_21_app_referencia_solo_assets_claros(self):
+        for n in ("logo_claro.png", "favicon.png", "hero_claro.png"):
             self.assertIn(n, self.src, f"app.py no referencia {n}")
+        for n in ("logo_oscuro.png", "hero_oscuro.png"):
+            self.assertNotIn(n, self.src, f"app.py ya no debe referenciar {n}")
 
     def test_22_lema_en_franja_y_pie(self):
         self.assertIn("nemet-lema", self.src)

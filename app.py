@@ -35,7 +35,7 @@ PALETA_NEMET = {
     "barro": "#B4552D",    # acento primario (terracota)
     "verde": "#2F5D3A",    # acento secundario (epoxi verde)
     "piedra": "#8F8B84",   # gris medio (cemento)
-    "carbon": "#141210",   # fondo oscuro (letterpress)
+    "carbon": "#141210",   # negro profundo (contraste)
 }
 
 
@@ -56,16 +56,9 @@ def _imagen_asset(nombre):
         return None
 
 
-def _tema_oscuro():
-    try:
-        return str(st.get_option("theme.base")).lower() == "dark"
-    except Exception:
-        return False
-
-
 def logo_marca():
-    """Logo para la cabecera: letterpress en tema oscuro, relieve claro en tema claro."""
-    return _imagen_asset("logo_oscuro.png" if _tema_oscuro() else "logo_claro.png")
+    """Logo de la marca: siempre la versión clara (el letterpress oscuro se retiró de la interfaz)."""
+    return _imagen_asset("logo_claro.png")
 
 
 def estilos_marca():
@@ -84,7 +77,7 @@ def estilos_marca():
 
 
 def cabecera_marca():
-    """Franja de marca al inicio de cada vista (logo del tema + lema). Silenciosa si faltan los assets."""
+    """Franja de marca al inicio de cada vista (logo claro + lema). Silenciosa si faltan los assets."""
     logo = logo_marca()
     if logo is None:
         return
@@ -96,12 +89,12 @@ def cabecera_marca():
 
 
 def portada_marca():
-    """Portada cinematográfica del dashboard: el hero letterpress cubre todo el ancho.
+    """Portada cinematográfica del dashboard: el hero claro cubre todo el ancho.
 
     Devuelve True si se mostró (el hero ya lleva logo + lema, así que la vista omite
     la franja compacta para no duplicar la marca).
     """
-    hero = _imagen_asset("hero_oscuro.png")
+    hero = _imagen_asset("hero_claro.png")
     if hero is None:
         return False
     with st.container(border=True):
@@ -860,7 +853,7 @@ st.sidebar.caption("El Excel se respalda automáticamente en GitHub tras cada gu
 mostrar_flash()
 estilos_marca()
 
-# El dashboard abre con la portada letterpress (ya incluye logo y lema); si no se muestra,
+# El dashboard abre con la portada de marca (ya incluye logo y lema); si no se muestra,
 # o en cualquier otra vista, entra la franja compacta de marca.
 _portada_activa = menu == "📊 Dashboard & Resumen" and portada_marca()
 if not _portada_activa:

@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
 """Sistema de marca NEMET — procesador de logos originales.
 
-Convierte los logos originales del usuario en los 4 assets transparentes de la app:
+Convierte el logo original del usuario en los 3 assets de la app:
 
   python herramientas/procesar_logo.py /tmp/logo_claro.png
       Logo claro (fotografía del logo en relieve sobre muro crema)
-        -> assets/logo_claro.png   (recorte transparente, para tema claro)
+        -> assets/logo_claro.png   (recorte transparente)
         -> assets/favicon.png      (isotipo 'N' sobre pastilla crema, 128 px)
-
-  python herramientas/procesar_logo.py /tmp/logo_oscuro.png --dark
-      Letterpress sobre negro (ya recortado con alfa)
-        -> assets/logo_oscuro.png  (letterpress transparente, para tema oscuro)
-        -> assets/hero_oscuro.png  (banner 1600x900 para portadas/splash)
+        -> assets/hero_claro.png   (portada crema 1600x900 del dashboard)
 
 El fondo se auto-detecta: si la imagen trae canal alfa se respeta; si es opaca se
-estima el color del borde (muro/crema/negro) y se elimina por densidad de color —
+estima el color del borde (muro/crema) y se elimina por densidad de color —
 así las piezas de barro conservan su textura y los trozos decorativos pegados al
-borde de la foto se descartan. --dark / --claro solo fuerzan el par de salida.
+borde de la foto se descartan. La marca ya no usa letterpress oscuro: una entrada
+con fondo negro se rechaza.
 """
 from __future__ import annotations
 
@@ -181,7 +178,7 @@ def procesar_claro(arr_rgba: np.ndarray, max_side=LADO_MAXIMO) -> Image.Image:
 
 
 def procesar_alpha(arr_rgba: np.ndarray, max_side=LADO_MAXIMO) -> Image.Image:
-    """Ruta letterpress: respeta el alfa existente, limpia islas y recorta al contenido."""
+    """Ruta con alfa: respeta el alfa existente, limpia islas y recorta al contenido."""
     alpha = arr_rgba[..., 3].astype(np.float64)
     mask = alpha > 24
     mask = ndi.binary_opening(mask, np.ones((2, 2)))
@@ -215,29 +212,14 @@ def _ensamblar(arr_rgba: np.ndarray, alpha: np.ndarray, caja, max_side: int) -> 
 
 
 def procesar(arr_rgba: np.ndarray, forzar: str | None = None, max_side=LADO_MAXIMO) -> tuple[Image.Image, str]:
-    """Auto-detecta el fondo y devuelve (logoRGBA, modo)."""
+    """Auto-detecta el fondo y devuelve (logoRGBA, modo). Rechaza el fondo oscuro."""
     modo = forzar if forzar in ("alpha", "claro", "oscuro") else modo_entrada(arr_rgba)
+    if modo == "oscuro":
+        raise SystemExit(
+            "La marca NEMET ya no usa el letterpress oscuro: la app usa solo el logo "
+            "claro (fondo crema o transparente).")
     if modo == "alpha":
         logo = procesar_alpha(arr_rgba, max_side)
-    elif modo == "oscuro":
-        # fondo negro opaco: el contenido es lo claro -> invertimos la lógica de fondo
-        arr = arr_rgba[..., :3].astype(np.float64)
-        fondo = estimar_color_fondo(arr)
-        dist = np.sqrt(((arr - fondo) ** 2).sum(-1))
-        dens = ndi.gaussian_filter(dist, 8)
-        mask = dens > DENS_MIN
-        mask = ndi.binary_opening(mask, np.ones((2, 2)))
-        mask = _matar_componentes(mask, min_size=90, margin=5, max_frac=0.30, central=True)
-        lab, n = ndi.label(mask)
-        tam = ndi.sum(mask, lab, np.arange(1, n + 1)) if n else np.zeros(1)
-        grandes = np.isin(lab, np.nonzero(tam >= 500)[0] + 1) if n else mask
-        ys, xs = np.nonzero(grandes)
-        pad = int(RELLENO_PAD * max(ys.max() - ys.min(), xs.max() - xs.min()))
-        alto, ancho = mask.shape
-        caja = (max(0, xs.min() - pad), max(0, ys.min() - pad),
-                min(ancho, xs.max() + 1 + pad), min(alto, ys.max() + 1 + pad))
-        sub = mask[caja[1]:caja[3], caja[0]:caja[2]]
-        logo = _ensamblar(arr_rgba, _alpha_suavizado(sub), caja, max_side)
     else:
         logo = procesar_claro(arr_rgba, max_side)
     return logo, modo
@@ -283,17 +265,17 @@ def generar_favicon(logo_claro: Image.Image, tam: int = 128, radio: int = 26) ->
     return fondo
 
 
-def generar_hero(logo_oscuro: Image.Image, ancho=1600, alto=900) -> Image.Image:
-    """Letterpress centrado sobre un lienzo carbón con viñeta radial sutil."""
+def generar_hero(logo_claro: Image.Image, ancho=1600, alto=900) -> Image.Image:
+    """Portada crema con viñeta radial sutil y el logo claro centrado."""
     yy, xx = np.mgrid[0:alto, 0:ancho]
     r = np.sqrt(((xx - ancho / 2) / (ancho / 2)) ** 2 + ((yy - alto / 2) / (alto / 2)) ** 2)
-    base = np.clip(26 - 10 * r, 12, 26)
-    lienzo = np.dstack([base, base * 0.965, base * 0.90]).astype(np.uint8)
+    base = np.clip(245.0 - 12.0 * r, 224.0, 245.0)  # crema #F5EFE6 con borde sutilmente más profundo
+    lienzo = np.dstack([base, base * 0.9755, base * 0.9388]).astype(np.uint8)
     lienzo = np.dstack([lienzo, np.full((alto, ancho), 255, np.uint8)])
     hero = Image.fromarray(lienzo, "RGBA")
     objetivo = int(ancho * 0.52)
-    escala = objetivo / logo_oscuro.width
-    logo = logo_oscuro.resize((objetivo, max(1, round(logo_oscuro.height * escala))), Image.LANCZOS)
+    escala = objetivo / logo_claro.width
+    logo = logo_claro.resize((objetivo, max(1, round(logo_claro.height * escala))), Image.LANCZOS)
     if logo.height > alto * 0.82:
         e2 = (alto * 0.82) / logo.height
         logo = logo.resize((max(1, round(logo.width * e2)), int(alto * 0.82)), Image.LANCZOS)
@@ -304,24 +286,18 @@ def generar_hero(logo_oscuro: Image.Image, ancho=1600, alto=900) -> Image.Image:
 # ---------------------------------------------------------------- CLI
 
 
-def procesar_archivo(ruta: str, oscuro: bool, salida: str, max_side=LADO_MAXIMO) -> list[str]:
+def procesar_archivo(ruta: str, salida: str, max_side=LADO_MAXIMO) -> list[str]:
     im = Image.open(ruta)
     arr = np.array(im.convert("RGBA"))
-    logo, modo = procesar(arr, forzar="alpha" if modo_entrada(arr) == "alpha" and oscuro else None, max_side=max_side)
+    logo, modo = procesar(arr, max_side=max_side)  # lanza SystemExit si el fondo es oscuro
     os.makedirs(salida, exist_ok=True)
     escritos = []
-    if oscuro:
-        for imagen, nombre in ((logo, "logo_oscuro.png"),
-                               (generar_hero(logo), "hero_oscuro.png")):
-            ruta_out = os.path.join(salida, nombre)
-            imagen.save(ruta_out, optimize=True)
-            escritos.append(ruta_out)
-    else:
-        for imagen, nombre in ((logo, "logo_claro.png"),
-                               (generar_favicon(logo), "favicon.png")):
-            ruta_out = os.path.join(salida, nombre)
-            imagen.save(ruta_out, optimize=True)
-            escritos.append(ruta_out)
+    for imagen, nombre in ((logo, "logo_claro.png"),
+                           (generar_favicon(logo), "favicon.png"),
+                           (generar_hero(logo), "hero_claro.png")):
+        ruta_out = os.path.join(salida, nombre)
+        imagen.save(ruta_out, optimize=True)
+        escritos.append(ruta_out)
     print(f"[NEMET] {os.path.basename(ruta)}: fondo detectado = {modo}")
     for ruta_out in escritos:
         info = Image.open(ruta_out)
@@ -330,16 +306,14 @@ def procesar_archivo(ruta: str, oscuro: bool, salida: str, max_side=LADO_MAXIMO)
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="Genera los assets de marca NEMET desde los logos originales.")
-    parser.add_argument("entrada", help="PNG original del logo (claro u oscuro/letterpress)")
-    parser.add_argument("--dark", dest="oscuro", action="store_true",
-                        help="Generar el par oscuro (logo_oscuro + hero_oscuro)")
+    parser = argparse.ArgumentParser(description="Genera los assets de marca NEMET desde el logo original.")
+    parser.add_argument("entrada", help="PNG original del logo claro")
     parser.add_argument("--salida", default=DIR_ASSETS, help="Directorio de destino (por defecto: assets/)")
     parser.add_argument("--largo", type=int, default=LADO_MAXIMO, help="Lado máximo en px de los logos")
     args = parser.parse_args(argv)
     if not os.path.exists(args.entrada):
         parser.error(f"No existe el archivo de entrada: {args.entrada}")
-    procesar_archivo(args.entrada, args.oscuro, args.salida, max_side=args.largo)
+    procesar_archivo(args.entrada, args.salida, max_side=args.largo)
     return 0
 
 
