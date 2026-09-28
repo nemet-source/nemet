@@ -39,6 +39,11 @@ token = "github_pat_..."     # Token con permiso de escritura en el repo
 repo = "nemet-source/nemet"
 ```
 
-> En Streamlit Community Cloud el disco es efímero: los cambios al Excel se pierden al
-> reiniciarse la app. Usa el botón **☁️ Respaldar Excel en GitHub** para subirlos al repositorio
-> (esto reinicia la app al hacer push).
+> En Streamlit Community Cloud el disco es efímero. Si los Secrets `[git]` están configurados, la app
+> **respalda automáticamente** el Excel en GitHub después de cada guardado (inventario, clientes y cada
+> folio emitido; empuja como máximo una vez por minuto y sesión). El botón **☁️ Respaldar Excel en GitHub**
+> fuerza un respaldo manual. Cada push reinicia la app brevemente.
+>
+> Si dos personas editan a la vez, el segundo guardado detecta el conflicto y ofrece sobrescribir
+> o reintentar después de sincronizar. Los folios se asignan releyendo el historial bajo cerrojo,
+> así que dos sesiones ya no pueden registrar el mismo folio.

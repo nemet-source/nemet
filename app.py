@@ -1,9 +1,12 @@
+import hashlib
 import math
 import os
 import re
 import smtplib
+import threading
 import unicodedata
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -37,6 +40,20 @@ TITULO_INVENTARIO = "CONTROL DE INVENTARIO Y FACTURACIÓN - NEMET"
 TASA_IVA = 0.16
 RENDIMIENTO_DEFAULT = 1.2  # kg por m² por mm, si el producto no está en Cat_Productos
 
+# Sonora (MX) usa UTC-7 todo el año; el servidor de Streamlit Community Cloud vive en UTC.
+try:
+    ZONA_HORARIA = ZoneInfo("America/Hermosillo")
+except Exception:
+    ZONA_HORARIA = None
+
+# Serializa todas las escrituras al Excel: en Streamlit cada sesión es un hilo del mismo proceso.
+LOCK_EXCEL = threading.RLock()
+RESPALDO_INTERVALO_SEG = 60  # anti-spam del respaldo automático por sesión
+
+
+class ConflictoGuardado(Exception):
+    """Otro usuario guardó el Excel después de que esta sesión lo cargó."""
+
 COLUMNAS_CARRITO = ["SKU", "Descripcion", "Presentacion", "Cantidad", "Subtotal"]
 COLUMNAS_CARRITO_AREA = ["SKU", "Descripcion", "Presentacion", "Area_m2", "Espesor_mm", "Kg_Necesarios", "Cantidad", "Subtotal", "Detalle"]
 COLUMNAS_CLIENTES = ["Nombre", "Empresa", "Correo", "Teléfono", "Dirección"]
@@ -63,15 +80,28 @@ def obtener_secret(seccion, clave):
 
 
 def flash(mensaje, tipo="success"):
-    """Guarda un mensaje para mostrarlo después de un st.rerun()."""
-    st.session_state["_flash"] = (tipo, mensaje)
+    """Guarda mensajes para mostrarlos después de un st.rerun()."""
+    st.session_state.setdefault("_flash_lista", []).append((tipo, mensaje))
 
 
 def mostrar_flash():
-    flash_msg = st.session_state.pop("_flash", None)
-    if flash_msg:
-        tipo, mensaje = flash_msg
+    for tipo, mensaje in st.session_state.pop("_flash_lista", []):
         getattr(st, tipo, st.info)(mensaje)
+
+
+def ahora_local():
+    """datetime.now() en hora de Sonora (el servidor de Streamlit Cloud está en UTC)."""
+    return datetime.now(ZONA_HORARIA) if ZONA_HORARIA else datetime.now()
+
+
+def _hash_hoja(nombre_hoja):
+    """Huella del contenido actual de una hoja, para detectar cambios hechos por otras sesiones."""
+    try:
+        with LOCK_EXCEL:
+            df = pd.read_excel(EXCEL_FILE, sheet_name=nombre_hoja)
+        return hashlib.md5(df.to_csv(index=False).encode("utf-8")).hexdigest()
+    except Exception:
+        return None
 
 
 def normalizar_texto(texto):
@@ -132,20 +162,23 @@ def agregar_al_carrito(clave, item):
 # ==========================================
 # RESPALDO EN GITHUB
 # ==========================================
-def guardar_cambios_github(mensaje="Actualización automática de datos"):
-    """Hace commit y push del Excel al repositorio. Requiere secrets [git] token y repo."""
+def _url_github(token, repo_name):
+    return f"https://{token}@github.com/{repo_name}.git"
+
+
+def _respaldar_core(mensaje):
+    """Commit + fetch/rebase + push del Excel. Devuelve (ok, tipo_ui, mensaje)."""
     token = obtener_secret("git", "token")
     repo_name = obtener_secret("git", "repo")
     if not token or not repo_name:
-        st.warning("Respaldo en GitHub no configurado: agrega `[git]` con `token` y `repo` en los Secrets de Streamlit.")
-        return False
+        return False, "warning", "Respaldo en GitHub no configurado: agrega `[git]` con `token` y `repo` en los Secrets de Streamlit."
     try:
         import git  # Import perezoso: GitPython falla al importarse si no existe el binario git
 
         repo = git.Repo(BASE_DIR, search_parent_directories=True)
         with repo.config_writer() as git_config:
-            git_config.set_value("user", "name", "Streamlit Bot")
-            git_config.set_value("user", "email", "bot@streamlit.app")
+            git_config.set_value("user", "name", "NEMET Bot")
+            git_config.set_value("user", "email", "bot@nemet.app")
 
         ruta_excel = os.path.relpath(EXCEL_FILE, repo.working_tree_dir)
         repo.index.add([ruta_excel])
@@ -157,17 +190,51 @@ def guardar_cambios_github(mensaje="Actualización automática de datos"):
         except TypeError:  # HEAD desprendido (detached)
             rama = "main"
 
-        # El token solo se usa en esta llamada; no se guarda en .git/config.
+        url = _url_github(token, repo_name)
+        # Traer primero lo remoto y rebasar el commit local encima: sin esto, un push
+        # tras otro respaldo (o un merge en main) moría con "non-fast-forward".
+        # El Excel es binario: si remoto y local lo tocaron, gana la versión local
+        # (la recién guardada por el usuario) con -X theirs.
+        try:
+            repo.git.fetch(url, rama)
+            repo.git.rebase("-X", "theirs", "FETCH_HEAD")
+        except Exception:
+            try:
+                repo.git.rebase("--abort")
+            except Exception:
+                pass
+            return False, "error", ("El repositorio cambió y el Excel local entra en conflicto con lo remoto. "
+                                    "Intenta el respaldo de nuevo; si persiste, revisa el historial en GitHub.")
+        # El token solo se usa en estas llamadas; no se guarda en .git/config.
         # Se empuja siempre para subir también commits previos que no se hayan podido enviar.
-        repo.git.push(f"https://{token}@github.com/{repo_name}.git", f"HEAD:{rama}")
+        repo.git.push(url, f"HEAD:{rama}")
         if hay_cambios:
-            st.success(f"¡Datos guardados y respaldados en GitHub (rama `{rama}`) correctamente!")
-        else:
-            st.info(f"El Excel no tenía cambios nuevos; el repositorio (rama `{rama}`) ya está al día.")
-        return True
+            return True, "success", f"¡Datos guardados y respaldados en GitHub (rama `{rama}`) correctamente!"
+        return True, "info", f"El Excel no tenía cambios nuevos; el repositorio (rama `{rama}`) ya está al día."
     except Exception as e:
-        st.error(f"Error al sincronizar con GitHub: {str(e).replace(token, '***')}")
-        return False
+        return False, "error", f"Error al sincronizar con GitHub: {str(e).replace(token, '***')}"
+
+
+def guardar_cambios_github(mensaje="Actualización automática de datos"):
+    """Versión para botón: ejecuta el respaldo y muestra el resultado en pantalla."""
+    ok, tipo, texto = _respaldar_core(mensaje)
+    getattr(st, tipo, st.info)(texto)
+    return ok
+
+
+def _respaldo_automatico(mensaje):
+    """Tras un guardado exitoso intenta subir el Excel a GitHub (si los Secrets [git] existen).
+    Devuelve (tipo_ui, mensaje) para mostrar, o None si no aplica o se omitió por el intervalo."""
+    token = obtener_secret("git", "token")
+    repo_name = obtener_secret("git", "repo")
+    if not token or not repo_name:
+        return None
+    ahora = datetime.now().timestamp()
+    if ahora - st.session_state.get("_ultimo_respaldo", 0) < RESPALDO_INTERVALO_SEG:
+        return None
+    st.session_state["_ultimo_respaldo"] = ahora
+    ok, tipo, texto = _respaldar_core(mensaje)
+    return (tipo, texto) if ok else ("warning", f"Respaldo automático falló: {texto}")
 
 
 # ==========================================
@@ -244,6 +311,7 @@ def cargar_inventario():
         for col in ("SKU", "Descripcion", "Presentacion"):
             df[col] = df[col].fillna("").astype(str).str.strip()
 
+        st.session_state["inv_base_hash"] = _hash_hoja(HOJA_INVENTARIO)
         return df.reset_index(drop=True)
     except Exception as e:
         st.error(f"Error al cargar el archivo Excel: {e}")
@@ -261,6 +329,7 @@ def cargar_clientes():
     for col in COLUMNAS_CLIENTES:
         if col not in df_cli.columns:
             df_cli[col] = ""
+    st.session_state["cli_base_hash"] = _hash_hoja(HOJA_CLIENTES)
     return df_cli.reset_index(drop=True)
 
 
@@ -346,11 +415,12 @@ def columnas_inventario(df):
 # GUARDADO EN EXCEL
 # ==========================================
 def escribir_hoja(df, nombre_hoja, startrow=0, titulo=None):
-    """Reemplaza una hoja del Excel conservando las demás."""
-    with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
-        df.to_excel(writer, sheet_name=nombre_hoja, index=False, startrow=startrow)
-        if titulo:
-            writer.sheets[nombre_hoja].cell(row=1, column=1, value=titulo)
+    """Reemplaza una hoja del Excel conservando las demás. Serializado entre hilos/sesiones."""
+    with LOCK_EXCEL:
+        with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+            df.to_excel(writer, sheet_name=nombre_hoja, index=False, startrow=startrow)
+            if titulo:
+                writer.sheets[nombre_hoja].cell(row=1, column=1, value=titulo)
 
 
 def recalcular_columnas_derivadas(df):
@@ -383,16 +453,34 @@ def quitar_filas_vacias(df, columnas_clave):
     return df[~vacias]
 
 
-def guardar_inventario(df_editado):
-    df_final = quitar_filas_vacias(df_editado, ["SKU", "Descripcion"])
-    df_final = recalcular_columnas_derivadas(df_final)
-    if "SKU" in df_final.columns:
-        df_final["SKU"] = df_final["SKU"].fillna("").astype(str).str.strip()
-    escribir_hoja(df_final, HOJA_INVENTARIO, startrow=1, titulo=TITULO_INVENTARIO)
+def _verificar_sin_conflicto(nombre_hoja, clave_hash):
+    """Lanza ConflictoGuardado si la hoja cambió en disco desde que esta sesión la cargó."""
+    base = st.session_state.get(clave_hash)
+    actual = _hash_hoja(nombre_hoja)
+    if base and actual and actual != base:
+        raise ConflictoGuardado(
+            f"La hoja '{nombre_hoja}' cambió en el archivo (probablemente otro usuario guardó cambios). "
+            "Tus capturas siguen en pantalla: sincroniza para revisarlas, o sobrescribe si lo prefieres.")
 
 
-def guardar_clientes(df_editado):
-    escribir_hoja(quitar_filas_vacias(df_editado, ["Nombre", "Empresa", "Correo"]), HOJA_CLIENTES)
+def guardar_inventario(df_editado, forzar=False):
+    with LOCK_EXCEL:
+        if not forzar:
+            _verificar_sin_conflicto(HOJA_INVENTARIO, "inv_base_hash")
+        df_final = quitar_filas_vacias(df_editado, ["SKU", "Descripcion"])
+        df_final = recalcular_columnas_derivadas(df_final)
+        if "SKU" in df_final.columns:
+            df_final["SKU"] = df_final["SKU"].fillna("").astype(str).str.strip()
+        escribir_hoja(df_final, HOJA_INVENTARIO, startrow=1, titulo=TITULO_INVENTARIO)
+        st.session_state["inv_base_hash"] = _hash_hoja(HOJA_INVENTARIO)
+
+
+def guardar_clientes(df_editado, forzar=False):
+    with LOCK_EXCEL:
+        if not forzar:
+            _verificar_sin_conflicto(HOJA_CLIENTES, "cli_base_hash")
+        escribir_hoja(quitar_filas_vacias(df_editado, ["Nombre", "Empresa", "Correo"]), HOJA_CLIENTES)
+        st.session_state["cli_base_hash"] = _hash_hoja(HOJA_CLIENTES)
 
 
 # ==========================================
@@ -400,7 +488,7 @@ def guardar_clientes(df_editado):
 # ==========================================
 def obtener_siguiente_folio():
     """Siguiente consecutivo del año en curso (COT-AAAA-NNN) según el mayor folio ya registrado."""
-    anio_actual = datetime.now().year
+    anio_actual = ahora_local().year
     patron = re.compile(rf"^COT-{anio_actual}-(\d+)$")
     ultimo = 0
     for folio in cargar_historial()["Folio"].dropna().astype(str):
@@ -420,21 +508,35 @@ def describir_item(fila):
 
 
 def registrar_cotizacion_en_excel(folio, cliente, items_carrito, total_general):
-    """Agrega la cotización al historial. Devuelve (ok, mensaje_error)."""
+    """Agrega la cotización al historial de forma atómica: relee el archivo bajo cerrojo.
+    Si otra sesión ya tomó el folio con otro contenido, asigna el siguiente libre.
+    Devuelve (ok, mensaje_error, folio_final)."""
     try:
-        df_hist = cargar_historial()
-        nueva_fila = pd.DataFrame({
-            "Folio": [folio],
-            "Fecha": [datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
-            "Cliente": [cliente],
-            "Detalle_Productos": [", ".join(describir_item(fila) for _, fila in items_carrito.iterrows())],
-            "Total": [float(total_general)],
-        })
-        df_hist = nueva_fila if df_hist.empty else pd.concat([df_hist, nueva_fila], ignore_index=True)
-        escribir_hoja(df_hist, HOJA_HISTORIAL)
-        return True, ""
+        detalle = ", ".join(describir_item(fila) for _, fila in items_carrito.iterrows())
+        with LOCK_EXCEL:
+            df_hist = cargar_historial()
+            folio_final = folio
+            if not df_hist.empty:
+                chocan = df_hist[df_hist["Folio"].astype(str).str.strip() == folio]
+                if not chocan.empty:
+                    mismo_contenido = chocan.apply(
+                        lambda f: str(valor_celda(f, "Cliente")).strip() == cliente.strip()
+                        and str(valor_celda(f, "Detalle_Productos")) == detalle, axis=1)
+                    if mismo_contenido.any():
+                        return True, "", folio  # ya está registrada; no duplicar
+                    folio_final = obtener_siguiente_folio()  # otra sesión lo tomó primero
+            nueva_fila = pd.DataFrame({
+                "Folio": [folio_final],
+                "Fecha": [ahora_local().strftime("%Y-%m-%d %H:%M:%S")],
+                "Cliente": [cliente],
+                "Detalle_Productos": [detalle],
+                "Total": [float(total_general)],
+            })
+            df_hist = nueva_fila if df_hist.empty else pd.concat([df_hist, nueva_fila], ignore_index=True)
+            escribir_hoja(df_hist, HOJA_HISTORIAL)
+        return True, "", folio_final
     except Exception as e:
-        return False, str(e)
+        return False, str(e), folio
 
 
 def generar_pdf_cotizacion(folio, cliente, items, titulo_detalle):
@@ -457,7 +559,7 @@ def generar_pdf_cotizacion(folio, cliente, items, titulo_detalle):
 
     pdf.set_font("helvetica", "", 11)
     pdf.set_text_color(0, 0, 0)
-    for linea in (f"Folio: {folio}", f"Cliente: {cliente}", f"Fecha: {datetime.now():%Y-%m-%d}", titulo_detalle):
+    for linea in (f"Folio: {folio}", f"Cliente: {cliente}", f"Fecha: {ahora_local():%Y-%m-%d}", titulo_detalle):
         pdf.cell(0, 6, texto_pdf(linea), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.ln(5)
 
@@ -554,10 +656,18 @@ def registrar_si_es_necesario(clave, folio, cliente, items, total):
     """Registra el folio en el historial una sola vez por carrito y guarda un mensaje para la interfaz."""
     if st.session_state.get(f"{clave}_emitido", {}).get("folio") == folio:
         return True
-    ok, error = registrar_cotizacion_en_excel(folio, cliente, items, total)
+    ok, error, folio_final = registrar_cotizacion_en_excel(folio, cliente, items, total)
     if ok:
-        st.session_state[f"{clave}_emitido"] = {"firma": firma_carrito(items, cliente), "folio": folio}
-        st.session_state[f"{clave}_msg"] = ("success", f"Cotización **{folio}** registrada en el historial.")
+        st.session_state[f"{clave}_emitido"] = {"firma": firma_carrito(items, cliente), "folio": folio_final}
+        if folio_final != folio:
+            st.session_state[f"{clave}_msg"] = (
+                "warning", f"El folio {folio} acababa de ser tomado por otra sesión; se asignó **{folio_final}**. "
+                           "Vuelve a descargar el PDF para que incluya el folio correcto.")
+        else:
+            st.session_state[f"{clave}_msg"] = ("success", f"Cotización **{folio}** registrada en el historial.")
+        respaldo = _respaldo_automatico(f"Respaldo automático: cotización {folio_final}")
+        if respaldo:
+            flash(respaldo[1], respaldo[0])
     else:
         st.session_state[f"{clave}_msg"] = ("error", f"No se pudo registrar el folio {folio} en el Excel: {error}")
     return ok
@@ -582,7 +692,7 @@ def bloque_acciones_cotizacion(clave, items, cliente, correo, titulo_detalle):
 
     pdf_bytes = generar_pdf_cotizacion(folio, cliente, items, titulo_detalle) if not items.empty else b""
 
-    col_b1, col_b2, col_b3 = st.columns(3)
+    col_b1, col_b2, col_b3, col_b4 = st.columns(4)
     with col_b1:
         st.download_button("📄 Descargar PDF", data=pdf_bytes, file_name=f"{folio}.pdf", mime="application/pdf",
                            disabled=items.empty, key=f"{clave}_pdf",
@@ -590,17 +700,29 @@ def bloque_acciones_cotizacion(clave, items, cliente, correo, titulo_detalle):
     with col_b2:
         if st.button("📧 Enviar por Correo", disabled=items.empty, key=f"{clave}_mail"):
             try:
-                enviar_cotizacion_por_correo(correo, cliente, folio, total, pdf_bytes)
-                st.success(f"¡Correo enviado exitosamente a {correo}!")
-                registrar_si_es_necesario(clave, folio, cliente, items, total)
+                # Primero se registra el folio y después se envía: si el registro falla,
+                # no se manda un PDF con un folio que el historial no conocerá.
+                if not registrar_si_es_necesario(clave, folio, cliente, items, total):
+                    raise RuntimeError("No se pudo registrar el folio en el historial; el correo NO se envió.")
+                folio_registrado = st.session_state.get(f"{clave}_emitido", {}).get("folio")
+                if folio_registrado != folio:
+                    raise RuntimeError(f"El folio cambió a {folio_registrado} (otra sesión lo tomó primero); "
+                                       "descarga de nuevo el PDF y reenvía el correo.")
                 mensaje = st.session_state.pop(f"{clave}_msg", None)
                 if mensaje:
                     getattr(st, mensaje[0])(mensaje[1])
+                enviar_cotizacion_por_correo(correo, cliente, folio, total, pdf_bytes)
+                st.success(f"¡Correo enviado exitosamente a {correo}!")
             except Exception as e:
                 st.error(f"Error al enviar correo: {e}")
     with col_b3:
         if st.button("🗑️ Limpiar Carrito", disabled=items.empty, key=f"{clave}_clear"):
             st.session_state[clave] = carrito_vacio(por_area=(clave == "carrito_area"))
+            st.rerun()
+    with col_b4:
+        if st.button("🧾 Folio Nuevo", disabled=items.empty, key=f"{clave}_nuevo_folio",
+                     help="Conserva el carrito pero fuerza un folio nuevo (p. ej. para una segunda cotización idéntica)."):
+            st.session_state.pop(f"{clave}_emitido", None)
             st.rerun()
 
 
@@ -634,9 +756,10 @@ menu = st.sidebar.selectbox("Navegación", [
 ])
 st.sidebar.divider()
 if st.sidebar.button("☁️ Respaldar Excel en GitHub"):
-    guardar_cambios_github()
-st.sidebar.caption("Sube el Excel al repositorio para no perder los datos al reiniciarse la app. "
-                   "Requiere los Secrets `[git]` (token y repo).")
+    ok, tipo, texto = _respaldar_core("Respaldo manual de datos")
+    getattr(st.sidebar, tipo, st.sidebar.info)(texto)
+st.sidebar.caption("El Excel se respalda automáticamente en GitHub tras cada guardado si configuras los Secrets `[git]` "
+                   "(token y repo). Este botón fuerza un respaldo manual.")
 
 mostrar_flash()
 
@@ -648,6 +771,8 @@ if menu == "📊 Dashboard & Resumen":
         st.session_state["inventario"] = cargar_inventario()
         st.session_state["clientes"] = cargar_clientes()
         st.session_state["version_editores"] += 1
+        st.session_state.pop("inv_conflicto", None)
+        st.session_state.pop("cli_conflicto", None)
         flash("¡Datos actualizados desde el archivo Excel!")
         st.rerun()
 
@@ -682,15 +807,33 @@ elif menu == "📦 Control de Inventario y Edición":
         key=f"editor_inv_{st.session_state['version_editores']}",
     )
 
+    def _guardar_inv(forzar=False):
+        guardar_inventario(df_editado, forzar=forzar)
+        st.session_state["inventario"] = cargar_inventario()
+        st.session_state["version_editores"] += 1
+        st.session_state.pop("inv_conflicto", None)
+        flash("¡Inventario actualizado y guardado exitosamente!")
+        respaldo = _respaldo_automatico("Respaldo automático: inventario")
+        if respaldo:
+            flash(respaldo[1], respaldo[0])
+        st.rerun()
+
     if st.button("💾 Guardar Cambios en Excel"):
         try:
-            guardar_inventario(df_editado)
-            st.session_state["inventario"] = cargar_inventario()
-            st.session_state["version_editores"] += 1
-            flash("¡Inventario actualizado y guardado exitosamente!")
-            st.rerun()
+            _guardar_inv()
+        except ConflictoGuardado as e:
+            st.session_state["inv_conflicto"] = True
+            st.error(str(e))
         except Exception as e:
             st.error(f"Error al guardar: {e}")
+
+    if st.session_state.get("inv_conflicto"):
+        st.warning("⚠️ Conflicto de guardado pendiente: otra sesión modificó el archivo mientras editabas.")
+        if st.button("💾 Sobrescribir con mis cambios", type="primary"):
+            try:
+                _guardar_inv(forzar=True)
+            except Exception as e:
+                st.error(f"Error al guardar: {e}")
 
 elif menu == "👥 Gestión de Clientes":
     st.subheader("👥 Base de Datos y Directorio de Clientes")
@@ -701,15 +844,33 @@ elif menu == "👥 Gestión de Clientes":
         key=f"editor_clientes_{st.session_state['version_editores']}",
     )
 
+    def _guardar_cli(forzar=False):
+        guardar_clientes(df_cli_editado, forzar=forzar)
+        st.session_state["clientes"] = cargar_clientes()
+        st.session_state["version_editores"] += 1
+        st.session_state.pop("cli_conflicto", None)
+        flash("¡Base de datos de clientes guardada exitosamente en Excel!")
+        respaldo = _respaldo_automatico("Respaldo automático: clientes")
+        if respaldo:
+            flash(respaldo[1], respaldo[0])
+        st.rerun()
+
     if st.button("💾 Guardar Base de Datos de Clientes"):
         try:
-            guardar_clientes(df_cli_editado)
-            st.session_state["clientes"] = cargar_clientes()
-            st.session_state["version_editores"] += 1
-            flash("¡Base de datos de clientes guardada exitosamente en Excel!")
-            st.rerun()
+            _guardar_cli()
+        except ConflictoGuardado as e:
+            st.session_state["cli_conflicto"] = True
+            st.error(str(e))
         except Exception as e:
             st.error(f"Error al guardar clientes: {e}")
+
+    if st.session_state.get("cli_conflicto"):
+        st.warning("⚠️ Conflicto de guardado pendiente: otra sesión modificó el archivo mientras editabas.")
+        if st.button("💾 Sobrescribir clientes con mis cambios", type="primary"):
+            try:
+                _guardar_cli(forzar=True)
+            except Exception as e:
+                st.error(f"Error al guardar clientes: {e}")
 
 elif menu == "📏 Cotizador por Área y Milimétrico":
     st.subheader("Cotizador por Área, Espesor y Proporción de Mezcla")
@@ -769,25 +930,36 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
     df_familia["Kg_Num"] = kg_por_fila[df_familia.index]
     df_familia = df_familia[df_familia["Kg_Num"].notna()].sort_values(by="Kg_Num", ascending=False)
 
+    stock_por_sku = {}
+    if "StockActual" in df_inv.columns:
+        stock_norm = pd.to_numeric(df_inv["StockActual"], errors="coerce").fillna(0)
+        stock_por_sku = {str(s).strip(): float(v) for s, v in zip(df_inv[col_sku], stock_norm)}
+
     resultados = []
     for _, fila in df_familia.iterrows():
         pres_kg = float(fila["Kg_Num"])
         precio_pub = float(valor_celda(fila, "PrecioPublicoIVA", 0.0))
         unidades = max(1, math.ceil(round(kg_necesarios / pres_kg, 6)))
+        sku_fila = str(valor_celda(fila, col_sku))
         resultados.append({
-            "SKU": str(valor_celda(fila, col_sku)),
+            "SKU": sku_fila,
             "Presentación": str(fila[col_pres]),
             "Kg por unidad": pres_kg,
             "Precio Público": precio_pub,
             "Unidades": unidades,
             "Kg cubiertos": unidades * pres_kg,
             "Costo Total": unidades * precio_pub,
+            "Stock": stock_por_sku.get(sku_fila.strip(), 0.0),
         })
 
     if resultados:
         optima = min(resultados, key=lambda x: (x["Costo Total"], x["Unidades"]))
         st.success(f"💡 **Recomendación Óptima:** Presentación de **{optima['Presentación']}** con **{optima['Unidades']} unidad(es)** "
                    f"({optima['Kg cubiertos']:.2f} kg) por **${optima['Costo Total']:,.2f} MXN**.")
+        if optima["Unidades"] > optima["Stock"]:
+            st.warning(f"⚠️ El stock actual de **{optima['SKU']}** es de {formato_cantidad(optima['Stock'])} unidad(es) "
+                       f"y la recomendación pide {formato_cantidad(optima['Unidades'])}. "
+                       "Considera reabastecer (o producir) antes de confirmar con el cliente.")
         with st.expander("Ver comparativa de todas las presentaciones"):
             st.dataframe(pd.DataFrame(resultados), width="stretch", hide_index=True)
 
@@ -801,7 +973,9 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
                 "Kg_Necesarios": round(kg_necesarios, 2),
                 "Cantidad": optima["Unidades"],
                 "Subtotal": optima["Costo Total"],
-                "Detalle": f"{prod_familia}\n{area_total:.2f} m² x {espesor_mm:g} mm ({kg_necesarios:.2f} kg)",
+                "Detalle": (f"{prod_familia}\n{area_total:.2f} m² x {espesor_mm:g} mm ({kg_necesarios:.2f} kg)"
+                            + (f"\n⚠️ Excede el stock actual: {formato_cantidad(optima['Stock'])} en almacén"
+                               if optima["Unidades"] > optima["Stock"] else "")),
             })
             st.rerun()
 
