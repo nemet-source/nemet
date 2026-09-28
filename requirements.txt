@@ -1,6 +1,10 @@
 streamlit>=1.49
 pandas>=2.0
+numpy>=1.26
 openpyxl>=3.1
 fpdf2>=2.7.5
 GitPython>=3.1
 tzdata>=2024.1
+# Sistema de marca NEMET (herramientas/procesar_logo.py y assets de la app)
+Pillow>=10.2
+scipy>=1.11

@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""Batería de pruebas del sistema de marca NEMET (24 pruebas).
+
+Cubre la herramienta de procesado (herramientas/procesar_logo.py), los 4 assets
+generados, la integración de marca en app.py y la configuración del repo.
+
+Uso:  python tests_bateria.py     →  "24/24 OK" si todo pasa.
+"""
+import os
+import re
+import sys
+import tempfile
+import unittest
+
+import numpy as np
+from PIL import Image
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(BASE, "herramientas"))
+import procesar_logo as pl  # noqa: E402
+
+
+def img_claro_sintetica(alto=300, ancho=400):
+    """Foto sintética: muro crema texturizado, logo oscuro al centro, decoración pegada al borde."""
+    arr = np.zeros((alto, ancho, 3), np.uint8)
+    arr[:, :] = (200, 183, 165)
+    rng = np.random.default_rng(7)
+    arr = arr.astype(np.int16) + rng.integers(-12, 13, size=arr.shape)
+    arr[110:190, 140:260] = (70, 68, 64)                       # logo central oscuro
+    arr[:, 0:30] = (150, 90, 40)                                # decoración que toca el borde
+    return np.clip(arr, 0, 255).astype(np.uint8)
+
+
+# ============================================================ herramienta
+class TestHerramienta(unittest.TestCase):
+
+    def test_01_estimar_color_fondo_es_la_mediana_del_borde(self):
+        arr = np.zeros((40, 50, 3), np.float64)
+        arr[:, :] = (200, 180, 160)
+        arr[20:24, 10:40] = (0, 0, 0)  # contenido interno no debe afectar
+        fondo = pl.estimar_color_fondo(arr)
+        np.testing.assert_allclose(fondo, (200, 180, 160), atol=1)
+
+    def test_02_modo_entrada_alpha(self):
+        arr = np.zeros((60, 60, 4), np.uint8)
+        arr[..., 3] = 255
+        arr[:, :40, 3] = 0  # 2/3 del lienzo transparente
+        self.assertEqual(pl.modo_entrada(arr), "alpha")
+
+    def test_03_modo_entrada_claro_fondo_opaco(self):
+        arr = np.dstack([np.full((50, 50, 3), (210, 200, 190), np.uint8), np.full((50, 50), 255, np.uint8)])
+        self.assertEqual(pl.modo_entrada(arr), "claro")
+
+    def test_04_modo_entrada_oscuro_fondo_negro(self):
+        arr = np.dstack([np.full((50, 50, 3), (4, 4, 5), np.uint8), np.full((50, 50), 255, np.uint8)])
+        self.assertEqual(pl.modo_entrada(arr), "oscuro")
+
+    def test_05_matar_componentes_deco_y_ruido(self):
+        mask = np.zeros((100, 200), bool)
+        mask[40:60, 90:110] = True          # contenido central: se queda
+        mask[:, 0:8] = True                 # pega al borde: se va
+        mask[95:100, 150:155] = True        # isla diminuta: se va
+        limpio = pl._matar_componentes(mask, min_size=30, margin=5)
+        self.assertTrue(limpio[50, 100])
+        self.assertFalse(limpio[50, 2])
+        self.assertFalse(limpio[97, 152])
+
+    def test_06_bandas_separan_filas_de_contenido(self):
+        mask = np.zeros((60, 40), bool)
+        mask[5:12, :] = True
+        mask[30:40, :] = True
+        bandas = pl._bandas(mask, min_grosor=2, min_pix=1)
+        self.assertEqual(len(bandas), 2)
+        self.assertEqual(bandas[0][1] - bandas[0][0], 6)
+
+    def test_07_procesar_claro_recorta_con_transparencia(self):
+        arr = np.dstack([img_claro_sintetica(), np.full((300, 400), 255, np.uint8)])
+        logo, modo = pl.procesar(arr)
+        self.assertEqual(modo, "claro")
+        a = np.array(logo)
+        self.assertEqual(a.shape[2], 4)
+        self.assertEqual(int(a[0, 0, 3]), 0)            # esquina: fondo eliminado
+        ys, xs = np.nonzero(a[..., 3] > 200)
+        self.assertGreater(len(ys), 500)                # contenido conservado
+        # la decoración pegada al borde no debe quedar como región grande aislada
+        self.assertLess(a[..., 3].mean(), 255)
+
+    def test_08_ruta_alpha_conserva_y_recorta(self):
+        arr = np.zeros((120, 160, 4), np.uint8)
+        arr[30:90, 40:120, :3] = (160, 90, 50)
+        arr[30:90, 40:120, 3] = 255
+        arr[5, 5, :] = (200, 200, 200, 255)             # mota mínima que debe limpiarse
+        logo, modo = pl.procesar(arr)
+        self.assertEqual(modo, "alpha")
+        self.assertLessEqual(logo.width, 150)
+        a = np.array(logo)
+        self.assertGreater(float((a[..., 3] > 200).mean()), 0.2)
+
+    def test_09_favicon_cuadrado_con_esquinas_redondeadas(self):
+        foto = img_claro_sintetica(alto=200, ancho=280)
+        rgba = np.dstack([foto, np.full(foto.shape[:2], 255, np.uint8)])
+        logo = Image.fromarray(rgba, "RGBA")
+        fav = pl.generar_favicon(logo, tam=64, radio=14)
+        self.assertEqual(fav.size, (64, 64))
+        fa = np.array(fav)
+        self.assertLess(int(fa[0, 0, 3]), 60)            # esquina redondeada casi transparente
+        self.assertGreater(int(fa[32, 32, 3]), 200)     # centro opaco
+
+    def test_10_hero_dimension_y_oscuro(self):
+        logo = Image.new("RGBA", (400, 200), (30, 30, 30, 255))
+        hero = pl.generar_hero(logo, ancho=800, alto=450)
+        self.assertEqual(hero.size, (800, 450))
+        ha = np.array(hero)[..., :3]
+        self.assertLess(float(ha.mean()), 80)
+
+    def test_11_cli_genera_pares_correctos(self):
+        with tempfile.TemporaryDirectory() as tdir:
+            claro_in = os.path.join(tdir, "claro.png")
+            Image.fromarray(img_claro_sintetica(), "RGB").save(claro_in)
+            sal = os.path.join(tdir, "assets")
+            rc = pl.main([claro_in, "--salida", sal])
+            self.assertEqual(rc, 0)
+            self.assertEqual(sorted(os.listdir(sal)), ["favicon.png", "logo_claro.png"])
+            osc_in = os.path.join(tdir, "oscuro.png")
+            arr = np.zeros((100, 140, 4), np.uint8)
+            arr[20:80, 30:110, :3] = (150, 90, 60)
+            arr[20:80, 30:110, 3] = 255
+            Image.fromarray(arr, "RGBA").save(osc_in)
+            sal2 = os.path.join(tdir, "assets2")
+            rc = pl.main([osc_in, "--dark", "--salida", sal2])
+            self.assertEqual(rc, 0)
+            self.assertEqual(sorted(os.listdir(sal2)), ["hero_oscuro.png", "logo_oscuro.png"])
+
+    def test_12_lado_maximo_respetado(self):
+        foto = img_claro_sintetica(alto=600, ancho=800)
+        arr = np.dstack([foto, np.full(foto.shape[:2], 255, np.uint8)])
+        logo, _ = pl.procesar(arr, max_side=150)
+        self.assertLessEqual(max(logo.size), 150)
+
+
+# ============================================================ assets del repo
+class TestAssets(unittest.TestCase):
+
+    ASSETS = os.path.join(BASE, "assets")
+
+    def test_13_existen_los_cuatro_assets(self):
+        for n in ("logo_claro.png", "logo_oscuro.png", "favicon.png", "hero_oscuro.png"):
+            self.assertTrue(os.path.exists(os.path.join(self.ASSETS, n)), f"falta assets/{n}")
+
+    def test_14_logo_claro_transparente_con_contenido(self):
+        a = np.array(Image.open(os.path.join(self.ASSETS, "logo_claro.png")))
+        self.assertEqual(a.shape[2], 4)
+        self.assertEqual(int(a[0, 0, 3]), 0)
+        self.assertGreater(float((a[..., 3] > 200).mean()), 0.15)
+
+    def test_15_logo_oscuro_lado_maximo(self):
+        im = Image.open(os.path.join(self.ASSETS, "logo_oscuro.png"))
+        self.assertEqual(max(im.size), 1400)
+        a = np.array(im)
+        self.assertEqual(int(a[0, 0, 3]), 0)
+
+    def test_16_favicon_128_redondeado(self):
+        im = Image.open(os.path.join(self.ASSETS, "favicon.png"))
+        self.assertEqual(im.size, (128, 128))
+        a = np.array(im)
+        self.assertLess(int(a[0, 0, 3]), 100)
+        self.assertGreater(int(a[64, 64, 3]), 150)
+
+    def test_17_hero_oscuro_1600x900(self):
+        im = Image.open(os.path.join(self.ASSETS, "hero_oscuro.png"))
+        self.assertEqual(im.size, (1600, 900))
+        self.assertLess(float(np.array(im)[..., :3].mean()), 80)
+
+    def test_18_originales_fuera_del_repo(self):
+        for n in ("Logo NEMET.png", "Logo NEMET 3.png"):
+            self.assertFalse(os.path.exists(os.path.join(BASE, n)), f"{n} ya no debe estar en la raíz")
+
+
+# ============================================================ app.py
+class TestApp(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(BASE, "app.py"), encoding="utf-8") as fh:
+            cls.src = fh.read()
+
+    def test_19_config_pagina_es_la_primera_llamada_st(self):
+        # a nivel de módulo (columna 0) la primera llamada st.* debe ser la configuración de página
+        m = re.search(r"^st\.(\w+)\s*\(", self.src, re.MULTILINE)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), "set_page_config")
+
+    def test_20_funciones_y_constantes_de_marca(self):
+        for token in ("PALETA_NEMET", "LEMA_NEMET", "DIR_ASSETS", "def _imagen_asset", "def logo_marca",
+                      "def estilos_marca", "def cabecera_marca", "def portada_marca"):
+            self.assertIn(token, self.src, f"falta {token} en app.py")
+
+    def test_21_app_referencia_los_cuatro_assets(self):
+        for n in ("logo_claro.png", "logo_oscuro.png", "favicon.png", "hero_oscuro.png"):
+            self.assertIn(n, self.src, f"app.py no referencia {n}")
+
+    def test_22_lema_en_franja_y_pie(self):
+        self.assertIn("nemet-lema", self.src)
+        self.assertIn("st.caption(f\"© {ahora_local().year} NEMET", self.src)
+
+
+# ============================================================ config repo
+class TestConfig(unittest.TestCase):
+
+    def test_23_requirements_de_la_marca(self):
+        with open(os.path.join(BASE, "requirements.txt"), encoding="utf-8") as fh:
+            reqs = fh.read().lower()
+        for p in ("pillow", "scipy", "numpy", "streamlit", "fpdf2"):
+            self.assertIn(p, reqs)
+
+    def test_24_config_toml_coherente_con_paleta(self):
+        ruta = os.path.join(BASE, ".streamlit", "config.toml")
+        self.assertTrue(os.path.exists(ruta))
+        with open(ruta, encoding="utf-8") as fh:
+            toml = fh.read()
+        self.assertIn('#B4552D', toml)  # barro = primaryColor
+        self.assertIn('#F5EFE6', toml)  # crema = backgroundColor
+        with open(os.path.join(BASE, "README.md"), encoding="utf-8") as fh:
+            readme = fh.read()
+        self.assertIn("herramientas/procesar_logo.py", readme)
+
+
+if __name__ == "__main__":
+    resultado = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__]))
+    n = resultado.testsRun
+    if resultado.wasSuccessful() and n == 24:
+        print(f"\n{ n }/{n} OK — sistema de marca NEMET verificado")
+        sys.exit(0)
+    print(f"\n{ n - len(resultado.failures) - len(resultado.errors) }/{n} (esperadas 24/24)")
+    sys.exit(1)

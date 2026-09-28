@@ -18,17 +18,110 @@ from fpdf import FPDF
 from fpdf.enums import XPos, YPos
 from fpdf.fonts import FontFace
 
+try:
+    from PIL import Image as _PILImage
+except ImportError:  # la app sigue funcionando sin Pillow; solo pierde el icono de pestaña
+    _PILImage = None
+
+# ==========================================
+# IDENTIDAD DE MARCA NEMET
+# ==========================================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DIR_ASSETS = os.path.join(BASE_DIR, "assets")
+LEMA_NEMET = "Naturaleza que habita"
+PALETA_NEMET = {
+    "crema": "#F5EFE6",    # fondo claro (muro encalado)
+    "tinta": "#26231F",    # texto principal (carbon)
+    "barro": "#B4552D",    # acento primario (terracota)
+    "verde": "#2F5D3A",    # acento secundario (epoxi verde)
+    "piedra": "#8F8B84",   # gris medio (cemento)
+    "carbon": "#141210",   # fondo oscuro (letterpress)
+}
+
+
+def _asset(nombre):
+    """Ruta del asset de marca si existe; None en caso contrario."""
+    ruta = os.path.join(DIR_ASSETS, nombre)
+    return ruta if os.path.exists(ruta) else None
+
+
+def _imagen_asset(nombre):
+    """PIL.Image del asset de marca (o None si no está instalado Pillow o falta el archivo)."""
+    ruta = _asset(nombre)
+    if ruta is None or _PILImage is None:
+        return None
+    try:
+        return _PILImage.open(ruta)
+    except Exception:
+        return None
+
+
+def _tema_oscuro():
+    try:
+        return str(st.get_option("theme.base")).lower() == "dark"
+    except Exception:
+        return False
+
+
+def logo_marca():
+    """Logo para la cabecera: letterpress en tema oscuro, relieve claro en tema claro."""
+    return _imagen_asset("logo_oscuro.png" if _tema_oscuro() else "logo_claro.png")
+
+
+def estilos_marca():
+    """Tipografía y detalles visuales de la marca sobre el tema base de Streamlit."""
+    st.markdown(f"""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@300;400;500;600;700&display=swap');
+    html, body, [class*="css"] {{ font-family: 'Montserrat', 'Source Sans Pro', sans-serif; }}
+    h1, h2, h3 {{ letter-spacing: 0.02em; }}
+    .stButton > button, .stDownloadButton > button {{ border-radius: 10px; font-weight: 600; letter-spacing: 0.02em; }}
+    .nemet-lema {{ font-weight: 300; letter-spacing: 0.34em; text-transform: uppercase;
+                   font-size: 0.72rem; opacity: 0.7; text-align: center; margin-top: -6px; }}
+    .nemet-linea {{ border-bottom: 1px solid rgba(143,139,132,0.35); margin: 10px 0 22px 0; }}
+    </style>
+    """, unsafe_allow_html=True)
+
+
+def cabecera_marca():
+    """Franja de marca al inicio de cada vista (logo del tema + lema). Silenciosa si faltan los assets."""
+    logo = logo_marca()
+    if logo is None:
+        return
+    col_izq, col_centro, col_der = st.columns([1, 2, 1])
+    with col_centro:
+        st.image(logo, width=250)
+        st.markdown(f"<div class='nemet-lema'>{LEMA_NEMET}</div>", unsafe_allow_html=True)
+        st.markdown("<div class='nemet-linea'></div>", unsafe_allow_html=True)
+
+
+def portada_marca():
+    """Portada cinematográfica del dashboard: el hero letterpress cubre todo el ancho.
+
+    Devuelve True si se mostró (el hero ya lleva logo + lema, así que la vista omite
+    la franja compacta para no duplicar la marca).
+    """
+    hero = _imagen_asset("hero_oscuro.png")
+    if hero is None:
+        return False
+    with st.container(border=True):
+        st.image(hero, width="stretch")
+    return True
+
+
+# Icono de pestaña: favicon de la marca si existe; emoji de respaldo.
+ICONO_PAGINA = _imagen_asset("favicon.png") or "🧪"
+
 # Configuración de la página (debe ser el primer comando de Streamlit)
 st.set_page_config(
     page_title="Sistema Maestro NEMET",
-    page_icon="🧪",
+    page_icon=ICONO_PAGINA,
     layout="wide"
 )
 
 # ==========================================
 # CONSTANTES
 # ==========================================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 EXCEL_FILE = os.path.join(BASE_DIR, "Sistema_Inventario_NEMET_Final.xlsx")
 
 HOJA_INVENTARIO = "Inventario"
@@ -745,6 +838,9 @@ df_clientes = st.session_state["clientes"]
 # ==========================================
 # MENÚ Y NAVEGACIÓN
 # ==========================================
+_logo_sidebar = logo_marca()
+if _logo_sidebar is not None:
+    st.sidebar.image(_logo_sidebar, width=160)
 st.sidebar.title("📂 Menú Principal")
 menu = st.sidebar.selectbox("Navegación", [
     "📊 Dashboard & Resumen",
@@ -762,6 +858,13 @@ st.sidebar.caption("El Excel se respalda automáticamente en GitHub tras cada gu
                    "(token y repo). Este botón fuerza un respaldo manual.")
 
 mostrar_flash()
+estilos_marca()
+
+# El dashboard abre con la portada letterpress (ya incluye logo y lema); si no se muestra,
+# o en cualquier otra vista, entra la franja compacta de marca.
+_portada_activa = menu == "📊 Dashboard & Resumen" and portada_marca()
+if not _portada_activa:
+    cabecera_marca()
 
 if menu == "📊 Dashboard & Resumen":
     st.title("🧪 Sistema Maestro NEMET")
@@ -1051,3 +1154,7 @@ elif menu == "📋 Historial de Cotizaciones (Folios)":
             ]
         st.dataframe(df_hist, width="stretch", hide_index=True)
         st.metric("Total de Cotizaciones Emitidas", len(df_hist))
+
+# Pie de marca (todas las vistas)
+st.divider()
+st.caption(f"© {ahora_local().year} NEMET · {LEMA_NEMET} · Materiales epóxicos y acabados arquitectónicos — Hermosillo, Sonora")
