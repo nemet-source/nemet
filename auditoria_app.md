@@ -118,7 +118,11 @@ Si `main` avanzó (un PR mergeado, otro respaldo desde otra sesión) el push es 
 ## 🟢 Bajas
 
 11. **Filtro de familias:** productos sin entrada en `Cat_Productos` se excluyen silenciosamente del cotizador por área (L735); el mensaje del rendimiento por defecto por producto (L766) es inalcanzable cuando el catálogo existe. Incluirlos con `RENDIMIENTO_DEFAULT` o avisar qué líneas no califican.
-12. **Sin autenticación:** el URL público permite editar inventario y expone el directorio (correos/teléfonos). Considerar `st.login` o un gate simple por contraseña en Secrets.
+12. ~~**Sin autenticación:** el URL público permite editar inventario y expone el directorio (correos/teléfonos). Considerar `st.login` o un gate simple por contraseña en Secrets.~~
+    ✅ **Resuelto (28-sep-2026):** la app quedó cerrada por completo con `auth_nemet.py` — administrador inicial
+    desde los Secrets, contraseñas con hash scrypt, sesiones firmadas con expiración, roles
+    Administrador/Editor/Usuario, panel de administración de cuentas, bitácora de auditoría y regla dura
+    de "nunca sin administradores activos". Ver README → *Acceso, roles y administración de usuarios*.
 13. **Higiene de datos detectada:** SKUs duplicados (`EM 01`, `EM 02`, `EP 01` — el dashboard ya lo advierte, bien), 2 filas con `Presentacion = "0"` (29 de 78 filas no son cotizables por área: piezas y rangos "10 a 20 kg", excluidas correctamente), y nombres de cliente repetidos tomarían el primero (`seleccionar_cliente`, `.iloc[0]`).
 
 ---
