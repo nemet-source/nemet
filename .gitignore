@@ -7,6 +7,10 @@ __pycache__/
 # Secretos locales de Streamlit (nunca subir credenciales)
 .streamlit/secrets.toml
 
+# La base de usuarios (nemet_usuarios.db) NO se ignora a propósito: es lo que permite
+# que Streamlit Community Cloud conserve las cuentas entre reinicios (el respaldo a
+# GitHub la sube junto con el Excel). Solo contiene hashes scrypt, nunca contraseñas.
+
 # Archivos temporales de Excel/SO
 ~$*.xlsx
 .DS_Store

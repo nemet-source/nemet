@@ -4,8 +4,9 @@ import os
 import re
 import smtplib
 import threading
+import time
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
@@ -17,6 +18,8 @@ import streamlit as st
 from fpdf import FPDF
 from fpdf.enums import XPos, YPos
 from fpdf.fonts import FontFace
+
+import auth_nemet as auth  # autenticación, roles y administración de usuarios (SQLite + scrypt)
 
 try:
     from PIL import Image as _PILImage
@@ -136,6 +139,12 @@ except Exception:
 LOCK_EXCEL = threading.RLock()
 RESPALDO_INTERVALO_SEG = 60  # anti-spam del respaldo automático por sesión
 
+# Base de usuarios: SQLite, respaldada en GitHub junto con el Excel.
+# Solo guarda hashes scrypt (nunca contraseñas en texto plano).
+NOMBRE_DB_USUARIOS = "nemet_usuarios.db"
+CLAVE_SESION_URL = "sesion"          # parámetro de URL con el token firmado de la sesión
+REFRESCO_TOKEN_SEG = 300             # cada cuánto se renueva el token (ventana deslizante)
+
 
 class ConflictoGuardado(Exception):
     """Otro usuario guardó el Excel después de que esta sesión lo cargó."""
@@ -163,6 +172,21 @@ def obtener_secret(seccion, clave):
         return st.secrets[seccion][clave]
     except Exception:
         return None
+
+
+def variable_entorno(nombre):
+    """Variable de entorno no vacía (alternativa a los Secrets en VPS/contenedores)."""
+    valor = os.environ.get(nombre, "")
+    return valor.strip() or None
+
+
+def ruta_db_usuarios():
+    """Ruta del archivo SQLite de usuarios: `[auth] db`, la variable NEMET_DB_USUARIOS o la carpeta de la app."""
+    configurada = obtener_secret("auth", "db") or variable_entorno("NEMET_DB_USUARIOS")
+    if configurada:
+        configurada = str(configurada)
+        return configurada if os.path.isabs(configurada) else os.path.join(BASE_DIR, configurada)
+    return os.path.join(BASE_DIR, NOMBRE_DB_USUARIOS)
 
 
 def flash(mensaje, tipo="success"):
@@ -248,12 +272,20 @@ def agregar_al_carrito(clave, item):
 # ==========================================
 # RESPALDO EN GITHUB
 # ==========================================
+RUTA_DB_USUARIOS = ruta_db_usuarios()
+
+
 def _url_github(token, repo_name):
     return f"https://{token}@github.com/{repo_name}.git"
 
 
-def _respaldar_core(mensaje):
-    """Commit + fetch/rebase + push del Excel. Devuelve (ok, tipo_ui, mensaje)."""
+def _respaldar_core(mensaje, rutas_extra=None):
+    """Commit + fetch/rebase + push de los datos (Excel + base de usuarios).
+
+    Devuelve (ok, tipo_ui, mensaje). Siempre incluye la base de usuarios: así el
+    respaldo la publica y, sobre todo, el árbol de trabajo queda limpio para que
+    el rebase no falle por cambios sin confirmar.
+    """
     token = obtener_secret("git", "token")
     repo_name = obtener_secret("git", "repo")
     if not token or not repo_name:
@@ -266,9 +298,20 @@ def _respaldar_core(mensaje):
             git_config.set_value("user", "name", "NEMET Bot")
             git_config.set_value("user", "email", "bot@nemet.app")
 
-        ruta_excel = os.path.relpath(EXCEL_FILE, repo.working_tree_dir)
-        repo.index.add([ruta_excel])
-        hay_cambios = bool(repo.index.diff("HEAD", paths=[ruta_excel]))
+        candidatas = [EXCEL_FILE, RUTA_DB_USUARIOS]
+        if isinstance(rutas_extra, str):
+            rutas_extra = [rutas_extra]
+        candidatas.extend(rutas_extra or [])
+        rutas_datos = []
+        for ruta in candidatas:
+            if not ruta or not os.path.exists(ruta):
+                continue
+            relativa = os.path.relpath(ruta, repo.working_tree_dir)
+            if not relativa.startswith("..") and relativa not in rutas_datos:
+                rutas_datos.append(relativa)
+
+        repo.index.add(rutas_datos)
+        hay_cambios = bool(repo.index.diff("HEAD", paths=rutas_datos))
         if hay_cambios:
             repo.index.commit(mensaje)
         try:
@@ -301,25 +344,24 @@ def _respaldar_core(mensaje):
         return False, "error", f"Error al sincronizar con GitHub: {str(e).replace(token, '***')}"
 
 
-def guardar_cambios_github(mensaje="Actualización automática de datos"):
+def guardar_cambios_github(mensaje="Actualización automática de datos", rutas_extra=None):
     """Versión para botón: ejecuta el respaldo y muestra el resultado en pantalla."""
-    ok, tipo, texto = _respaldar_core(mensaje)
+    ok, tipo, texto = _respaldar_core(mensaje, rutas_extra=rutas_extra)
     getattr(st, tipo, st.info)(texto)
     return ok
 
 
-def _respaldo_automatico(mensaje):
-    """Tras un guardado exitoso intenta subir el Excel a GitHub (si los Secrets [git] existen).
+def _respaldo_automatico(mensaje, rutas_extra=None, intervalo=True):
+    """Tras un guardado exitoso intenta subir los datos a GitHub (si los Secrets [git] existen).
     Devuelve (tipo_ui, mensaje) para mostrar, o None si no aplica o se omitió por el intervalo."""
     token = obtener_secret("git", "token")
     repo_name = obtener_secret("git", "repo")
     if not token or not repo_name:
         return None
-    ahora = datetime.now().timestamp()
-    if ahora - st.session_state.get("_ultimo_respaldo", 0) < RESPALDO_INTERVALO_SEG:
+    if intervalo and time.time() - st.session_state.get("_ultimo_respaldo", 0) < RESPALDO_INTERVALO_SEG:
         return None
-    st.session_state["_ultimo_respaldo"] = ahora
-    ok, tipo, texto = _respaldar_core(mensaje)
+    st.session_state["_ultimo_respaldo"] = time.time()
+    ok, tipo, texto = _respaldar_core(mensaje, rutas_extra=rutas_extra)
     return (tipo, texto) if ok else ("warning", f"Respaldo automático falló: {texto}")
 
 
@@ -813,12 +855,492 @@ def bloque_acciones_cotizacion(clave, items, cliente, correo, titulo_detalle):
 
 
 # ==========================================
+# AUTENTICACIÓN, SESIONES Y PERMISOS
+# ==========================================
+# Módulos del menú y la clave con la que se evalúa el permiso (auth_nemet.MODULOS).
+MODULOS_MENU = [
+    ("📊 Dashboard & Resumen", "dashboard"),
+    ("📦 Control de Inventario y Edición", "inventario"),
+    ("👥 Gestión de Clientes", "clientes"),
+    ("📏 Cotizador por Área y Milimétrico", "cotizador_area"),
+    ("📝 Cotizador Comercial Profesional", "cotizador_comercial"),
+    ("📋 Historial de Cotizaciones (Folios)", "historial"),
+    ("🛡️ Administración de Usuarios", "admin_usuarios"),
+]
+
+
+@st.cache_resource(show_spinner=False)
+def conexion_usuarios():
+    """Conexión única (cacheada) a la base de usuarios de la app."""
+    conn = auth.conectar(ruta_db_usuarios())
+    auth.inicializar_db(conn)
+    return conn
+
+
+def modulos_visibles(rol):
+    """Etiquetas del menú que el rol puede ver: los módulos sin permiso ni se listan."""
+    return [etiqueta for etiqueta, clave in MODULOS_MENU if auth.puede(rol, clave)]
+
+
+def fecha_legible(iso, con_hora=True):
+    """Convierte una marca de tiempo ISO al horario de Sonora para mostrarla."""
+    if not iso:
+        return ""
+    try:
+        momento = datetime.fromisoformat(str(iso))
+    except ValueError:
+        return str(iso)
+    if momento.tzinfo is None:
+        momento = momento.replace(tzinfo=timezone.utc)
+    if ZONA_HORARIA:
+        momento = momento.astimezone(ZONA_HORARIA)
+    return momento.strftime("%d/%m/%Y %H:%M" if con_hora else "%d/%m/%Y")
+
+
+def sembrar_administrador_inicial(conn):
+    """Administrador inicial desde `[auth]` en los Secrets (o variables de entorno NEMET_*).
+
+    Sin credenciales en el repositorio: la contraseña inicial vive en los Secrets y,
+    una vez creado el administrador, la app no vuelve a leerla (solo con `admin_forzar`).
+    """
+    def leer(clave, variable):
+        return obtener_secret("auth", clave) or variable_entorno(variable)
+
+    forzar = str(leer("admin_forzar", "NEMET_ADMIN_FORZAR") or "").strip().lower()
+    return auth.sembrar_admin_inicial(
+        conn,
+        leer("admin_usuario", "NEMET_ADMIN_USUARIO"),
+        leer("admin_password", "NEMET_ADMIN_PASSWORD"),
+        nombre=leer("admin_nombre", "NEMET_ADMIN_NOMBRE") or "",
+        correo=leer("admin_correo", "NEMET_ADMIN_CORREO") or "",
+        forzar=forzar in ("1", "true", "verdadero", "si", "sí", "yes"),
+        zona=ZONA_HORARIA,
+    )
+
+
+def minutos_de_sesion():
+    """Duración de la sesión (por inactividad): `[auth] session_minutos`, por omisión 60."""
+    configurado = obtener_secret("auth", "session_minutos") or variable_entorno("NEMET_SESION_MINUTOS")
+    try:
+        return max(5, int(configurado))
+    except (TypeError, ValueError):
+        return auth.TTL_SESION_MINUTOS
+
+
+def _fijar_token(usuario, secreto, ttl):
+    """Emite el token firmado de la sesión (session_state + URL para sobrevivir recargas)."""
+    token = auth.crear_token(secreto, usuario, minutos=ttl)
+    st.session_state["_token"] = token
+    st.session_state["_token_emitido"] = time.time()
+    try:
+        st.query_params[CLAVE_SESION_URL] = token
+    except Exception:
+        pass  # sin URL disponible la sesión sigue viva en session_state
+    return token
+
+
+def _borrar_token():
+    st.session_state.pop("_token", None)
+    st.session_state.pop("_token_emitido", None)
+    try:
+        if CLAVE_SESION_URL in st.query_params:
+            del st.query_params[CLAVE_SESION_URL]
+    except Exception:
+        pass
+
+
+def cerrar_sesion(conn, motivo="Cierre de sesión del usuario."):
+    """Cierra la sesión: bitácora, borra el token y limpia el estado de la sesión."""
+    usuario = st.session_state.get("_usuario") or {}
+    if usuario:
+        auth.registrar_evento(conn, "cierre_sesion", actor=usuario.get("usuario", ""),
+                              actor_id=usuario.get("id"), detalle=motivo, zona=ZONA_HORARIA)
+    _borrar_token()
+    for clave in ("_usuario", "inventario", "clientes", "carrito_area", "carrito_comercial",
+                  "inv_base_hash", "cli_base_hash", "_ultimo_respaldo"):
+        st.session_state.pop(clave, None)
+
+
+def pantalla_login(conn, secreto, ttl, aviso_semilla=None):
+    """Formulario de acceso. Devuelve None (la sesión se fija y se recarga la app)."""
+    estilos_marca()
+    cabecera_marca()
+    st.subheader("🔐 Acceso al sistema")
+    st.caption("Sistema interno de NEMET. El acceso está restringido a cuentas autorizadas "
+               "y todas las acciones quedan registradas en la bitácora.")
+
+    if aviso_semilla and aviso_semilla[0] in ("creado", "actualizado"):
+        st.info(f"🌱 {aviso_semilla[1]}")
+    if aviso_semilla and aviso_semilla[0] == "sin_admins":
+        st.error("🚨 El sistema no tiene ningún administrador activo y los Secrets no traen "
+                 "credenciales de administrador inicial (`[auth] admin_usuario` y `admin_password`). "
+                 "Configúralas en los Secrets de la app para poder entrar; nadie puede crear al "
+                 "primer administrador desde esta pantalla.")
+        return None
+
+    with st.form("form_acceso"):
+        usuario = st.text_input("Usuario", key="acceso_usuario", autocomplete="username")
+        password = st.text_input("Contraseña", type="password", key="acceso_password",
+                                 autocomplete="current-password")
+        entrar = st.form_submit_button("Entrar", type="primary", key="acceso_entrar")
+
+    if entrar:
+        datos, mensaje = auth.autenticar(conn, usuario, password, zona=ZONA_HORARIA)
+        if datos:
+            st.session_state["_usuario"] = datos
+            _fijar_token(datos, secreto, ttl)
+            st.rerun()
+        else:
+            st.error(f"❌ {mensaje}")
+
+    st.caption("¿Olvidaste tu contraseña? Pide a un administrador que la restablezca desde el "
+               "panel de administración; nadie puede recuperarla porque se guarda cifrada.")
+    if not obtener_secret("auth", "session_secret"):
+        st.caption("💡 Sugerencia de seguridad: define `[auth] session_secret` en los Secrets para "
+                   "rotar la clave que firma las sesiones y `[auth] session_minutos` para ajustar "
+                   "la expiración por inactividad.")
+    return None
+
+
+def pantalla_cambio_obligatorio(conn, usuario, secreto, ttl):
+    """Bloquea la app hasta que el usuario cambie su contraseña provisional."""
+    estilos_marca()
+    cabecera_marca()
+    st.subheader("🔑 Cambia tu contraseña")
+    st.warning(f"Hola {usuario['nombre'] or usuario['usuario']}: tu contraseña es provisional. "
+               "Por seguridad debes cambiarla antes de usar el sistema.")
+    with st.form("form_password_obligatorio"):
+        actual = st.text_input("Contraseña actual (la provisional)", type="password", key="cambio_actual")
+        nueva = st.text_input("Contraseña nueva", type="password", key="cambio_nueva",
+                              help=f"Mínimo {auth.LARGO_MINIMO_PASSWORD} caracteres, con letras y números.")
+        repetir = st.text_input("Repite la contraseña nueva", type="password", key="cambio_repetir")
+        guardar = st.form_submit_button("Guardar contraseña", type="primary", key="cambio_guardar")
+    if guardar:
+        if nueva != repetir:
+            st.error("Las contraseñas nuevas no coinciden.")
+        else:
+            try:
+                actualizado = auth.cambiar_password_propia(conn, usuario["id"], actual, nueva, zona=ZONA_HORARIA)
+                _fijar_token(actualizado, secreto, ttl)
+                st.session_state["_usuario"] = actualizado
+                flash("✅ Contraseña actualizada. ¡Bienvenido al Sistema Maestro NEMET!")
+                st.rerun()
+            except auth.ErrorAuth as error:
+                st.error(str(error))
+    if st.button("🔒 Cerrar sesión"):
+        cerrar_sesion(conn, "Cerró sesión desde el cambio de contraseña obligatorio.")
+        st.rerun()
+
+
+def ejecutar_gate_acceso():
+    """Punto único de entrada: sin sesión válida no se ejecuta ni un módulo de negocio."""
+    conn = CONN
+    aviso_semilla = sembrar_administrador_inicial(conn)
+    secreto = auth.secreto_sesion(conn, obtener_secret("auth", "session_secret"))
+    ttl = minutos_de_sesion()
+
+    token = st.session_state.get("_token") or st.query_params.get(CLAVE_SESION_URL)
+    usuario = auth.usuario_de_token(conn, secreto, token) if token else None
+    if usuario is None:
+        if token:
+            _borrar_token()  # caducó, se firmó con otra clave o la cuenta se desactivó
+        pantalla_login(conn, secreto, ttl, aviso_semilla)
+        st.stop()
+
+    # Ventana deslizante: la sesión se renueva mientras el usuario sigue trabajando.
+    if time.time() - float(st.session_state.get("_token_emitido", 0)) > REFRESCO_TOKEN_SEG:
+        _fijar_token(usuario, secreto, ttl)
+    st.session_state["_usuario"] = usuario
+
+    if usuario["debe_cambiar"]:
+        pantalla_cambio_obligatorio(conn, usuario, secreto, ttl)
+        st.stop()
+    return usuario
+
+
+def requiere_modulo(clave_modulo):
+    """Corta la vista (y lo anota en la bitácora) si el rol no tiene permiso al módulo."""
+    if auth.puede(SESION["rol"], clave_modulo):
+        return True
+    auth.registrar_evento(CONN, "permiso_denegado", actor=SESION["usuario"], actor_id=SESION["id"],
+                          objetivo=clave_modulo,
+                          detalle=f"El rol {auth.etiqueta_rol(SESION['rol'])} intentó abrir {clave_modulo}.",
+                          zona=ZONA_HORARIA)
+    st.error("🚫 Tu rol no tiene acceso a este módulo. Si lo necesitas, pide a un administrador "
+             "que ajuste tus permisos.")
+    st.stop()
+
+
+def recargar_datos():
+    """Sincroniza la caché de la sesión con el Excel respetando los permisos del rol."""
+    st.session_state["inventario"] = cargar_inventario()
+    if auth.puede(SESION["rol"], "clientes"):
+        st.session_state["clientes"] = cargar_clientes()
+    else:
+        st.session_state["clientes"] = pd.DataFrame(columns=COLUMNAS_CLIENTES)
+
+
+def bloque_usuario_sidebar(conn, secreto, ttl):
+    """Identidad de la sesión, cambio de contraseña propio y cierre de sesión."""
+    with st.sidebar.container(border=True):
+        st.markdown(f"**{SESION['nombre'] or SESION['usuario']}**")
+        st.caption(f"👤 `{SESION['usuario']}` · {auth.etiqueta_rol(SESION['rol'])}")
+        st.caption(f"🕒 Último acceso: {fecha_legible(SESION['ultimo_acceso']) or '—'}")
+
+    with st.sidebar.expander("🔑 Cambiar mi contraseña"):
+        with st.form("form_mi_password"):
+            actual = st.text_input("Contraseña actual", type="password", key="mi_password_actual")
+            nueva = st.text_input("Contraseña nueva", type="password", key="mi_password_nueva",
+                                  help=f"Mínimo {auth.LARGO_MINIMO_PASSWORD} caracteres, con letras y números.")
+            repetir = st.text_input("Repite la nueva", type="password", key="mi_password_repetir")
+            guardar = st.form_submit_button("Actualizar contraseña", key="mi_password_guardar")
+        if guardar:
+            if nueva != repetir:
+                st.error("Las contraseñas nuevas no coinciden.")
+            else:
+                try:
+                    actualizado = auth.cambiar_password_propia(conn, SESION["id"], actual, nueva, zona=ZONA_HORARIA)
+                except auth.ErrorAuth as error:
+                    st.error(str(error))
+                else:
+                    st.session_state["_usuario"] = actualizado
+                    _fijar_token(actualizado, secreto, ttl)
+                    flash("✅ Tu contraseña se actualizó correctamente.")
+                    st.rerun()
+
+    if st.sidebar.button("🔒 Cerrar sesión"):
+        cerrar_sesion(conn)
+        st.rerun()
+
+
+def _tras_cambio_de_usuarios(motivo):
+    """Respalda la base de usuarios de inmediato (sin esperar el intervalo anti-spam) y recarga."""
+    respaldo = _respaldo_automatico(f"Respaldo automático: {motivo}", rutas_extra=[RUTA_DB_USUARIOS],
+                                    intervalo=False)
+    if respaldo:
+        flash(respaldo[1], respaldo[0])
+    st.rerun()
+
+
+def panel_usuarios(conn):
+    """Panel de administración: crear, editar, desactivar y eliminar administradores y usuarios."""
+    requiere_modulo("usuarios_gestionar")  # doble candado: además del módulo, exige la acción de administrar
+    st.subheader("🛡️ Administración de Usuarios y Permisos")
+    st.caption("Solo los administradores activos ven este panel. Las contraseñas se guardan con hash "
+               "scrypt (nunca en texto plano) y todas las acciones quedan en la bitácora.")
+
+    metricas = auth.resumen(conn)
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("Cuentas", metricas["total"])
+    col2.metric("Activas", metricas["activos"])
+    col3.metric("Administradores activos", metricas["admins_activos"])
+    col4.metric("Por cambiar contraseña", metricas["por_cambiar"])
+    col5.metric("Bloqueadas temporalmente", metricas["bloqueados"])
+    if metricas["admins_activos"] <= 1:
+        st.warning("⚠️ Solo hay un administrador activo. Crea otro administrador para no depender "
+                   "de una sola cuenta (el sistema nunca se queda sin administradores activos).")
+
+    credenciales = st.session_state.pop("_credenciales_recientes", None)
+    if credenciales:
+        st.warning(f"🔐 **Anota estas credenciales ahora**: no se vuelven a mostrar.\n\n"
+                   f"Usuario: `{credenciales['usuario']}` — Contraseña temporal: `{credenciales['password']}`\n\n"
+                   "Compártelas por un canal seguro: al iniciar sesión la app pedirá cambiarla.")
+
+    usuarios = auth.listar_usuarios(conn)
+    tab_cuentas, tab_crear, tab_actividad = st.tabs(["👥 Cuentas", "➕ Crear cuenta", "🧾 Actividad"])
+
+    with tab_cuentas:
+        st.dataframe(pd.DataFrame([{
+            "Usuario": u["usuario"],
+            "Nombre": u["nombre"],
+            "Correo": u["correo"],
+            "Rol": auth.etiqueta_rol(u["rol"]),
+            "Estado": "🟢 Activa" if u["activo"] else "⚪ Desactivada",
+            "Contraseña": "🔑 Provisional" if u["debe_cambiar"] else "Definida",
+            "Último acceso": fecha_legible(u["ultimo_acceso"]) or "Nunca",
+            "Bloqueada hasta": fecha_legible(u["bloqueado_hasta"]) or "—",
+            "Creada": fecha_legible(u["creado_en"], con_hora=False),
+        } for u in usuarios]), width="stretch", hide_index=True)
+
+        etiquetas = {u["id"]: f"{u['usuario']} — {auth.etiqueta_rol(u['rol'])}"
+                              f"{'' if u['activo'] else ' (desactivada)'}" for u in usuarios}
+        id_objetivo = st.selectbox("Cuenta a administrar", list(etiquetas), format_func=etiquetas.get,
+                                   key="cuenta_objetivo")
+        objetivo = auth.obtener_usuario(conn, id_objetivo)
+        es_uno_mismo = objetivo["id"] == SESION["id"]
+
+        col_datos, col_acceso = st.columns(2)
+        with col_datos:
+            with st.form("form_datos_usuario"):
+                st.markdown("**Datos de la cuenta**")
+                nombre = st.text_input("Nombre completo", value=objetivo["nombre"], key="datos_nombre")
+                correo = st.text_input("Correo", value=objetivo["correo"], key="datos_correo")
+                guardar_datos = st.form_submit_button("💾 Guardar datos", key="datos_guardar")
+            if guardar_datos:
+                try:
+                    auth.actualizar_datos(conn, SESION, objetivo["id"], nombre=nombre, correo=correo,
+                                          zona=ZONA_HORARIA)
+                except auth.ErrorAuth as error:
+                    st.error(str(error))
+                else:
+                    flash(f"✅ Datos de `{objetivo['usuario']}` actualizados.")
+                    _tras_cambio_de_usuarios("datos de usuario")
+
+            with st.form("form_rol_usuario"):
+                st.markdown("**Rol y permisos**")
+                if es_uno_mismo:
+                    st.caption("No puedes cambiar tu propio rol: pídelo a otro administrador.")
+                rol_nuevo = st.selectbox("Rol", auth.ROLES if not es_uno_mismo else [objetivo["rol"]],
+                                         index=auth.ROLES.index(objetivo["rol"]) if not es_uno_mismo else 0,
+                                         format_func=auth.etiqueta_rol, disabled=es_uno_mismo, key="rol_nuevo")
+                guardar_rol = st.form_submit_button("🔁 Aplicar rol", disabled=es_uno_mismo, key="rol_guardar")
+            if guardar_rol:
+                try:
+                    auth.cambiar_rol(conn, SESION, objetivo["id"], rol_nuevo, zona=ZONA_HORARIA)
+                except auth.ErrorAuth as error:
+                    st.error(str(error))
+                else:
+                    flash(f"✅ `{objetivo['usuario']}` ahora es {auth.etiqueta_rol(rol_nuevo)}.")
+                    _tras_cambio_de_usuarios("cambio de rol")
+
+        with col_acceso:
+            with st.form("form_password_usuario"):
+                st.markdown("**Restablecer contraseña**")
+                generar = st.checkbox("Generar una contraseña temporal", value=True, key="pass_generar")
+                nueva = st.text_input("Contraseña nueva", type="password", disabled=generar, key="pass_nueva",
+                                      help="Se pedirá cambiarla al iniciar sesión.")
+                restablecer = st.form_submit_button("🔑 Restablecer", key="pass_restablecer")
+            if restablecer:
+                try:
+                    _, temporal = auth.restablecer_password(conn, SESION, objetivo["id"],
+                                                            password=None if generar else nueva,
+                                                            zona=ZONA_HORARIA)
+                except auth.ErrorAuth as error:
+                    st.error(str(error))
+                else:
+                    if temporal:
+                        st.session_state["_credenciales_recientes"] = {"usuario": objetivo["usuario"],
+                                                                       "password": temporal}
+                    flash(f"✅ Contraseña de `{objetivo['usuario']}` restablecida.")
+                    _tras_cambio_de_usuarios("restablecimiento de contraseña")
+
+            st.markdown("**Estado de la cuenta**")
+            if objetivo["activo"]:
+                st.caption("Una cuenta desactivada no puede iniciar sesión, pero conserva su historial.")
+                if st.button("🚫 Desactivar cuenta", disabled=es_uno_mismo, key="cuenta_desactivar"):
+                    try:
+                        auth.establecer_activo(conn, SESION, objetivo["id"], False, zona=ZONA_HORARIA)
+                    except auth.ErrorAuth as error:
+                        st.error(str(error))
+                    else:
+                        flash(f"✅ `{objetivo['usuario']}` quedó desactivada.")
+                        _tras_cambio_de_usuarios("desactivación de usuario")
+            else:
+                if st.button("♻️ Reactivar cuenta", type="primary", key="cuenta_reactivar"):
+                    try:
+                        auth.establecer_activo(conn, SESION, objetivo["id"], True, zona=ZONA_HORARIA)
+                    except auth.ErrorAuth as error:
+                        st.error(str(error))
+                    else:
+                        flash(f"✅ `{objetivo['usuario']}` quedó activa de nuevo.")
+                        _tras_cambio_de_usuarios("reactivación de usuario")
+
+            with st.expander("🗑️ Eliminar cuenta definitivamente"):
+                st.caption("Se borra la cuenta y no se puede deshacer. La bitácora conserva sus acciones.")
+                confirmacion = st.text_input(f"Escribe `{objetivo['usuario']}` para confirmar",
+                                             key=f"confirmar_borrado_{objetivo['id']}")
+                if st.button("Eliminar cuenta", key="cuenta_eliminar",
+                             disabled=es_uno_mismo or confirmacion.strip() != objetivo["usuario"]):
+                    try:
+                        auth.eliminar_usuario(conn, SESION, objetivo["id"], zona=ZONA_HORARIA)
+                    except auth.ErrorAuth as error:
+                        st.error(str(error))
+                    else:
+                        flash(f"🗑️ La cuenta `{objetivo['usuario']}` fue eliminada.")
+                        _tras_cambio_de_usuarios("eliminación de usuario")
+
+    with tab_crear:
+        with st.form("form_crear_usuario", clear_on_submit=True):
+            col_a, col_b = st.columns(2)
+            with col_a:
+                usuario_nuevo = st.text_input("Usuario (para iniciar sesión)", key="nuevo_usuario",
+                                              help="3-32 caracteres: letras, números, punto, guion o guion bajo.")
+                nombre_nuevo = st.text_input("Nombre completo", key="nuevo_nombre")
+            with col_b:
+                correo_nuevo = st.text_input("Correo", key="nuevo_correo")
+                rol_nuevo = st.selectbox("Rol", auth.ROLES, index=2, format_func=auth.etiqueta_rol,
+                                         key="nuevo_rol")
+            definir = st.checkbox("Definir yo la contraseña inicial (si no, se genera una temporal)",
+                                  value=False, key="nuevo_definir")
+            password_nueva = st.text_input("Contraseña inicial", type="password", disabled=not definir,
+                                           key="nuevo_password",
+                                           help=f"Mínimo {auth.LARGO_MINIMO_PASSWORD} caracteres, con letras y números.")
+            debe_cambiar = st.checkbox("Pedir cambio de contraseña al primer inicio de sesión", value=True,
+                                       key="nuevo_debe_cambiar")
+            crear = st.form_submit_button("➕ Crear cuenta", type="primary", key="crear_cuenta")
+        if crear:
+            try:
+                creado = auth.crear_usuario(conn, SESION, usuario_nuevo,
+                                            password=password_nueva if definir else None,
+                                            nombre=nombre_nuevo, correo=correo_nuevo, rol=rol_nuevo,
+                                            debe_cambiar=debe_cambiar, zona=ZONA_HORARIA)
+            except auth.ErrorAuth as error:
+                st.error(str(error))
+            else:
+                st.session_state["_credenciales_recientes"] = {
+                    "usuario": creado["usuario"],
+                    "password": creado.get("password_temporal") or password_nueva,
+                }
+                flash(f"✅ Cuenta `{creado['usuario']}` creada como {auth.etiqueta_rol(creado['rol'])}.")
+                _tras_cambio_de_usuarios("alta de usuario")
+
+        st.markdown("**Permisos por rol**")
+        st.dataframe(pd.DataFrame([{
+            "Módulo": etiqueta,
+            "Administrador": "✅" if auth.puede("admin", clave) else "—",
+            "Editor": "✅" if auth.puede("editor", clave) else "—",
+            "Usuario": "✅" if auth.puede("usuario", clave) else "—",
+        } for etiqueta, clave in MODULOS_MENU]), width="stretch", hide_index=True)
+
+    with tab_actividad:
+        eventos = auth.listar_eventos(conn, limite=300)
+        if eventos:
+            st.dataframe(pd.DataFrame([{
+                "Fecha": fecha_legible(e["fecha"]),
+                "Actor": e["actor"] or "—",
+                "Acción": e["accion"],
+                "Objetivo": e["objetivo"] or "—",
+                "Detalle": e["detalle"],
+            } for e in eventos]), width="stretch", hide_index=True)
+        else:
+            st.info("Todavía no hay actividad registrada.")
+        st.caption("La bitácora nunca guarda contraseñas: solo hashes (y las contraseñas provisorias "
+                   "se muestran una única vez, en pantalla).")
+        if st.button("🚪 Cerrar todas las sesiones (cambia la clave de firma)", key="cerrar_sesiones"):
+            auth.rotar_secreto_sesion(conn, SESION, zona=ZONA_HORARIA)
+            secreto = auth.secreto_sesion(conn, obtener_secret("auth", "session_secret"))
+            _fijar_token(SESION, secreto, minutos_de_sesion())
+            flash("✅ Sesiones revocadas: todos deberán iniciar sesión otra vez (esta sesión se renovó).")
+            _tras_cambio_de_usuarios("revocación de sesiones")
+
+
+# ==========================================
+# ACCESO (se ejecuta antes de tocar cualquier dato)
+# ==========================================
+CONN = conexion_usuarios()
+SESION = ejecutar_gate_acceso()
+
+# ==========================================
 # ESTADO INICIAL
 # ==========================================
 if "inventario" not in st.session_state or st.session_state["inventario"].empty:
     st.session_state["inventario"] = cargar_inventario()
 if "clientes" not in st.session_state:
-    st.session_state["clientes"] = cargar_clientes()
+    # El directorio de clientes solo se carga con permiso al módulo (evita exponerlo a otros roles).
+    if auth.puede(SESION["rol"], "clientes"):
+        st.session_state["clientes"] = cargar_clientes()
+    else:
+        st.session_state["clientes"] = pd.DataFrame(columns=COLUMNAS_CLIENTES)
 if "carrito_comercial" not in st.session_state:
     st.session_state["carrito_comercial"] = carrito_vacio()
 if "carrito_area" not in st.session_state:
@@ -835,20 +1357,16 @@ _logo_sidebar = logo_marca()
 if _logo_sidebar is not None:
     st.sidebar.image(_logo_sidebar, width=160)
 st.sidebar.title("📂 Menú Principal")
-menu = st.sidebar.selectbox("Navegación", [
-    "📊 Dashboard & Resumen",
-    "📦 Control de Inventario y Edición",
-    "👥 Gestión de Clientes",
-    "📏 Cotizador por Área y Milimétrico",
-    "📝 Cotizador Comercial Profesional",
-    "📋 Historial de Cotizaciones (Folios)"
-])
+menu = st.sidebar.selectbox("Navegación", modulos_visibles(SESION["rol"]))
 st.sidebar.divider()
-if st.sidebar.button("☁️ Respaldar Excel en GitHub"):
-    ok, tipo, texto = _respaldar_core("Respaldo manual de datos")
-    getattr(st.sidebar, tipo, st.sidebar.info)(texto)
-st.sidebar.caption("El Excel se respalda automáticamente en GitHub tras cada guardado si configuras los Secrets `[git]` "
-                   "(token y repo). Este botón fuerza un respaldo manual.")
+if auth.puede(SESION["rol"], "respaldo"):
+    if st.sidebar.button("☁️ Respaldar datos en GitHub"):
+        with st.spinner("Respaldando Excel y base de usuarios..."):
+            guardar_cambios_github("Respaldo manual de datos (Excel + usuarios)")
+    st.sidebar.caption("El Excel y la base de usuarios se respaldan automáticamente en GitHub tras cada guardado "
+                       "si configuras los Secrets `[git]` (token y repo). Este botón fuerza un respaldo manual.")
+    st.sidebar.divider()
+bloque_usuario_sidebar(CONN, auth.secreto_sesion(CONN, obtener_secret("auth", "session_secret")), minutos_de_sesion())
 
 mostrar_flash()
 estilos_marca()
@@ -860,12 +1378,12 @@ if not _portada_activa:
     cabecera_marca()
 
 if menu == "📊 Dashboard & Resumen":
+    requiere_modulo("dashboard")
     st.title("🧪 Sistema Maestro NEMET")
     st.subheader("Panel General de Control y Logística")
 
     if st.button("🔄 Sincronizar Datos con Excel"):
-        st.session_state["inventario"] = cargar_inventario()
-        st.session_state["clientes"] = cargar_clientes()
+        recargar_datos()
         st.session_state["version_editores"] += 1
         st.session_state.pop("inv_conflicto", None)
         st.session_state.pop("cli_conflicto", None)
@@ -880,7 +1398,11 @@ if menu == "📊 Dashboard & Resumen":
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total de SKUs Registrados", len(df_inv))
-    col2.metric("Clientes Registrados", len(df_clientes))
+    if auth.puede(SESION["rol"], "clientes"):
+        col2.metric("Clientes Registrados", len(df_clientes))
+    else:
+        col2.metric("Clientes Registrados", "🔒",
+                    help="Tu rol no tiene acceso al directorio de clientes.")
     col3.metric("Valor Total Inventario ($)", f"${valor_total:,.2f} MXN")
     col4.metric("SKUs por Reabastecer", por_reabastecer)
 
@@ -894,6 +1416,7 @@ if menu == "📊 Dashboard & Resumen":
     st.dataframe(df_inv, width="stretch")
 
 elif menu == "📦 Control de Inventario y Edición":
+    requiere_modulo("inventario")
     st.subheader("Gestión, Entradas, Salidas y Edición Directa")
     st.caption("Captura StockInicial, Entradas, Salidas, StockMinimo, PrecioCompra y PrecioPublicoIVA. "
                "Las columnas StockActual, AlertaStock, PrecioBaseSinIVA, IVA 16% y ValorInventario se calculan al guardar.")
@@ -932,6 +1455,7 @@ elif menu == "📦 Control de Inventario y Edición":
                 st.error(f"Error al guardar: {e}")
 
 elif menu == "👥 Gestión de Clientes":
+    requiere_modulo("clientes")
     st.subheader("👥 Base de Datos y Directorio de Clientes")
     st.markdown("Agrega, edita o elimina la información de tus clientes directamente. Los cambios se guardarán en la pestaña `Clientes` de tu Excel.")
 
@@ -969,6 +1493,7 @@ elif menu == "👥 Gestión de Clientes":
                 st.error(f"Error al guardar clientes: {e}")
 
 elif menu == "📏 Cotizador por Área y Milimétrico":
+    requiere_modulo("cotizador_area")
     st.subheader("Cotizador por Área, Espesor y Proporción de Mezcla")
 
     with st.expander("📦 Consultar Inventario General"):
@@ -1084,6 +1609,7 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
                                "Cotización por Área y Sistemas Epóxicos")
 
 elif menu == "📝 Cotizador Comercial Profesional":
+    requiere_modulo("cotizador_comercial")
     st.subheader("Generador de Cotizaciones Comerciales")
 
     if df_inv.empty:
@@ -1121,19 +1647,29 @@ elif menu == "📝 Cotizador Comercial Profesional":
                                "Cotización Comercial")
 
 elif menu == "📋 Historial de Cotizaciones (Folios)":
+    requiere_modulo("historial")
     st.subheader("Historial y Auditoría de Cotizaciones")
 
-    with st.expander("🗑️ Borrar Todo el Historial de Cotizaciones"):
-        confirmar = st.checkbox("Confirmo que deseo borrar TODO el historial (esta acción no se puede deshacer)")
-        if st.button("Borrar Historial", disabled=not confirmar, type="primary"):
-            try:
-                escribir_hoja(pd.DataFrame(columns=COLUMNAS_HISTORIAL), HOJA_HISTORIAL)
-                for clave in ("carrito_area", "carrito_comercial"):
-                    st.session_state.pop(f"{clave}_emitido", None)
-                flash("¡Historial de cotizaciones limpiado exitosamente!")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Error al limpiar el historial: {e}")
+    if auth.puede(SESION["rol"], "historial_borrar"):
+        with st.expander("🗑️ Borrar Todo el Historial de Cotizaciones"):
+            confirmar = st.checkbox("Confirmo que deseo borrar TODO el historial (esta acción no se puede deshacer)")
+            if st.button("Borrar Historial", disabled=not confirmar, type="primary"):
+                try:
+                    escribir_hoja(pd.DataFrame(columns=COLUMNAS_HISTORIAL), HOJA_HISTORIAL)
+                    for clave in ("carrito_area", "carrito_comercial"):
+                        st.session_state.pop(f"{clave}_emitido", None)
+                    auth.registrar_evento(CONN, "historial_borrado", actor=SESION["usuario"],
+                                          actor_id=SESION["id"],
+                                          detalle="Se borró todo el historial de cotizaciones.", zona=ZONA_HORARIA)
+                    flash("¡Historial de cotizaciones limpiado exitosamente!")
+                    respaldo = _respaldo_automatico("Respaldo automático: historial borrado")
+                    if respaldo:
+                        flash(respaldo[1], respaldo[0])
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error al limpiar el historial: {e}")
+    else:
+        st.caption("🔒 Solo un administrador puede borrar el historial completo.")
 
     df_hist = cargar_historial()
     if df_hist.empty:
@@ -1147,6 +1683,10 @@ elif menu == "📋 Historial de Cotizaciones (Folios)":
             ]
         st.dataframe(df_hist, width="stretch", hide_index=True)
         st.metric("Total de Cotizaciones Emitidas", len(df_hist))
+
+elif menu == "🛡️ Administración de Usuarios":
+    requiere_modulo("admin_usuarios")
+    panel_usuarios(CONN)
 
 # Pie de marca (todas las vistas)
 st.divider()
