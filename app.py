@@ -976,6 +976,11 @@ def pantalla_login(conn, secreto, ttl, aviso_semilla=None):
 
     if aviso_semilla and aviso_semilla[0] in ("creado", "actualizado"):
         st.success(f"🌱 {aviso_semilla[1]}")
+        # Se publica la base en GitHub de inmediato: si el servidor se reinicia antes del
+        # primer guardado, la cuenta de administrador no se pierde (disco efímero en la nube).
+        respaldo = _respaldar_usuarios("alta del administrador inicial")
+        if respaldo:
+            getattr(st, respaldo[0], st.info)(respaldo[1])
     if aviso_semilla and aviso_semilla[0] == "sin_admins":
         st.error("🚨 El sistema no tiene ningún administrador activo y los Secrets no traen "
                  "credenciales de administrador inicial (`[auth] admin_usuario` y `admin_password`). "
@@ -1047,6 +1052,9 @@ def pantalla_cambio_obligatorio(conn, usuario, secreto, ttl):
                 _fijar_token(actualizado, secreto, ttl)
                 st.session_state["_usuario"] = actualizado
                 flash("✅ Contraseña actualizada. ¡Bienvenido al Sistema Maestro NEMET!")
+                respaldo = _respaldar_usuarios("cambio de la contraseña provisional")
+                if respaldo:
+                    flash(respaldo[1], respaldo[0])
                 st.rerun()
             except auth.ErrorAuth as error:
                 st.error(str(error))
@@ -1129,6 +1137,9 @@ def bloque_usuario_sidebar(conn, secreto, ttl):
                     st.session_state["_usuario"] = actualizado
                     _fijar_token(actualizado, secreto, ttl)
                     flash("✅ Tu contraseña se actualizó correctamente.")
+                    respaldo = _respaldar_usuarios("cambio de contraseña")
+                    if respaldo:
+                        flash(respaldo[1], respaldo[0])
                     st.rerun()
 
     if st.sidebar.button("🔒 Cerrar sesión"):
@@ -1138,11 +1149,21 @@ def bloque_usuario_sidebar(conn, secreto, ttl):
 
 def _tras_cambio_de_usuarios(motivo):
     """Respalda la base de usuarios de inmediato (sin esperar el intervalo anti-spam) y recarga."""
-    respaldo = _respaldo_automatico(f"Respaldo automático: {motivo}", rutas_extra=[RUTA_DB_USUARIOS],
-                                    intervalo=False)
+    respaldo = _respaldar_usuarios(motivo)
     if respaldo:
         flash(respaldo[1], respaldo[0])
     st.rerun()
+
+
+def _respaldar_usuarios(motivo):
+    """Publica la base de usuarios en GitHub en el acto.
+
+    En Streamlit Community Cloud el disco es efímero: si el servidor se reinicia antes
+    del siguiente respaldo, las cuentas recién creadas (y las contraseñas recién
+    cambiadas) se perderían. Devuelve (tipo_ui, mensaje) o None si `[git]` no está configurado.
+    """
+    return _respaldo_automatico(f"Respaldo automático: {motivo}",
+                                rutas_extra=[RUTA_DB_USUARIOS], intervalo=False)
 
 
 def panel_usuarios(conn):

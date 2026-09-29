@@ -431,6 +431,10 @@ class TestIntegracionApp(unittest.TestCase):
     def test_48_respaldo_en_github_incluye_la_base_de_usuarios(self):
         self.assertIn("rutas_extra", self.src)
         self.assertIn("RUTA_DB_USUARIOS", self.src)
+        # La base se publica en el acto al sembrar, cambiar contraseñas o gestionar cuentas:
+        # en Streamlit Cloud el disco es efímero y sin eso las cuentas se perderían.
+        self.assertIn("def _respaldar_usuarios", self.src)
+        self.assertGreaterEqual(self.src.count("_respaldar_usuarios("), 5)
 
     def test_49_la_pantalla_de_acceso_avisa_que_no_hay_registro_abierto(self):
         self.assertIn("No hay registro abierto", self.src)
