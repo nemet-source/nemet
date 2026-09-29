@@ -107,6 +107,9 @@ class TestFlujoAcceso(unittest.TestCase):
         self.assertFalse(at.title, "el dashboard no debe renderizarse sin sesión")
         visibles = " ".join(str(m.value) for m in at.markdown)
         self.assertNotIn("Menú Principal", visibles)
+        avisos = " ".join(i.value for i in at.info)
+        self.assertIn("No hay registro abierto", avisos,
+                      "la pantalla de acceso debe explicar que las cuentas las crea un administrador")
 
     def test_02_login_fallido_y_cambio_obligatorio_de_password(self):
         at = self.abrir(paso="login fallido")

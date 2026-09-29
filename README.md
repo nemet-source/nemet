@@ -73,6 +73,22 @@ cp .streamlit/secrets.toml.ejemplo .streamlit/secrets.toml
 `.streamlit/secrets.toml` está en `.gitignore`, así que las credenciales nunca llegan al repositorio.
 En Streamlit Community Cloud se capturan en **App → Settings → Secrets**.
 
+**Instalación local o VPS (sin Secrets):** usa el asistente de terminal, que pide la contraseña de
+forma oculta y la guarda ya cifrada:
+
+```bash
+python herramientas/crear_admin.py --usuario jefe                 # pide la contraseña dos veces
+python herramientas/crear_admin.py --usuario jefe --generar       # o genera una temporal
+python herramientas/crear_admin.py --usuario jefe --db /ruta/nemet_usuarios.db
+```
+
+Se niega a crear cuentas si ya existe algún administrador activo (usa `--forzar` solo en una
+emergencia, por ejemplo si perdiste el acceso). Al entrar, la app pedirá cambiar la contraseña.
+
+> **No hay registro abierto:** nadie puede darse de alta desde la pantalla de acceso. Las cuentas
+> las crea un administrador desde el panel 🛡️ *Administración de Usuarios* (usuario, rol y contraseña
+> provisional), y el primer administrador se define con los Secrets o con `herramientas/crear_admin.py`.
+
 ### Persistencia de las cuentas
 
 La base de usuarios es SQLite (`nemet_usuarios.db`, configurable con `[auth] db`). Como el disco de
@@ -135,7 +151,7 @@ streamlit run app.py
 
 # Baterías de pruebas
 python tests_bateria.py        #  24/24  identidad de marca (assets, tema)
-python tests_autenticacion.py  #  48/48  hashes, roles, sesiones, reglas duras
+python tests_autenticacion.py  #  50/50  hashes, roles, sesiones, reglas duras, asistente CLI
 python tests_flujo_app.py      #  10/10  flujo real de acceso (AppTest, copia temporal)
 ```
 

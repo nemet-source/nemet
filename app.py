@@ -907,6 +907,7 @@ def sembrar_administrador_inicial(conn):
         return obtener_secret("auth", clave) or variable_entorno(variable)
 
     forzar = str(leer("admin_forzar", "NEMET_ADMIN_FORZAR") or "").strip().lower()
+    origen = "los Secrets" if obtener_secret("auth", "admin_usuario") else "las variables de entorno"
     return auth.sembrar_admin_inicial(
         conn,
         leer("admin_usuario", "NEMET_ADMIN_USUARIO"),
@@ -915,6 +916,7 @@ def sembrar_administrador_inicial(conn):
         correo=leer("admin_correo", "NEMET_ADMIN_CORREO") or "",
         forzar=forzar in ("1", "true", "verdadero", "si", "sí", "yes"),
         zona=ZONA_HORARIA,
+        origen=origen,
     )
 
 
@@ -968,14 +970,35 @@ def pantalla_login(conn, secreto, ttl, aviso_semilla=None):
     st.subheader("🔐 Acceso al sistema")
     st.caption("Sistema interno de NEMET. El acceso está restringido a cuentas autorizadas "
                "y todas las acciones quedan registradas en la bitácora.")
+    st.info("🔒 **No hay registro abierto.** Las cuentas las crea un administrador desde el panel "
+            "🛡️ *Administración de Usuarios*; si no tienes cuenta, pídesela a un administrador "
+            "(te dará un usuario y una contraseña provisional).")
 
     if aviso_semilla and aviso_semilla[0] in ("creado", "actualizado"):
-        st.info(f"🌱 {aviso_semilla[1]}")
+        st.success(f"🌱 {aviso_semilla[1]}")
     if aviso_semilla and aviso_semilla[0] == "sin_admins":
         st.error("🚨 El sistema no tiene ningún administrador activo y los Secrets no traen "
                  "credenciales de administrador inicial (`[auth] admin_usuario` y `admin_password`). "
-                 "Configúralas en los Secrets de la app para poder entrar; nadie puede crear al "
-                 "primer administrador desde esta pantalla.")
+                 "Configúralas en los Secrets de la app (o, en una instalación local, ejecuta "
+                 "`python herramientas/crear_admin.py --usuario tu_usuario`) y recarga esta página. "
+                 "Por seguridad, el primer administrador nunca se crea desde esta pantalla.")
+        with st.expander("👤 Soy el administrador: ¿cómo entro?"):
+            st.markdown(
+                "**En Streamlit Community Cloud o servidor con Secrets**\n\n"
+                "1. Abre los Secrets de la app (o el archivo `.streamlit/secrets.toml`) y agrega:\n"
+                "   ```toml\n"
+                "   [auth]\n"
+                '   admin_usuario = "tu_usuario"\n'
+                '   admin_password = "una-contraseña-larga-y-única"\n'
+                "   ```\n"
+                "2. Recarga la página: la app crea esa cuenta y te pide cambiar la contraseña al entrar.\n\n"
+                "**En una instalación local (sin Secrets)**\n\n"
+                "```bash\n"
+                "python herramientas/crear_admin.py --usuario tu_usuario\n"
+                "```\n\n"
+                "Si ya tenías cuenta y olvidaste la contraseña, un administrador puede restablecerla "
+                "desde el panel; o pon `admin_forzar = true` una sola vez en los Secrets para "
+                "restablecer la del administrador inicial.")
         return None
 
     with st.form("form_acceso"):

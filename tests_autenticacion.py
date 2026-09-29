@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Batería de pruebas de la autenticación NEMET (48 pruebas).
+"""Batería de pruebas de la autenticación NEMET (50 pruebas).
 
 Cubre `auth_nemet.py` (hashes, roles, sesiones, reglas duras) y la integración en
 `app.py` (gate de acceso, módulos protegidos, secretos fuera de Git).
 
-Uso:  python tests_autenticacion.py     →  "48/48 OK" si todo pasa.
+Uso:  python tests_autenticacion.py     →  "50/50 OK" si todo pasa.
 """
 import os
 import re
@@ -399,16 +399,30 @@ class TestIntegracionApp(unittest.TestCase):
         self.assertIn(etiqueta_historias, self.src)
 
     def test_46_no_hay_credenciales_en_el_codigo_ni_en_los_secrets_versionados(self):
-        # Ninguna asignación de contraseña literal en el código de la app
-        self.assertIsNone(re.search(r'(admin_password|password)\s*=\s*"[^"\s]{6,}"', self.src),
-                          "app.py no debe traer contraseñas escritas en el código")
+        # Ninguna variable de contraseña/secreto debe recibir un valor literal en el código
+        # (los ejemplos de ayuda van dentro de textos de la interfaz, no en asignaciones).
+        import ast
+        arbol = ast.parse(self.src)
+        sospechosas = []
+        for nodo in ast.walk(arbol):
+            if not isinstance(nodo, ast.Assign) or not isinstance(nodo.value, ast.Constant):
+                continue
+            if not isinstance(nodo.value.value, str) or len(nodo.value.value.strip()) < 6:
+                continue
+            for destino in nodo.targets:
+                nombre = getattr(destino, "id", "").lower()
+                if any(p in nombre for p in ("password", "contrasena", "contraseña", "secret", "secreto")):
+                    sospechosas.append(f"{nombre} = {nodo.value.value[:20]!r} (línea {nodo.lineno})")
+        self.assertEqual(sospechosas, [], f"app.py no debe traer credenciales escritas: {sospechosas}")
+
         # El archivo de secretos locales no debe estar versionado
-        ruta_secrets = os.path.join(BASE, ".streamlit", "secrets.toml")
         with open(os.path.join(BASE, ".gitignore"), encoding="utf-8") as fh:
             self.assertIn(".streamlit/secrets.toml", fh.read())
-        salida = subprocess.run(["git", "ls-files"], cwd=BASE, capture_output=True, text=True).stdout
-        self.assertNotIn("secrets.toml", salida)
-        self.assertFalse(os.path.exists(ruta_secrets) and ruta_secrets in salida)
+        versionados = subprocess.run(["git", "ls-files"], cwd=BASE, capture_output=True,
+                                     text=True).stdout.splitlines()
+        self.assertNotIn(".streamlit/secrets.toml", versionados)
+        self.assertFalse([f for f in versionados if os.path.basename(f) == "secrets.toml"],
+                         "ningún archivo de Secrets debe estar en Git (solo la plantilla .ejemplo)")
 
     def test_47_los_roles_se_aplican_en_las_acciones_sensibles(self):
         for token in ("usuarios_gestionar", "historial_borrar", '"respaldo"'):
@@ -417,6 +431,42 @@ class TestIntegracionApp(unittest.TestCase):
     def test_48_respaldo_en_github_incluye_la_base_de_usuarios(self):
         self.assertIn("rutas_extra", self.src)
         self.assertIn("RUTA_DB_USUARIOS", self.src)
+
+    def test_49_la_pantalla_de_acceso_avisa_que_no_hay_registro_abierto(self):
+        self.assertIn("No hay registro abierto", self.src)
+        self.assertIn("herramientas/crear_admin.py", self.src)
+
+    def test_50_el_asistente_crea_el_primer_administrador_local(self):
+        """`herramientas/crear_admin.py` resuelve el primer arranque sin Secrets."""
+        with tempfile.TemporaryDirectory() as carpeta:
+            ruta_db = os.path.join(carpeta, "usuarios.db")
+            script = os.path.join(BASE, "herramientas", "crear_admin.py")
+            base = [sys.executable, script, "--db", ruta_db]
+
+            primera = subprocess.run(base + ["--usuario", "jorge", "--generar"],
+                                     capture_output=True, text=True)
+            self.assertEqual(primera.returncode, 0, primera.stdout + primera.stderr)
+            self.assertIn("Contraseña temporal", primera.stdout)
+
+            password = primera.stdout.split("Contraseña temporal:")[1].split()[0]
+            conexion = auth.conectar(ruta_db)
+            creado = auth.autenticar(conexion, "jorge", password)[0]
+            self.assertIsNotNone(creado, "la contraseña temporal debe servir para entrar")
+            self.assertTrue(creado["debe_cambiar"], "debe pedir el cambio al iniciar sesión")
+
+            # Con un administrador activo ya no crea más cuentas por esta vía
+            segunda = subprocess.run(base + ["--usuario", "colado", "--generar"],
+                                     capture_output=True, text=True)
+            self.assertEqual(segunda.returncode, 1)
+            self.assertIn("Ya existe", segunda.stdout)
+            self.assertIsNone(auth.obtener_por_login(conexion, "colado"))
+
+            # Rechaza contraseñas fuera de la política
+            tercera = subprocess.run(base + ["--usuario", "otro", "--forzar", "--password", "corta"],
+                                     capture_output=True, text=True)
+            self.assertEqual(tercera.returncode, 1)
+            self.assertIn("al menos", tercera.stdout)
+            conexion.close()
 
 
 if __name__ == "__main__":

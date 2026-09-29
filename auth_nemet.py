@@ -366,24 +366,28 @@ def _parsear_fecha(texto):
 # ADMINISTRADOR INICIAL (SEMILLA DESDE SECRETS)
 # ==========================================
 ACCIONES_SEMILLA = {
-    "creado": "Se creó el administrador inicial desde los Secrets.",
-    "actualizado": "Se restableció la contraseña del administrador inicial (admin_forzar = true).",
+    "creado": "Se creó la cuenta de administrador inicial.",
+    "actualizado": "Se restableció la contraseña del administrador inicial.",
     "existente": "El administrador inicial ya existe; no se tocó su contraseña.",
-    "sin_datos": "No hay credenciales de administrador inicial en los Secrets.",
-    "sin_password": "Falta la contraseña del administrador inicial en los Secrets.",
+    "sin_datos": "No hay credenciales de administrador inicial configuradas.",
+    "sin_password": "Falta la contraseña del administrador inicial.",
     "invalido": "El usuario o la contraseña del administrador inicial no son válidos.",
-    "sin_admins": "No existe ningún administrador activo y los Secrets no permiten crear uno.",
+    "sin_admins": "No existe ningún administrador activo y no hay credenciales configuradas "
+                  "para crear uno (en Streamlit Community Cloud se definen en los Secrets).",
 }
 
 
-def sembrar_admin_inicial(conn, usuario, password, nombre="", correo="", forzar=False, zona=None):
-    """Crea el administrador inicial desde los Secrets (idempotente).
+def sembrar_admin_inicial(conn, usuario, password, nombre="", correo="", forzar=False, zona=None,
+                          origen="los Secrets"):
+    """Crea el administrador inicial (idempotente) desde una fuente externa de confianza.
 
-    - Si el usuario no existe: se crea con la contraseña de los Secrets y se marca
-      `debe_cambiar = True` para que la cambie al primer inicio de sesión.
-    - Si ya existe: **no** se toca su contraseña (los Secrets no son una puerta
-      trasera permanente), salvo que `forzar=True`, que restablece la contraseña y
-      desbloquea la cuenta (útil si el administrador la olvidó).
+    La usan los Secrets de la app y `herramientas/crear_admin.py`; `origen` solo sirve
+    para redactar el mensaje.
+
+    - Si el usuario no existe: se crea con esa contraseña y se marca `debe_cambiar = True`
+      para que la cambie al primer inicio de sesión.
+    - Si ya existe: **no** se toca su contraseña (no es una puerta trasera permanente),
+      salvo que `forzar=True`, que la restablece y desbloquea la cuenta.
 
     Devuelve (estado, mensaje) con estado en {"creado", "actualizado", "existente",
     "sin_datos", "sin_password", "invalido", "sin_admins"}.
@@ -414,7 +418,7 @@ def sembrar_admin_inicial(conn, usuario, password, nombre="", correo="", forzar=
             return "invalido", f"{ACCIONES_SEMILLA['invalido']} {error}"
         registrar_evento(conn, "admin_sembrado", actor="semilla", actor_id=creado["id"],
                          objetivo=creado["usuario"], detalle=ACCIONES_SEMILLA["creado"], zona=zona)
-        return "creado", f"Administrador inicial `{creado['usuario']}` creado desde los Secrets."
+        return "creado", f"Administrador inicial `{creado['usuario']}` creado desde {origen}."
 
     if not forzar:
         return "existente", ACCIONES_SEMILLA["existente"]
@@ -428,7 +432,7 @@ def sembrar_admin_inicial(conn, usuario, password, nombre="", correo="", forzar=
         conn.commit()
     registrar_evento(conn, "admin_password_restablecida", actor="semilla", actor_id=existente["id"],
                      objetivo=existente["usuario"], detalle=ACCIONES_SEMILLA["actualizado"], zona=zona)
-    return "actualizado", (f"Contraseña de `{existente['usuario']}` restablecida desde los Secrets; "
+    return "actualizado", (f"Contraseña de `{existente['usuario']}` restablecida desde {origen}; "
                            "se pedirá cambiarla al iniciar sesión.")
 
 
