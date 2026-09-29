@@ -20,6 +20,7 @@ from fpdf.enums import XPos, YPos
 from fpdf.fonts import FontFace
 
 import auth_nemet as auth  # autenticación, roles y administración de usuarios (SQLite + scrypt)
+import movil_nemet  # modo móvil: detección de pantalla chica, ajustes táctiles y tema de la sesión
 
 try:
     from PIL import Image as _PILImage
@@ -84,9 +85,10 @@ def cabecera_marca():
     logo = logo_marca()
     if logo is None:
         return
-    col_izq, col_centro, col_der = st.columns([1, 2, 1])
-    with col_centro:
-        st.image(logo, width=250)
+    # En el teléfono la franja se acorta: el logo va más chico y centrado para no comerse la pantalla.
+    columnas = st.columns([1, 3, 1]) if MODO_MOVIL else st.columns([1, 2, 1])
+    with columnas[1]:
+        st.image(logo, width=190 if MODO_MOVIL else 250)
         st.markdown(f"<div class='nemet-lema'>{LEMA_NEMET}</div>", unsafe_allow_html=True)
         st.markdown("<div class='nemet-linea'></div>", unsafe_allow_html=True)
 
@@ -114,6 +116,20 @@ st.set_page_config(
     page_icon=ICONO_PAGINA,
     layout="wide"
 )
+
+# ==========================================
+# MODO MÓVIL
+# ==========================================
+# Se resuelve aquí arriba, antes del gate de acceso: la pantalla de login y el cambio
+# obligatorio de contraseña ya se ven bien en el teléfono. Decide el ancho que declara el
+# navegador (Client Hints), luego el user-agent y, si hace falta, el forzado manual
+# `?movil=1` / `?escritorio=1` (que se recuerda durante la sesión). Ver movil_nemet.py.
+MODO_MOVIL = movil_nemet.aplicar()
+TEMA_NEMET = movil_nemet.tema_actual()
+
+# Hoja de estilos del modo móvil: área táctil de 44 px, botones a lo ancho, campos a 16 px
+# (evita el zoom automático de iOS), métricas como tarjetas y columnas que se envuelven.
+st.markdown(movil_nemet.estilos(oscuro=TEMA_NEMET == "oscuro"), unsafe_allow_html=True)
 
 # ==========================================
 # CONSTANTES
@@ -820,7 +836,8 @@ def bloque_acciones_cotizacion(clave, items, cliente, correo, titulo_detalle):
 
     pdf_bytes = generar_pdf_cotizacion(folio, cliente, items, titulo_detalle) if not items.empty else b""
 
-    col_b1, col_b2, col_b3, col_b4 = st.columns(4)
+    # En móvil los cuatro botones quedan 2x2: se pulsan con el pulgar sin apuntar de más.
+    col_b1, col_b2, col_b3, col_b4 = movil_nemet.columnas_apiladas(4, MODO_MOVIL, por_fila_movil=2)
     with col_b1:
         st.download_button("📄 Descargar PDF", data=pdf_bytes, file_name=f"{folio}.pdf", mime="application/pdf",
                            disabled=items.empty, key=f"{clave}_pdf",
@@ -1411,13 +1428,15 @@ if auth.puede(SESION["rol"], "respaldo"):
                        "si configuras los Secrets `[git]` (token y repo). Este botón fuerza un respaldo manual.")
     st.sidebar.divider()
 bloque_usuario_sidebar(CONN, auth.secreto_sesion(CONN, obtener_secret("auth", "session_secret")), minutos_de_sesion())
+movil_nemet.nota_sidebar(MODO_MOVIL)  # cómo pasar de la vista móvil al diseño completo y viceversa
 
 mostrar_flash()
 estilos_marca()
 
 # El dashboard abre con la portada de marca (ya incluye logo y lema); si no se muestra,
-# o en cualquier otra vista, entra la franja compacta de marca.
-_portada_activa = menu == "📊 Dashboard & Resumen" and portada_marca()
+# o en cualquier otra vista, entra la franja compacta de marca. En el teléfono el hero 16:9
+# se omite a propósito: ocupa toda la primera pantalla y retrasa lo que se viene a ver.
+_portada_activa = menu == "📊 Dashboard & Resumen" and not MODO_MOVIL and portada_marca()
 if not _portada_activa:
     cabecera_marca()
 
@@ -1440,7 +1459,8 @@ if menu == "📊 Dashboard & Resumen":
     por_reabastecer = int((stock <= pd.to_numeric(df_inv.get("StockMinimo"), errors="coerce").fillna(0)).sum()) \
         if stock is not None and "StockMinimo" in df_inv.columns else 0
 
-    col1, col2, col3, col4 = st.columns(4)
+    # En el teléfono las métricas se reparten 2x2 (en la computadora siguen siendo 4 en línea).
+    col1, col2, col3, col4 = movil_nemet.columnas_apiladas(4, MODO_MOVIL, por_fila_movil=2)
     col1.metric("Total de SKUs Registrados", len(df_inv))
     if auth.puede(SESION["rol"], "clientes"):
         col2.metric("Clientes Registrados", len(df_clientes))
@@ -1457,7 +1477,9 @@ if menu == "📊 Dashboard & Resumen":
                        "Asigna códigos únicos para evitar confusiones en las cotizaciones.")
 
     st.markdown("### 🔍 Vista Rápida del Inventario Sincronizado")
-    st.dataframe(df_inv, width="stretch")
+    # En móvil la tabla se recorta a una altura cómoda: se desplaza dentro del recuadro
+    # en lugar de empujar el resto del panel hacia abajo.
+    st.dataframe(df_inv, width="stretch", **({"height": 320} if MODO_MOVIL else {}))
 
 elif menu == "📦 Control de Inventario y Edición":
     requiere_modulo("inventario")
@@ -1566,7 +1588,8 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
         st.error(f"Ningún producto tiene presentación en kg/L y rendimiento definido en `{HOJA_CATALOGO}`.")
         st.stop()
 
-    col_a1, col_a2, col_a3 = st.columns(3)
+    # Medidas, espesor y línea de producto: en el teléfono cada campo va en su propia fila.
+    col_a1, col_a2, col_a3 = movil_nemet.columnas_apiladas(3, MODO_MOVIL)
     with col_a1:
         cliente_area, correo_area = seleccionar_cliente("area")
     with col_a2:
