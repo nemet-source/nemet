@@ -142,6 +142,55 @@ La app usa **solo el logo claro**: el letterpress oscuro (`logo_oscuro.png` /
 La paleta (`PALETA_NEMET` en `app.py`) y el tema (`assets` en `.streamlit/config.toml`) comparten
 los colores de los logos: crema `#F5EFE6`, tinta `#26231F`, barro `#B4552D`, verde `#2F5D3A`.
 
+## 📱 Modo móvil
+
+Mucho del trabajo pasa en el teléfono (almacén, obra, visita a cliente), así que la app detecta
+en cada carga si viene de una pantalla chica y adapta la interfaz. Todo vive en `movil_nemet.py`
+y se resuelve **antes** del gate de acceso: la pantalla de login y el cambio obligatorio de
+contraseña ya se ven bien en el teléfono.
+
+**Cómo decide** (en este orden, sin JavaScript ni cookies):
+
+| Pista | Ejemplo | Nota |
+|---|---|---|
+| Ancho declarado por el navegador | `sec-ch-viewport-width: 390`, `viewport-width` | Manda sobre lo demás; el encabezado propio del despliegue (`x-nemet-viewport`) tiene prioridad. |
+| Client Hint | `sec-ch-ua-mobile: ?1` | Respaldo cuando el navegador no declara el ancho. |
+| `user-agent` | iPhone, Android con `Mobile`, iPad y tabletas | Último recurso; sin ninguna pista se asume escritorio. |
+| Forzado manual | `?movil=1` / `?escritorio=1` | Gana sobre todo y se recuerda durante la sesión. |
+
+El umbral son 768 px (`movil_nemet.BREAKPOINT_PX`) y una tableta cuenta como pantalla chica; si
+declara 1024 px (iPad en horizontal) recibe el diseño completo. Una ventana angosta de escritorio
+también recibe la vista táctil: la decisión es por espacio disponible, no por tipo de aparato.
+Si nada de esto acierta (por ejemplo iPadOS moderno, que se anuncia como Mac), `?movil=1` siempre
+está disponible y la barra lateral recuerda cómo usarlo.
+
+**Qué cambia en el teléfono**
+
+- Área táctil mínima de 44 px y botones a lo ancho de la pantalla.
+- Campos de texto a 16 px: con menos, iOS hace zoom al enfocar y descuadra la vista.
+- Métricas del dashboard en 2×2 y los cuatro botones de cotización (PDF, correo, limpiar, folio) 2×2.
+- Los campos del cotizador por área (cliente, medidas, espesor, línea) se apilan: uno por fila.
+- Tablas y editores se desplazan dentro de su recuadro, y la vista rápida del inventario se recorta
+  a una altura cómoda en lugar de empujar el resto del panel hacia abajo.
+- Logo y lema más compactos, títulos ajustados y el hero 16:9 del dashboard se omite a propósito
+  (ocupa toda la primera pantalla).
+- Tema nocturno opcional con `?tema=oscuro`; el crema de marca es el tema por omisión.
+
+**Forzar la vista desde la URL**
+
+```
+https://<la-app>/?movil=1        # vista táctil siempre (también sirve ?movil)
+https://<la-app>/?escritorio=1   # diseño completo aunque sea un teléfono
+https://<la-app>/?tema=oscuro    # tema nocturno de la sesión (?tema=claro lo devuelve al crema)
+```
+
+El forzado se recuerda en la sesión (las recargas de Streamlit pierden la URL), así que basta con
+pedirlo una vez; la barra lateral indica cómo cambiar de vista.
+
+> ℹ️ En el tema nocturno las tablas de datos son un lienzo aparte (`glide-data-grid`) y se tiñen con
+> sus propias variables CSS, así que pueden conservar algún detalle del tema claro. El resto de la
+> interfaz (fondo, tarjetas de métricas, campos, formularios, barra lateral) sí cambia por completo.
+
 ## Ejecución local
 
 ```bash
@@ -153,6 +202,7 @@ streamlit run app.py
 python tests_bateria.py        #  24/24  identidad de marca (assets, tema)
 python tests_autenticacion.py  #  50/50  hashes, roles, sesiones, reglas duras, asistente CLI
 python tests_flujo_app.py      #  10/10  flujo real de acceso (AppTest, copia temporal)
+python tests_movil.py          #  15/15  modo móvil (detección, forzado por URL y app real en móvil)
 ```
 
 Sin `[auth]` en los Secrets la app arranca, pero muestra la pantalla de acceso y avisa que no hay
