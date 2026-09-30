@@ -6,7 +6,8 @@ import smtplib
 import threading
 import time
 import unicodedata
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from io import BytesIO
 from zoneinfo import ZoneInfo
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
@@ -20,6 +21,7 @@ from fpdf.enums import XPos, YPos
 from fpdf.fonts import FontFace
 
 import auth_nemet as auth  # autenticación, roles y administración de usuarios (SQLite + scrypt)
+import prospeccion as pros  # búsqueda pública, clasificación y deduplicación de prospectos
 
 try:
     from PIL import Image as _PILImage
@@ -122,6 +124,7 @@ EXCEL_FILE = os.path.join(BASE_DIR, "Sistema_Inventario_NEMET_Final.xlsx")
 
 HOJA_INVENTARIO = "Inventario"
 HOJA_CLIENTES = "Clientes"
+HOJA_PROSPECTOS = "Prospectos"
 HOJA_HISTORIAL = "Historial_Cotizaciones"
 HOJA_CATALOGO = "Cat_Productos"
 
@@ -290,6 +293,9 @@ def _respaldar_core(mensaje, rutas_extra=None):
     repo_name = obtener_secret("git", "repo")
     if not token or not repo_name:
         return False, "warning", "Respaldo en GitHub no configurado: agrega `[git]` con `token` y `repo` en los Secrets de Streamlit."
+    privado, motivo = pros.respaldo_github_privado(repo_name, token)
+    if not privado:
+        return False, "warning", motivo
     try:
         import git  # Import perezoso: GitPython falla al importarse si no existe el binario git
 
@@ -612,6 +618,109 @@ def guardar_clientes(df_editado, forzar=False):
 
 
 # ==========================================
+# PROSPECCIÓN: HOJA SEPARADA DE CLIENTES
+# ==========================================
+def cargar_prospectos():
+    """La hoja se crea al primer guardado; no se confunden oportunidades con clientes."""
+    with LOCK_EXCEL:
+        with pd.ExcelFile(EXCEL_FILE) as libro:
+            if HOJA_PROSPECTOS not in libro.sheet_names:
+                return pd.DataFrame(columns=pros.COLUMNAS)
+            df = pd.read_excel(libro, sheet_name=HOJA_PROSPECTOS, dtype=str, keep_default_na=False)
+    for columna in pros.COLUMNAS:
+        if columna not in df.columns:
+            df[columna] = ""
+    return df[list(pros.COLUMNAS)].reset_index(drop=True)
+
+
+def _clientes_para_prospeccion():
+    """Lee los clientes *actuales* del disco antes de insertar, nunca la copia de la sesión."""
+    with LOCK_EXCEL:
+        with pd.ExcelFile(EXCEL_FILE) as libro:
+            if HOJA_CLIENTES not in libro.sheet_names:
+                return []
+            clientes = pd.read_excel(libro, sheet_name=HOJA_CLIENTES, dtype=str, keep_default_na=False)
+    return clientes.to_dict("records")
+
+
+def nuevos_prospectos(candidatos):
+    """Previsualización deduplicada contra prospectos y clientes existentes."""
+    with LOCK_EXCEL:
+        return pros.filtrar_nuevos(candidatos, cargar_prospectos().to_dict("records"),
+                                  _clientes_para_prospeccion())
+
+
+def guardar_prospectos(candidatos):
+    """Relee y agrega solo nuevos bajo cerrojo; nunca sobreescribe notas de otra sesión."""
+    with LOCK_EXCEL:
+        guardados = cargar_prospectos()
+        nuevos, repetidos, clientes = pros.filtrar_nuevos(
+            candidatos, guardados.to_dict("records"), _clientes_para_prospeccion())
+        if nuevos:
+            filas = []
+            for candidato in nuevos:
+                fila = {col: pros.proteger_excel(candidato.get(col, "")) for col in pros.COLUMNAS}
+                fila["Puntaje"] = int(candidato["Puntaje"])
+                fila["Fecha_alta"] = ahora_local().date().isoformat()
+                fila["Estado"] = candidato["Estado"] if candidato["Estado"] in pros.ESTADOS else "Nuevo"
+                filas.append(fila)
+            escribir_hoja(pd.concat([guardados, pd.DataFrame(filas)], ignore_index=True), HOJA_PROSPECTOS)
+        return len(nuevos), repetidos, clientes
+
+
+def guardar_seguimiento_prospecto(clave, esperado, cambios):
+    """Actualiza una ficha y recalcula su prioridad sin sobrescribir ediciones ajenas."""
+    if cambios["Estado"] not in pros.ESTADOS:
+        raise ValueError("Estado de prospecto no válido.")
+    if len(cambios["Notas"]) > 500:
+        raise ValueError("Las notas no pueden superar 500 caracteres.")
+    for campo in ("Último_contacto", "Próximo_seguimiento", "Última_actividad"):
+        if cambios[campo]:
+            fecha_capturada = date.fromisoformat(cambios[campo])
+            if campo != "Próximo_seguimiento" and fecha_capturada > ahora_local().date():
+                raise ValueError(f"{campo} no puede ser una fecha futura.")
+    if cambios["Tamaño"] and cambios["Tamaño"] not in pros.TAMANOS[1:]:
+        raise ValueError("Tamaño no válido.")
+    if cambios["Tipo_clientela"] and cambios["Tipo_clientela"] not in pros.CLIENTELAS[1:]:
+        raise ValueError("Tipo de clientela no válido.")
+    with LOCK_EXCEL:
+        guardados = cargar_prospectos()
+        indices = guardados.index[guardados["Clave"] == clave].tolist()
+        if len(indices) != 1:
+            raise ConflictoGuardado("El prospecto ya no está en la lista. Recarga la página.")
+        indice = indices[0]
+        actual = tuple(str(guardados.at[indice, col]) for col in pros.CAMPOS_SEGUIMIENTO)
+        if actual != esperado:
+            raise ConflictoGuardado("Otra sesión actualizó este prospecto. Recarga antes de editarlo de nuevo.")
+        valores = {col: pros.proteger_excel(cambios[col]) for col in pros.CAMPOS_SEGUIMIENTO}
+        valores["Notas"] = pros.proteger_excel(pros.texto(cambios["Notas"], 500))
+        valores["Productos_negocio"] = pros.proteger_excel(pros.texto(cambios["Productos_negocio"], 250))
+        valores["Fuente_perfil"] = pros.proteger_excel(pros.texto(cambios["Fuente_perfil"], 250))
+        if any(valores[c] != guardados.at[indice, c] for c in
+               ("Productos_negocio", "Tamaño", "Tipo_clientela", "Última_actividad")) and not valores["Fuente_perfil"]:
+            raise ValueError("Para modificar el perfil comercial indica una fuente pública o nota de verificación.")
+        if all(valores[c] == guardados.at[indice, c] for c in pros.CAMPOS_SEGUIMIENTO):
+            return False
+        ficha = guardados.loc[indice].to_dict()
+        ficha.update(valores)
+        ficha = pros.recalcular_ficha(ficha, hoy=ahora_local().date())
+        for campo in (*pros.CAMPOS_SEGUIMIENTO, "Puntaje", "Prioridad", "Motivo"):
+            guardados.at[indice, campo] = str(ficha[campo]) if campo == "Puntaje" else ficha[campo]
+        escribir_hoja(guardados, HOJA_PROSPECTOS)
+        return True
+
+
+def csv_prospectos(df):
+    """Exportación UTF-8 con BOM, enlaces a Maps calculados y sin fórmulas de CSV."""
+    exportar = df.copy()
+    if {"Dirección", "Ciudad", "Latitud", "Longitud"} <= set(exportar.columns):
+        exportar["Google_Maps"] = [pros.enlace_google_maps(fila) for fila in exportar.to_dict("records")]
+    for columna in exportar.columns:
+        exportar[columna] = exportar[columna].map(pros.proteger_csv)
+    return exportar.to_csv(index=False).encode("utf-8-sig")
+
+
+# ==========================================
 # FOLIOS, HISTORIAL, PDF Y CORREO
 # ==========================================
 def obtener_siguiente_folio():
@@ -862,6 +971,7 @@ MODULOS_MENU = [
     ("📊 Dashboard & Resumen", "dashboard"),
     ("📦 Control de Inventario y Edición", "inventario"),
     ("👥 Gestión de Clientes", "clientes"),
+    ("🎯 Prospección Comercial", "prospeccion"),
     ("📏 Cotizador por Área y Milimétrico", "cotizador_area"),
     ("📝 Cotizador Comercial Profesional", "cotizador_comercial"),
     ("📋 Historial de Cotizaciones (Folios)", "historial"),
@@ -1369,6 +1479,521 @@ def panel_usuarios(conn):
 
 
 # ==========================================
+# INTERFAZ DE PROSPECCIÓN COMERCIAL
+# ==========================================
+@st.cache_data(ttl=1800, show_spinner=False)
+def buscar_prospectos_osm(ciudad, radio, sectores, catalogo):
+    """Caché de media hora: no repetir consultas idénticas a los servidores públicos."""
+    return pros.buscar_osm(ciudad, radio, sectores, catalogo)
+
+
+def formulario_prospecto_manual(catalogo):
+    """Alta directa en el Excel local; nunca geocodifica domicilios ni envía mensajes."""
+    if st.session_state.pop("manual_limpiar_despues_de_guardar", False):
+        # El permiso y el origen deben confirmarse otra vez para CADA nuevo negocio.
+        # Limpiar antes de crear los widgets; hacerlo tras crearlos viola el estado de Streamlit.
+        for campo in ("empresa", "giro", "ciudad", "zona", "direccion", "telefono", "whatsapp",
+                      "correo", "sitio", "redes", "url_fuente", "latitud", "longitud", "origen",
+                      "estado", "ultimo", "proximo", "notas", "permiso"):
+            st.session_state.pop(f"manual_{campo}", None)
+    with st.expander("➕ Agregar prospecto manualmente"):
+        st.caption("Registra solo datos **comerciales** publicados o que la empresa compartió con permiso. "
+                   "No hace falta buscar en OpenStreetMap ni importar un archivo.")
+        with st.form("form_alta_prospecto"):
+            empresa = st.text_input("Empresa *", max_chars=160, key="manual_empresa")
+            giro = st.selectbox("Tipo de negocio *", list(pros.SECTORES),
+                                format_func=lambda s: pros.SECTORES[s]["nombre"], key="manual_giro")
+            ciudad = st.text_input("Ciudad y estado *", value="Ciudad Obregón, Sonora",
+                                   max_chars=120, key="manual_ciudad")
+            zona = st.text_input("Zona / colonia", max_chars=120, key="manual_zona")
+            direccion = st.text_input("Dirección comercial (si fue publicada)", max_chars=240,
+                                      key="manual_direccion")
+            telefono = st.text_input("Teléfono comercial", max_chars=70, key="manual_telefono")
+            whatsapp = st.text_input("WhatsApp comercial (solo si lo publicaron expresamente)",
+                                     max_chars=180, key="manual_whatsapp")
+            correo = st.text_input("Correo comercial", max_chars=160, key="manual_correo")
+            sitio = st.text_input("Sitio web", max_chars=300, key="manual_sitio")
+            with st.expander("Datos adicionales y mapa (opcional)"):
+                redes = st.text_input("Redes comerciales (URL)", max_chars=300, key="manual_redes")
+                url_fuente = st.text_input("Enlace a la fuente pública (URL)", max_chars=300,
+                                           key="manual_url_fuente")
+                st.caption("Sin coordenadas, la dirección y ciudad sirven como búsqueda en Google Maps. "
+                           "No introduzcas coordenadas de domicilios privados.")
+                latitud = st.text_input("Latitud comercial (opcional)", key="manual_latitud")
+                longitud = st.text_input("Longitud comercial (opcional)", key="manual_longitud")
+            origen = st.text_input("Origen de los datos / autorización *", max_chars=240,
+                                   placeholder="Ej.: catálogo público del negocio o contacto compartido con permiso",
+                                   key="manual_origen")
+            st.caption("La recomendación de producto se calcula automáticamente a partir del giro y "
+                       "del Inventario. Puedes completar el perfil y su evidencia desde la ficha guardada.")
+            estado = st.selectbox("Estado inicial", pros.ESTADOS_COMERCIALES, key="manual_estado")
+            ultimo = st.date_input("Último contacto (opcional)", value=None, key="manual_ultimo")
+            proximo = st.date_input("Próximo seguimiento (opcional)", value=None, key="manual_proximo")
+            notas = st.text_area("Notas comerciales (máximo 500 caracteres)", max_chars=500,
+                                 key="manual_notas")
+            permiso = st.checkbox("Confirmo que son datos de contacto comerciales públicos o "
+                                  "aportados con autorización; no son teléfonos privados.", key="manual_permiso")
+            alta = st.form_submit_button("➕ Guardar prospecto localmente", type="primary", width="stretch",
+                                          key="manual_guardar")
+        if alta:
+            try:
+                ficha = pros.candidato_manual({
+                    "Empresa": empresa, "Giro": giro, "Ciudad": ciudad, "Zona": zona,
+                    "Dirección": direccion, "Teléfono": telefono, "WhatsApp": whatsapp,
+                    "Correo": correo, "Sitio_web": sitio, "Redes": redes, "URL_fuente": url_fuente,
+                    "Latitud": latitud, "Longitud": longitud, "Origen_datos": origen,
+                    "Estado": estado, "Último_contacto": ultimo, "Próximo_seguimiento": proximo,
+                    "Notas": notas, "Datos_comerciales_autorizados": permiso,
+                }, catalogo, hoy=ahora_local().date())
+                agregados, repetidos, clientes = guardar_prospectos([ficha])
+                if not agregados:
+                    st.warning("No se duplicó la ficha: " +
+                               ("ya existe en Clientes." if clientes else "ya existe un prospecto con esa empresa, ciudad o contacto."))
+                else:
+                    flash(f"Prospecto manual guardado: {ficha['Empresa']} · {ficha['Segmento']} · "
+                          f"potencial {ficha['Puntaje']}/100.")
+                    respaldo = _respaldo_automatico("Respaldo automático: prospecto manual", intervalo=False)
+                    if respaldo:
+                        flash(respaldo[1], respaldo[0])
+                    st.session_state["manual_limpiar_despues_de_guardar"] = True
+                    st.rerun()
+            except ValueError as error:
+                st.error(str(error))
+            except Exception as error:
+                st.error(f"No se pudo guardar el prospecto manual: {error}")
+
+
+def panel_prospeccion(inventario):
+    # Streamlit ya adapta la barra lateral; aquí las columnas de los filtros y
+    # formularios se apilan de forma legible en pantallas angostas. CSS fijo,
+    # limitado a este módulo (nunca se interpola información de prospectos).
+    st.markdown("""<style>
+    @media (max-width: 768px) {
+      .st-key-prospector-movil [data-testid="stHorizontalBlock"] {
+        flex-direction: column !important; align-items: stretch !important;
+      }
+      .st-key-prospector-movil [data-testid="column"] {
+        flex: 1 1 100% !important; width: 100% !important; min-width: 0 !important;
+      }
+      .st-key-prospector-movil [data-testid="stMarkdownContainer"] { overflow-wrap: anywhere; }
+      .st-key-prospector-movil [data-testid="stDataFrame"] { max-width: 100%; }
+    }
+    </style>""", unsafe_allow_html=True)
+    with st.container(key="prospector-movil"):
+        _contenido_prospeccion(inventario)
+
+
+def _contenido_prospeccion(inventario):
+    st.subheader("🎯 NEMET PROSPECTOR")
+    st.caption("Buscar → Detectar → Calificar → Contactar → Dar seguimiento → Vender")
+    st.write("Busca negocios públicos por ciudad y giro, revisa el mapa y arma tu lista comercial. "
+             "**Potencial no significa intención de compra:** comprueba los datos antes de contactar.")
+    st.caption("Fuente: © OpenStreetMap contributors (ODbL). Se consulta solo al pulsar Buscar, sin extraer "
+               "teléfonos privados ni enviar mensajes automáticamente. Un CSV propio también es opcional.")
+    st.caption("🔒 Las notas y contactos SOLO se respaldan en GitHub cuando se confirma que el destino es PRIVADO. "
+               "Sin respaldo, los datos del servidor de Streamlit Cloud pueden perderse al reiniciar: exporta el CSV.")
+    with st.expander("¿Cómo se califica el potencial?"):
+        st.write("Giro (50–66 puntos), productos publicados (hasta +12), distancia con coordenadas "
+                 "(+5 hasta 10 km / +2 hasta 30 km), teléfono o correo (+9), WhatsApp explícito (+5) y "
+                 "web/redes (+5). Tamaño (+3), actividad reciente (+4) y clientela (+2) solo cuentan "
+                 "si aportas una fuente de verificación. Alta ≥80, Media ≥60, Exploratoria <60. "
+                 "Un dato desconocido **no** se inventa ni penaliza. Las recomendaciones usan el inventario real.")
+    catalogo = tuple(inventario["Descripcion"].dropna().astype(str).unique()) if "Descripcion" in inventario else ()
+
+    with st.form("form_busqueda_prospectos"):
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            ciudad = st.text_input("Ciudad y estado (México)", "Ciudad Obregón, Sonora",
+                                   max_chars=100, key="pros_ciudad")
+        with c2:
+            radio = st.slider("Radio desde el centro (km)", min_value=1, max_value=30,
+                              value=30, key="pros_radio")
+        sectores = st.multiselect(
+            "Giros a buscar", list(pros.SECTORES), default=list(pros.SECTORES),
+            format_func=lambda s: pros.SECTORES[s]["nombre"], key="pros_sectores")
+        buscar = st.form_submit_button("🔎 Buscar negocios", key="pros_buscar")
+    if buscar:
+        st.session_state.pop("pros_resultados", None)  # nunca confundir fichas anteriores con un intento fallido
+        try:
+            with st.spinner("Buscando negocios y contrastando con clientes existentes..."):
+                encontrados = buscar_prospectos_osm(ciudad, radio, tuple(sectores), catalogo)
+                nuevos, repetidos, clientes = nuevos_prospectos(encontrados)
+            st.session_state["pros_resultados"] = nuevos
+            st.session_state["pros_origen"] = f"OpenStreetMap · {ciudad.strip()} · {radio} km"
+            st.session_state["pros_version"] = st.session_state.get("pros_version", 0) + 1
+            st.info(f"Encontrados: {len(encontrados)} · Nuevos: {len(nuevos)} · "
+                    f"Ya guardados: {repetidos} · Ya clientes: {clientes}.")
+            if not encontrados:
+                st.warning("No hay negocios etiquetados para esos giros en esta zona de OpenStreetMap. "
+                           "Prueba otro radio o importa un CSV de negocios públicos.")
+            elif len(encontrados) >= pros.MAX_RESULTADOS:
+                st.warning("Se alcanzó el límite de fichas de esta búsqueda. Reduce el radio o elige menos giros "
+                           "para descubrir negocios que pudieron quedar fuera.")
+        except (pros.ErrorBusqueda, ValueError) as error:
+            st.error(str(error))
+        except Exception as error:
+            st.error(f"No se pudo realizar la búsqueda: {error}")
+
+    formulario_prospecto_manual(catalogo)
+
+    with st.expander("📂 Importar un CSV de negocios (alternativa si faltan fichas públicas)"):
+        st.caption("Solo datos de contacto **comercial** publicados o aportados con autorización. "
+                   "Obligatorias: `Empresa`, `Giro` (o `Segmento`). Opcionales: ciudad, zona, dirección, "
+                   "teléfono, **WhatsApp publicado**, correo, web, redes, coordenadas y productos del negocio. "
+                   "Para puntuar tamaño, clientela o actividad escribe también `Fuente_perfil`.")
+        plantilla = ("Empresa,Giro,Ciudad,Zona,Dirección,Teléfono,WhatsApp,Correo,Sitio_web,Redes,"
+                    "URL_fuente,Latitud,Longitud,Productos_negocio,Tamaño,Tipo_clientela,"
+                    "Última_actividad,Fuente_perfil\n")
+        st.download_button("⬇️ Plantilla CSV", data=plantilla.encode("utf-8-sig"),
+                           file_name="plantilla_prospectos.csv", mime="text/csv", key="pros_plantilla")
+        archivo = st.file_uploader("Archivo CSV (UTF-8, máximo 500 KB / 300 filas)", type="csv", key="pros_archivo")
+        if st.button("Clasificar archivo", disabled=archivo is None, key="pros_importar"):
+            st.session_state.pop("pros_resultados", None)
+            try:
+                if archivo.size > 500_000:
+                    raise ValueError("El CSV supera 500 KB.")
+                contenido = archivo.getvalue()
+                tabla = pd.read_csv(BytesIO(contenido), dtype=str, keep_default_na=False,
+                                    encoding="utf-8-sig", nrows=301)
+                tabla.columns = [col.strip() for col in tabla.columns]
+                if "Empresa" not in tabla or not ({"Giro", "Segmento"} & set(tabla.columns)):
+                    raise ValueError("Faltan las columnas Empresa y Giro (o Segmento). Usa la plantilla.")
+                if len(tabla) > 300:
+                    raise ValueError("Importa como máximo 300 negocios por archivo.")
+                preparados = [pros.candidato_de_archivo(fila, catalogo, ciudad)
+                              for fila in tabla.to_dict("records")]
+                validos = [p for p in preparados if p]
+                nuevos, repetidos, clientes = nuevos_prospectos(validos)
+                st.session_state["pros_resultados"] = nuevos
+                st.session_state["pros_origen"] = "CSV importado"
+                st.session_state["pros_version"] = st.session_state.get("pros_version", 0) + 1
+                st.info(f"Clasificados: {len(validos)} · Nuevos: {len(nuevos)} · "
+                        f"Sin empresa/giro conocido: {len(preparados) - len(validos)} · "
+                        f"Ya guardados: {repetidos} · Ya clientes: {clientes}.")
+            except (ValueError, UnicodeError, pd.errors.ParserError) as error:
+                st.error(f"No se pudo leer el CSV: {error}")
+            except Exception as error:
+                st.error(f"No se pudo clasificar el archivo: {error}")
+
+    candidatos = st.session_state.get("pros_resultados", [])
+    if candidatos:
+        st.markdown(f"### Candidatos nuevos · {st.session_state.get('pros_origen', 'búsqueda')}")
+        st.caption("Selecciona las fichas que deseas guardar. WhatsApp solo se muestra si el negocio "
+                   "lo publicó expresamente. Sin contacto público, el estado inicial es ‘Por investigar’.")
+        puntos_nuevos = pros.puntos_mapa(candidatos)
+        if puntos_nuevos:
+            with st.expander(f"🗺️ Ver {len(puntos_nuevos)} negocio(s) ubicados en el mapa"):
+                st.map(pd.DataFrame(puntos_nuevos), latitude="lat", longitude="lon", color="color",
+                       size=35, height=380)
+        version = st.session_state["pros_version"]
+        modo = st.radio("Vista de candidatos", ("Tarjetas (ideal en celular)", "Tabla detallada"),
+                        key=f"pros_vista_{version}", horizontal=True)
+        etiquetas = {i: f"{p['Empresa']} · {p['Ciudad']} · {p['Puntaje']}/100"
+                     for i, p in enumerate(candidatos)}
+        if modo == "Tarjetas (ideal en celular)":
+            indice = st.selectbox("Revisar candidato", list(etiquetas), format_func=etiquetas.get,
+                                  key=f"pros_revisar_{version}")
+            elegido = candidatos[indice]
+            with st.container(border=True):
+                st.write(f"**{elegido['Empresa']}** · {elegido['Segmento']} · "
+                         f"**Potencial {elegido['Puntaje']}/100** ({elegido['Prioridad']})")
+                st.write(f"**Ciudad / zona:** {elegido['Ciudad']} · {elegido['Zona'] or 'Sin zona'} · "
+                         f"**Dirección:** {elegido['Dirección'] or 'No publicada'}")
+                st.write(f"**Teléfono comercial:** {elegido['Teléfono'] or 'No publicado'} · "
+                         f"**Producto recomendado:** {elegido['Productos'] or 'Sin coincidencia en Inventario'}")
+                st.caption(elegido["Motivo"])
+                destino = pros.enlace_google_maps(elegido)
+                if destino:
+                    st.link_button("📍 Abrir ubicación en Google Maps", destino, width="stretch",
+                                   help="Búsqueda externa: verifica el lugar antes de visitarlo.")
+                fuente = pros.url_publica(elegido["URL_fuente"])
+                if fuente:
+                    st.link_button("Ver ficha de origen", fuente, width="stretch")
+            todos = st.checkbox("Seleccionar todos los candidatos", key=f"pros_todos_{version}")
+            elegidos_ids = st.multiselect("Elegir negocios para guardar (puedes buscar por nombre)",
+                                          list(etiquetas), format_func=etiquetas.get,
+                                          disabled=todos, key=f"pros_seleccion_{version}")
+            elegidos = candidatos if todos else [candidatos[i] for i in elegidos_ids]
+        else:
+            columnas_vista = ("Empresa", "Segmento", "Prioridad", "Puntaje", "Motivo", "Productos",
+                              "Ciudad", "Zona", "Distancia_km", "Dirección", "Teléfono", "WhatsApp", "Correo",
+                              "Sitio_web", "Redes", "URL_fuente")
+            vista = pd.DataFrame([{col: p[col] for col in columnas_vista} for p in candidatos])
+            vista["Google_Maps"] = [pros.enlace_google_maps(p) for p in candidatos]
+            vista.insert(0, "Guardar", True)
+            seleccion = st.data_editor(
+                vista, hide_index=True, width="stretch", num_rows="fixed",
+                disabled=list(columnas_vista) + ["Google_Maps"],
+                column_config={"Sitio_web": st.column_config.LinkColumn("Sitio web"),
+                               "Redes": st.column_config.LinkColumn("Redes comerciales"),
+                               "URL_fuente": st.column_config.LinkColumn("Ficha de origen"),
+                               "Google_Maps": st.column_config.LinkColumn("Google Maps")},
+                key=f"pros_editor_{version}")
+            elegidos = [p for i, p in enumerate(candidatos) if bool(seleccion.iloc[i]["Guardar"])]
+        if st.button(f"💾 Guardar {len(elegidos)} prospecto(s)", disabled=not elegidos, type="primary",
+                     width="stretch", key="pros_guardar"):
+            try:
+                agregados, repetidos, clientes = guardar_prospectos(elegidos)
+                st.session_state.pop("pros_resultados", None)
+                flash(f"Se agregaron {agregados} prospectos. Omitidos: {repetidos} ya guardados, "
+                      f"{clientes} ya clientes.")
+                if agregados:
+                    respaldo = _respaldo_automatico("Respaldo automático: prospección comercial", intervalo=False)
+                    if respaldo:
+                        flash(respaldo[1], respaldo[0])
+                st.rerun()
+            except Exception as error:
+                st.error(f"No se pudo guardar la lista: {error}")
+
+    st.markdown("### 📋 Lista para contactar")
+    try:
+        guardados = cargar_prospectos()
+    except Exception as error:
+        st.error(f"No se pudo leer la hoja Prospectos: {error}")
+        return
+    if guardados.empty:
+        st.info("Aún no hay prospectos guardados. Busca negocios, agrégalos manualmente o importa un CSV.")
+        return
+
+    st.caption("Las fichas se guardan en la hoja local `Prospectos` del Excel; exporta una copia para "
+               "resguardar tus datos, especialmente si el servidor se reinicia.")
+    st.download_button("📥 Exportar todos los prospectos (CSV)", data=csv_prospectos(guardados),
+                       file_name=f"prospectos_nemet_todos_{ahora_local():%Y-%m-%d}.csv", mime="text/csv",
+                       key="pros_descargar_todos", width="stretch")
+    pendientes = pros.seguimientos_pendientes(guardados.to_dict("records"), hoy=ahora_local().date())
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Prospectos", len(guardados))
+    c2.metric("Con contacto comercial", int((guardados["Teléfono"].ne("") |
+                                              guardados["Correo"].ne("") | guardados["WhatsApp"].ne("")).sum()))
+    c3.metric("Seguimientos para hoy o vencidos", len(pendientes))
+    c4.metric("Clientes logrados", int(guardados["Estado"].eq("Cliente").sum()))
+    if pendientes:
+        st.warning(f"📅 Tienes {len(pendientes)} seguimiento(s) pendiente(s). La agenda se revisa "
+                   "al entrar al módulo; no envía notificaciones automáticas.")
+        with st.expander("Ver agenda pendiente"):
+            st.dataframe(pd.DataFrame(pendientes)[["Empresa", "Ciudad", "Próximo_seguimiento", "Estado",
+                                                   "Teléfono", "WhatsApp"]], hide_index=True, width="stretch")
+    f1, f2, f3, f4 = st.columns([2, 1, 1, 2])
+    with f1:
+        texto_busqueda = st.text_input("Filtrar empresa o ciudad", key="pros_filtro_texto")
+    with f2:
+        prioridades = st.multiselect("Prioridad", ("Alta", "Media", "Exploratoria"), key="pros_filtro_prioridad")
+    with f3:
+        estados = st.multiselect("Estado", pros.ESTADOS, key="pros_filtro_estado")
+    with f4:
+        giros = st.multiselect("Giro", sorted(guardados["Segmento"].unique()), key="pros_filtro_giro")
+    c_ciudad, c_zona = st.columns(2)
+    with c_ciudad:
+        ciudad_filtro = st.selectbox("Ciudad", ["Todas"] + sorted(guardados["Ciudad"].unique()),
+                                    key="pros_filtro_ciudad")
+    with c_zona:
+        zonas_base = guardados if ciudad_filtro == "Todas" else guardados[guardados["Ciudad"] == ciudad_filtro]
+        zonas_disponibles = sorted({zona or "Sin zona declarada" for zona in zonas_base["Zona"]})
+        zona_filtro = st.selectbox("Zona / colonia", ["Todas"] + zonas_disponibles, key="pros_filtro_zona")
+    solo_pendientes = st.checkbox("Mostrar solo seguimientos para hoy o vencidos", key="pros_solo_pendientes")
+    filtrados = guardados.copy()
+    if texto_busqueda:
+        filtrados = filtrados[filtrados["Empresa"].str.contains(texto_busqueda, case=False, regex=False)
+                              | filtrados["Ciudad"].str.contains(texto_busqueda, case=False, regex=False)]
+    if prioridades:
+        filtrados = filtrados[filtrados["Prioridad"].isin(prioridades)]
+    if estados:
+        filtrados = filtrados[filtrados["Estado"].isin(estados)]
+    if giros:
+        filtrados = filtrados[filtrados["Segmento"].isin(giros)]
+    if ciudad_filtro != "Todas":
+        filtrados = filtrados[filtrados["Ciudad"] == ciudad_filtro]
+    if zona_filtro != "Todas":
+        filtrados = filtrados[filtrados["Zona"] == ("" if zona_filtro == "Sin zona declarada" else zona_filtro)]
+    if solo_pendientes:
+        filtrados = filtrados[filtrados["Clave"].isin({p["Clave"] for p in pendientes})]
+    filtrados = filtrados.assign(_orden=pd.to_numeric(filtrados["Puntaje"], errors="coerce").fillna(0))
+    filtrados = filtrados.sort_values(["_orden", "Empresa"], ascending=[False, True]).drop(columns="_orden")
+    if filtrados.empty:
+        st.info("No hay prospectos que coincidan con esos filtros.")
+        return
+    st.markdown("#### 🗺️ Ciudad → zona → negocios")
+    geo = pros.puntos_mapa(filtrados.to_dict("records"))
+    if geo:
+        st.map(pd.DataFrame(geo), latitude="lat", longitude="lon", color="color", size=35, height=400)
+        st.caption(f"{len(geo)} de {len(filtrados)} prospectos tienen coordenadas comerciales públicas. "
+                   "Naranja: alto · verde: medio · gris: exploratorio. El mapa no geocodifica domicilios.")
+    else:
+        st.info("Estas fichas no incluyen coordenadas verificables. Siguen disponibles en la lista; "
+                "puedes consultar su dirección comercial y ficha de origen.")
+    resumen_zonas = (filtrados.assign(Zona=filtrados["Zona"].replace("", "Sin zona declarada"))
+                     .groupby(["Ciudad", "Zona"], as_index=False).size().rename(columns={"size": "Negocios"}))
+    with st.expander("Ver negocios por ciudad y zona"):
+        st.dataframe(resumen_zonas, hide_index=True, width="stretch")
+    visibles = ("Empresa", "Segmento", "Prioridad", "Puntaje", "Productos", "Ciudad", "Zona",
+                "Distancia_km", "Dirección", "Teléfono", "WhatsApp", "Correo", "Sitio_web", "Redes",
+                "URL_fuente", "Fecha_alta", "Estado", "Próximo_seguimiento", "Notas")
+    with st.expander("Ver tabla detallada (desliza horizontalmente en celular)"):
+        tabla = filtrados[list(visibles)].copy()
+        tabla["Google_Maps"] = [pros.enlace_google_maps(p) for p in filtrados.to_dict("records")]
+        st.dataframe(tabla, hide_index=True, width="stretch",
+                     column_config={"Sitio_web": st.column_config.LinkColumn("Sitio web"),
+                                    "Redes": st.column_config.LinkColumn("Redes comerciales"),
+                                    "URL_fuente": st.column_config.LinkColumn("Ficha de origen"),
+                                    "Google_Maps": st.column_config.LinkColumn("Google Maps")})
+    st.download_button("⬇️ Descargar lista filtrada (CSV)", data=csv_prospectos(filtrados[list(pros.COLUMNAS)]),
+                       file_name=f"prospectos_nemet_{ahora_local():%Y-%m-%d}.csv", mime="text/csv",
+                       key="pros_descargar", width="stretch")
+    st.caption("La exportación incluye la fuente y la fecha de alta. © OpenStreetMap contributors para las fichas OSM; "
+               "verifica los contactos antes de enviar comunicaciones y respeta las reglas locales de privacidad.")
+
+    st.markdown("#### 🔎 Abrir ficha y dar seguimiento")
+    fichas = {p["Clave"]: p for p in filtrados.to_dict("records")}
+    clave = st.selectbox("Negocio", list(fichas), format_func=lambda k: f"{fichas[k]['Empresa']} · {fichas[k]['Ciudad']}",
+                         key="pros_elegido")
+    ficha = fichas[clave]
+    with st.container(border=True):
+        st.subheader(ficha["Empresa"])
+        st.write(f"**Giro:** {ficha['Segmento']} · **Potencial:** {ficha['Prioridad']} "
+                 f"({ficha['Puntaje']}/100) · **Estado:** {ficha['Estado']}")
+        ubicacion = f"**Ubicación:** {ficha['Ciudad']} · {ficha['Zona'] or 'Zona no publicada'}"
+        if ficha["Distancia_km"]:
+            ubicacion += f" · {ficha['Distancia_km']} km del centro consultado"
+        st.write(ubicacion)
+        st.write(f"**Dirección comercial:** {ficha['Dirección'] or 'No publicada'} · "
+                 f"**Teléfono:** {ficha['Teléfono'] or 'No publicado'} · "
+                 f"**WhatsApp:** {ficha['WhatsApp'] or 'No publicado expresamente'}")
+        mapa_google = pros.enlace_google_maps(ficha)
+        if mapa_google:
+            st.link_button("📍 Abrir en Google Maps", mapa_google, width="stretch",
+                           help="Abre una búsqueda externa por dirección o coordenadas, no una ubicación verificada.")
+        else:
+            st.caption("Google Maps no disponible: falta dirección con ciudad o coordenadas comerciales válidas.")
+        st.write(f"**Correo:** {ficha['Correo'] or 'No publicado'} · "
+                 f"**Productos NEMET sugeridos:** {ficha['Productos'] or 'Sin coincidencia en inventario'}")
+        st.write(f"**Productos/actividad del negocio:** {ficha['Productos_negocio'] or 'Sin dato público'}")
+        st.caption(f"{ficha['Motivo']} · Fuente: {ficha['Fuente']} · "
+                   f"Tamaño: {ficha['Tamaño'] or 'Sin dato'} · "
+                   f"Clientela: {ficha['Tipo_clientela'] or 'Sin dato'} · "
+                   f"Actividad: {ficha['Última_actividad'] or 'Sin dato verificado'}")
+        if not ficha["Fuente_perfil"] and any(ficha[c] for c in ("Tamaño", "Tipo_clientela", "Última_actividad")):
+            st.info("Tamaño, clientela o actividad importados SIN fuente de verificación: no afectan el puntaje.")
+        enlaces = []
+        for titulo, valor in (("Ver ficha de origen", ficha["URL_fuente"]),
+                              ("Sitio web", ficha["Sitio_web"]), ("Redes comerciales", ficha["Redes"])):
+            destino = pros.url_publica(valor)
+            if destino:
+                enlaces.append((titulo, destino))
+        if enlaces:
+            columnas_enlaces = st.columns(len(enlaces))
+            for contenedor, (titulo, url) in zip(columnas_enlaces, enlaces):
+                with contenedor:
+                    st.link_button(titulo, url, width="stretch")
+        if ficha["Estado"] == "No contactar":
+            st.warning("Este negocio está marcado como ‘No contactar’. Respeta su decisión.")
+
+    if ficha["Estado"] != "No contactar":
+        with st.expander("💬 Preparar mensaje de WhatsApp (sin envío automático)"):
+            firma = st.text_input("Tu nombre para el borrador", value=SESION.get("nombre") or "",
+                                  max_chars=70, key="pros_firma_whatsapp")
+            opciones_producto = [p.strip() for p in ficha["Productos"].split(";") if p.strip() in catalogo]
+            if ficha["Productos"] and not opciones_producto:
+                st.warning("La sugerencia guardada ya no está en Inventario. Usa el mensaje general "
+                           "o sincroniza el catálogo antes de contactar.")
+            producto_mensaje = st.selectbox("Producto a mencionar (opcional)",
+                                            ["Mensaje general"] + opciones_producto,
+                                            key=f"pros_prod_mensaje_{clave}")
+            borrador = pros.preparar_mensaje(
+                firma, ficha, producto_elegido=producto_mensaje if producto_mensaje != "Mensaje general" else "")
+            st.code(borrador, language=None)
+            enlace_wa = pros.enlace_whatsapp(ficha, borrador)
+            if enlace_wa:
+                st.link_button("💬 Abrir borrador en WhatsApp (revisar antes de enviar)", enlace_wa,
+                               width="stretch")
+            else:
+                st.info("No hay WhatsApp comercial publicado y válido. Puedes copiar el borrador "
+                        "para otro canal de contacto autorizado; no se supone que el teléfono tenga WhatsApp.")
+
+    original = tuple(ficha[c] for c in pros.CAMPOS_SEGUIMIENTO)
+    # Congelar la versión que vio ESTA sesión: rereleer Excel en un rerun no autoriza
+    # sobrescribir las notas ni el próximo seguimiento de otra persona.
+    clave_base = f"pros_base_{clave}"
+    if clave_base not in st.session_state:
+        st.session_state[clave_base] = original
+    if st.session_state[clave_base] != original:
+        st.warning("Este prospecto cambió en otra sesión. Recarga la ficha antes de guardar.")
+    widgets = ("estado", "notas", "fecha", "proximo", "productos", "tamano", "clientela", "actividad", "fuente")
+    if st.button("🔄 Recargar ficha", key=f"pros_recargar_{clave}"):
+        st.session_state[clave_base] = original
+        for widget in widgets:
+            st.session_state.pop(f"pros_{widget}_{clave}", None)
+        st.rerun()
+
+    def fecha_de(campo):
+        try:
+            return date.fromisoformat(ficha[campo][:10]) if ficha[campo] else None
+        except ValueError:
+            return None
+
+    with st.form(f"form_seguimiento_{clave}"):
+        c_estado, c_ultimo, c_proximo = st.columns(3)
+        with c_estado:
+            nuevo_estado = st.selectbox("Estado comercial", pros.ESTADOS,
+                                        index=pros.ESTADOS.index(ficha["Estado"]) if ficha["Estado"] in pros.ESTADOS else 0,
+                                        key=f"pros_estado_{clave}")
+        with c_ultimo:
+            fecha_contacto = st.date_input("Último contacto", value=fecha_de("Último_contacto"),
+                                           key=f"pros_fecha_{clave}")
+        with c_proximo:
+            proximo = st.date_input("Próximo seguimiento", value=fecha_de("Próximo_seguimiento"),
+                                    key=f"pros_proximo_{clave}")
+        notas = st.text_area("Notas de la conversación (máximo 500 caracteres)", value=ficha["Notas"],
+                             max_chars=500, key=f"pros_notas_{clave}")
+        with st.expander("Perfil comercial opcional (solo con evidencia)"):
+            st.caption("Estos datos influyen en el puntaje solo si indicas la fuente pública o una nota de "
+                       "verificación. La fecha de edición de OpenStreetMap NO demuestra actividad reciente.")
+            productos_negocio = st.text_input("Productos/actividad declarados por el negocio",
+                                               value=ficha["Productos_negocio"], max_chars=250,
+                                               key=f"pros_productos_{clave}")
+            c_tamano, c_clientela, c_actividad = st.columns(3)
+            with c_tamano:
+                tamano = st.selectbox("Tamaño comprobado", pros.TAMANOS,
+                                      index=pros.TAMANOS.index(ficha["Tamaño"]) if ficha["Tamaño"] in pros.TAMANOS else 0,
+                                      key=f"pros_tamano_{clave}")
+            with c_clientela:
+                clientela = st.selectbox("Tipo de clientela comprobado", pros.CLIENTELAS,
+                                         index=pros.CLIENTELAS.index(ficha["Tipo_clientela"])
+                                         if ficha["Tipo_clientela"] in pros.CLIENTELAS else 0,
+                                         key=f"pros_clientela_{clave}")
+            with c_actividad:
+                actividad = st.date_input("Última actividad comercial comprobada",
+                                          value=fecha_de("Última_actividad"), key=f"pros_actividad_{clave}")
+            fuente_perfil = st.text_input("Fuente de la verificación (URL pública o nota)",
+                                          value=ficha["Fuente_perfil"], max_chars=250,
+                                          key=f"pros_fuente_{clave}")
+        actualizar = st.form_submit_button("💾 Guardar seguimiento", key="pros_actualizar")
+    if actualizar:
+        try:
+            cambios = {"Estado": nuevo_estado, "Notas": notas,
+                       "Último_contacto": fecha_contacto.isoformat() if fecha_contacto else "",
+                       "Próximo_seguimiento": proximo.isoformat() if proximo else "",
+                       "Productos_negocio": productos_negocio,
+                       "Tamaño": "" if tamano == "Sin dato" else tamano,
+                       "Tipo_clientela": "" if clientela == "Sin dato" else clientela,
+                       "Última_actividad": actividad.isoformat() if actividad else "",
+                       "Fuente_perfil": fuente_perfil}
+            cambio = guardar_seguimiento_prospecto(clave, st.session_state[clave_base], cambios)
+            if cambio:
+                st.session_state[clave_base] = tuple(pros.proteger_excel(cambios[c]) for c in pros.CAMPOS_SEGUIMIENTO)
+            flash("Seguimiento actualizado." if cambio else "No hubo cambios en el seguimiento.",
+                  "success" if cambio else "info")
+            if cambio:
+                respaldo = _respaldo_automatico("Respaldo automático: seguimiento de prospecto", intervalo=False)
+                if respaldo:
+                    flash(respaldo[1], respaldo[0])
+            st.rerun()
+        except (ConflictoGuardado, ValueError) as error:
+            st.error(str(error))
+        except Exception as error:
+            st.error(f"No se pudo actualizar el seguimiento: {error}")
+
+
+# ==========================================
 # ACCESO (se ejecuta antes de tocar cualquier dato)
 # ==========================================
 CONN = conexion_usuarios()
@@ -1407,8 +2032,9 @@ if auth.puede(SESION["rol"], "respaldo"):
     if st.sidebar.button("☁️ Respaldar datos en GitHub"):
         with st.spinner("Respaldando Excel y base de usuarios..."):
             guardar_cambios_github("Respaldo manual de datos (Excel + usuarios)")
-    st.sidebar.caption("El Excel y la base de usuarios se respaldan automáticamente en GitHub tras cada guardado "
-                       "si configuras los Secrets `[git]` (token y repo). Este botón fuerza un respaldo manual.")
+    st.sidebar.caption("Respaldo automático solo con Secrets `[git]` que apunten a un repo PRIVADO verificable. "
+                       "Si es público o no se puede comprobar, se bloquea la subida de Excel y usuarios. "
+                       "Este botón fuerza un respaldo manual sujeto a la misma verificación.")
     st.sidebar.divider()
 bloque_usuario_sidebar(CONN, auth.secreto_sesion(CONN, obtener_secret("auth", "session_secret")), minutos_de_sesion())
 
@@ -1535,6 +2161,10 @@ elif menu == "👥 Gestión de Clientes":
                 _guardar_cli(forzar=True)
             except Exception as e:
                 st.error(f"Error al guardar clientes: {e}")
+
+elif menu == "🎯 Prospección Comercial":
+    requiere_modulo("prospeccion")
+    panel_prospeccion(df_inv)
 
 elif menu == "📏 Cotizador por Área y Milimétrico":
     requiere_modulo("cotizador_area")

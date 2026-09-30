@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Batería de pruebas de extremo a extremo del acceso NEMET (10 pruebas).
+"""Batería de pruebas de acceso y prospección NEMET (15 pruebas).
 
 Ejecuta la app real con `streamlit.testing.v1.AppTest` sobre una **copia temporal**
 del proyecto (con su propio Excel y su propia base de usuarios), así que nunca toca
@@ -9,13 +9,18 @@ entorno equivalentes a los Secrets.
 Los métodos están numerados porque forman un flujo encadenado (login, cambio
 obligatorio de contraseña, panel de administración). Unittest los ejecuta en orden.
 
-Uso:  python tests_flujo_app.py     →  "10/10 OK" si todo pasa.
+Uso:  python tests_flujo_app.py     →  "15/15 OK" si todo pasa.
 """
 import os
 import shutil
 import sys
 import tempfile
 import unittest
+from datetime import date
+from unittest.mock import patch
+
+import pandas as pd
+import prospeccion as pros
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
@@ -40,7 +45,7 @@ class TestFlujoAcceso(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory()
         cls.app_dir = os.path.join(cls.tmp.name, "nemet")
         os.makedirs(os.path.join(cls.app_dir, "assets"), exist_ok=True)
-        for nombre in ("app.py", "auth_nemet.py", "Sistema_Inventario_NEMET_Final.xlsx"):
+        for nombre in ("app.py", "auth_nemet.py", "prospeccion.py", "Sistema_Inventario_NEMET_Final.xlsx"):
             shutil.copy(os.path.join(BASE, nombre), os.path.join(cls.app_dir, nombre))
         for nombre in os.listdir(os.path.join(BASE, "assets")):
             shutil.copy(os.path.join(BASE, "assets", nombre), os.path.join(cls.app_dir, "assets", nombre))
@@ -185,6 +190,7 @@ class TestFlujoAcceso(unittest.TestCase):
         menu_editor = self.opciones_menu(at)
         self.assertIn("📦 Control de Inventario y Edición", menu_editor)
         self.assertIn("👥 Gestión de Clientes", menu_editor)
+        self.assertIn("🎯 Prospección Comercial", menu_editor)
         self.assertNotIn("🛡️ Administración de Usuarios", menu_editor)
 
         at = self.abrir(paso="usuario")
@@ -192,6 +198,7 @@ class TestFlujoAcceso(unittest.TestCase):
         menu_usuario = self.opciones_menu(at)
         self.assertNotIn("📦 Control de Inventario y Edición", menu_usuario)
         self.assertNotIn("👥 Gestión de Clientes", menu_usuario)
+        self.assertNotIn("🎯 Prospección Comercial", menu_usuario)
         self.assertNotIn("🛡️ Administración de Usuarios", menu_usuario)
         for esperado in ("📊 Dashboard & Resumen", "📏 Cotizador por Área y Milimétrico",
                          "📝 Cotizador Comercial Profesional", "📋 Historial de Cotizaciones (Folios)"):
@@ -199,7 +206,7 @@ class TestFlujoAcceso(unittest.TestCase):
 
         at = self.abrir(paso="admin")
         self.entrar(at, "jefe", PASSWORD_ADMIN, "admin")
-        self.assertEqual(len(self.opciones_menu(at)), 7)
+        self.assertEqual(len(self.opciones_menu(at)), 8)
 
     def test_07_el_panel_crea_cuentas_y_muestra_la_password_una_sola_vez(self):
         at = self.abrir(paso="panel")
@@ -289,6 +296,216 @@ class TestFlujoAcceso(unittest.TestCase):
             self.assertIn(esperada, acciones)
         self.assertTrue(all("Nemet2026" not in e["detalle"] for e in auth.listar_eventos(self.conn, 200)),
                         "la bitácora no debe guardar contraseñas")
+
+    def test_11_busca_guarda_y_no_duplica_prospectos_en_el_excel(self):
+        """Simula la fuente externa; nunca llama a Overpass ni modifica el Excel real."""
+        self.assertFalse(auth.puede("usuario", "prospeccion"))
+        self.assertTrue(auth.puede("editor", "prospeccion"))
+        at = self.abrir(token=TestFlujoAcceso.token_admin, paso="prospección")
+        self.ir_a(at, "🎯 Prospección Comercial")
+        candidato = pros._elemento_a_candidato({
+            "type": "node", "id": 9001, "lat": 27.495, "lon": -109.94,
+            "tags": {"name": "Aplicadores de Sonora", "craft": "tiler", "addr:suburb": "Centro",
+                     "contact:phone": "+52 662 111 2345", "contact:whatsapp": "+52 644 111 2345",
+                     "products": "pisos con resina epóxica", "website": "aplicadores.example.mx"},
+        }, "Ciudad Obregón, Sonora", ("aplicadores",), ("EPOXY PISOS (A Y B) TRANSPARENTE",),
+           centro=(27.49, -109.94))
+        cliente_existente = pros._elemento_a_candidato({
+            "type": "node", "id": 9002, "tags": {"name": "Nemet", "craft": "tiler"},
+        }, "Hermosillo, Sonora", ("aplicadores",), ())
+        with patch("prospeccion.buscar_osm", return_value=[candidato, cliente_existente]) as buscar:
+            at.button(key="pros_buscar").click()
+            at.run()
+            self.assertFalse(at.exception, [e.value for e in at.exception])
+            buscar.assert_called_once()
+        self.assertTrue(any("Nuevos: 1" in e.value for e in at.info))
+        self.assertTrue(at.button(key="pros_guardar").disabled,
+                        "la vista compacta nunca guarda todos accidentalmente")
+        at.checkbox(key="pros_todos_1").check()
+        at.run()
+        at.button(key="pros_guardar").click()
+        at.run()
+        self.assertFalse(at.exception, [e.value for e in at.exception])
+        xlsx = os.path.join(self.app_dir, "Sistema_Inventario_NEMET_Final.xlsx")
+        guardados = pd.read_excel(xlsx, sheet_name="Prospectos")
+        self.assertEqual(guardados["Empresa"].tolist(), ["Aplicadores de Sonora"])
+        self.assertEqual(guardados.at[0, "Estado"], "Nuevo")
+        self.assertIn("EPOXY PISOS", guardados.at[0, "Productos"])
+        self.assertEqual(guardados.at[0, "URL_fuente"], "https://www.openstreetmap.org/node/9001")
+        self.assertEqual(guardados.at[0, "Zona"], "Centro")
+        self.assertAlmostEqual(guardados.at[0, "Latitud"], 27.495)
+        self.assertIn("644", guardados.at[0, "WhatsApp"])
+        self.assertGreater(guardados.at[0, "Puntaje"], 80)
+        with patch("prospeccion.buscar_osm", return_value=[candidato, cliente_existente]):
+            at.button(key="pros_buscar").click()
+            at.run()
+        self.assertTrue(any("Nuevos: 0" in e.value for e in at.info))
+        self.assertEqual(len(pd.read_excel(xlsx, sheet_name="Prospectos")), 1, "una búsqueda repetida no duplica fichas")
+        self.assertIn("Clientes", pd.ExcelFile(xlsx).sheet_names, "no reemplazar el directorio de clientes")
+        original = os.path.join(BASE, "Sistema_Inventario_NEMET_Final.xlsx")
+        self.assertNotIn("Prospectos", pd.ExcelFile(original).sheet_names, "las pruebas no deben tocar datos reales")
+
+    def test_12_seguimiento_persiste_y_rechaza_edicion_concurrente(self):
+        """La versión mostrada al usuario NO se actualiza silenciosamente en el rerun."""
+        clave = "osm/node/9001"
+        at_a = self.abrir(token=TestFlujoAcceso.token_admin, paso="seguimiento A")
+        self.ir_a(at_a, "🎯 Prospección Comercial")
+        at_b = self.abrir(token=TestFlujoAcceso.token_admin, paso="seguimiento B")
+        self.ir_a(at_b, "🎯 Prospección Comercial")
+
+        at_a.selectbox(key=f"pros_estado_{clave}").select("Contactado")
+        at_a.text_area(key=f"pros_notas_{clave}").set_value("Llamar el martes")
+        at_a.button(key="pros_actualizar").click()
+        at_a.run()
+        self.assertFalse(at_a.error, [e.value for e in at_a.error])
+        self.assertFalse(at_a.exception, [e.value for e in at_a.exception])
+        xlsx = os.path.join(self.app_dir, "Sistema_Inventario_NEMET_Final.xlsx")
+        guardados = pd.read_excel(xlsx, sheet_name="Prospectos")
+        self.assertEqual(guardados.at[0, "Estado"], "Contactado")
+        self.assertEqual(guardados.at[0, "Notas"], "Llamar el martes")
+
+        at_b.selectbox(key=f"pros_estado_{clave}").select("Descartado")
+        at_b.button(key="pros_actualizar").click()
+        at_b.run()
+        self.assertFalse(at_b.exception, [e.value for e in at_b.exception])
+        self.assertTrue(any("Otra sesión" in e.value for e in at_b.error))
+        self.assertEqual(pd.read_excel(xlsx, sheet_name="Prospectos").at[0, "Estado"], "Contactado")
+        at_b.button(key=f"pros_recargar_{clave}").click()
+        at_b.run()
+        self.assertFalse(at_b.exception, [e.value for e in at_b.exception])
+        self.assertEqual(at_b.selectbox(key=f"pros_estado_{clave}").value, "Contactado")
+
+    def test_13_agenda_y_perfil_requieren_evidencia_y_persisten(self):
+        clave = "osm/node/9001"
+        at = self.abrir(token=TestFlujoAcceso.token_admin, paso="agenda comercial")
+        self.ir_a(at, "🎯 Prospección Comercial")
+        at.selectbox(key=f"pros_tamano_{clave}").select("Grande")
+        at.date_input(key=f"pros_proximo_{clave}").set_value(date(2020, 1, 1))
+        at.button(key="pros_actualizar").click()
+        at.run()
+        self.assertTrue(any("indica una fuente" in e.value for e in at.error))
+        xlsx = os.path.join(self.app_dir, "Sistema_Inventario_NEMET_Final.xlsx")
+        self.assertFalse(pd.read_excel(xlsx, sheet_name="Prospectos").at[0, "Próximo_seguimiento"] == "2020-01-01",
+                         "si falla el guardado no debe quedar medio escrito")
+        at.text_input(key=f"pros_fuente_{clave}").set_value("Catálogo comercial revisado")
+        at.selectbox(key=f"pros_clientela_{clave}").select("Empresas")
+        at.date_input(key=f"pros_actividad_{clave}").set_value(date(2026, 9, 25))
+        at.button(key="pros_actualizar").click()
+        at.run()
+        self.assertFalse(at.error, [e.value for e in at.error])
+        self.assertFalse(at.exception, [e.value for e in at.exception])
+        fila = pd.read_excel(xlsx, sheet_name="Prospectos").iloc[0]
+        self.assertEqual(str(fila["Próximo_seguimiento"])[:10], "2020-01-01")
+        self.assertEqual(fila["Tamaño"], "Grande")
+        self.assertEqual(fila["Tipo_clientela"], "Empresas")
+        self.assertEqual(fila["Notas"], "Llamar el martes", "no debe perder notas previas")
+        self.assertIn("Catálogo comercial", fila["Fuente_perfil"])
+        self.assertTrue(any("seguimiento(s) pendiente(s)" in w.value for w in at.warning))
+
+        at.selectbox(key=f"pros_estado_{clave}").select("No contactar")
+        at.button(key="pros_actualizar").click()
+        at.run()
+        self.assertFalse(at.exception, [e.value for e in at.exception])
+        self.assertEqual(pd.read_excel(xlsx, sheet_name="Prospectos").at[0, "Estado"], "No contactar")
+        self.assertFalse(any("seguimiento(s) pendiente(s)" in w.value for w in at.warning))
+
+    def test_14_excel_antiguo_se_lee_y_actualiza_sin_perder_ficha(self):
+        xlsx = os.path.join(self.app_dir, "Sistema_Inventario_NEMET_Final.xlsx")
+        ficha = pd.read_excel(xlsx, sheet_name="Prospectos", dtype=str, keep_default_na=False)
+        with pd.ExcelWriter(xlsx, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+            ficha[list(pros.COLUMNAS[:18])].to_excel(writer, sheet_name="Prospectos", index=False)
+        at = self.abrir(token=TestFlujoAcceso.token_admin, paso="Excel legado")
+        self.ir_a(at, "🎯 Prospección Comercial")
+        self.assertFalse(at.exception, [e.value for e in at.exception])
+        at.selectbox(key="pros_estado_osm/node/9001").select("Interesado")
+        at.button(key="pros_actualizar").click()
+        at.run()
+        self.assertFalse(at.error, [e.value for e in at.error])
+        self.assertFalse(at.exception, [e.value for e in at.exception])
+        migrado = pd.read_excel(xlsx, sheet_name="Prospectos")
+        self.assertEqual(migrado.at[0, "Estado"], "Interesado")
+        self.assertEqual(migrado.at[0, "Empresa"], "Aplicadores de Sonora")
+        self.assertIn("Próximo_seguimiento", migrado.columns)
+        self.assertIn("WhatsApp", migrado.columns)
+
+    def test_15_alta_manual_sin_red_mapa_estado_filtros_y_guardado_local(self):
+        """El alta rechaza contactos sin confirmación y persiste en un Excel temporal."""
+        xlsx = os.path.join(self.app_dir, "Sistema_Inventario_NEMET_Final.xlsx")
+        at = self.abrir(token=TestFlujoAcceso.token_admin, paso="alta manual")
+        self.ir_a(at, "🎯 Prospección Comercial")
+        self.assertTrue(any("@media (max-width: 768px)" in m.value for m in at.markdown),
+                        "la vista móvil debe apilar los formularios y filtros")
+        self.assertIn("Seguimiento", at.selectbox(key="pros_estado_osm/node/9001").options)
+        self.assertIn("Cotización", at.selectbox(key="pros_estado_osm/node/9001").options)
+        at.text_input(key="manual_empresa").set_value("Carpintería del Valle")
+        at.selectbox(key="manual_giro").select("carpinterias")
+        at.text_input(key="manual_direccion").set_value("Calle Sinaloa 12, Centro")
+        at.text_input(key="manual_telefono").set_value("+52 644 123 4567")
+        at.text_input(key="manual_origen").set_value("Sitio comercial público del negocio")
+        at.text_input(key="manual_url_fuente").set_value("https://ejemplo.mx/contacto")
+        at.selectbox(key="manual_estado").select("Cotización")
+        at.text_area(key="manual_notas").set_value("Enviar catálogo por correo si lo solicitan")
+        at.date_input(key="manual_proximo").set_value(date(2026, 10, 2))
+        at.button(key="manual_guardar").click()
+        at.run()
+        self.assertTrue(any("Confirma" in e.value for e in at.error))
+        self.assertEqual(len(pd.read_excel(xlsx, sheet_name="Prospectos")), 1,
+                         "el fallo no debe escribir parcialmente")
+
+        at.checkbox(key="manual_permiso").check()
+        at.button(key="manual_guardar").click()
+        at.run()
+        self.assertFalse(at.error, [e.value for e in at.error])
+        self.assertFalse(at.exception, [e.value for e in at.exception])
+        registros = pd.read_excel(xlsx, sheet_name="Prospectos", dtype=str, keep_default_na=False)
+        self.assertEqual(len(registros), 2)
+        manual = registros.loc[registros["Empresa"] == "Carpintería del Valle"].iloc[0]
+        clave = manual["Clave"]
+        self.assertTrue(clave.startswith("manual/"))
+        self.assertEqual(manual["Segmento"], pros.SECTORES["carpinterias"]["nombre"])
+        self.assertEqual(manual["Estado"], "Cotización")
+        self.assertEqual(manual["Notas"], "Enviar catálogo por correo si lo solicitan")
+        self.assertEqual(manual["Próximo_seguimiento"], "2026-10-02")
+        self.assertEqual(manual["Teléfono"], "+52 644 123 4567")
+        self.assertEqual(manual["WhatsApp"], "", "un teléfono no equivale a WhatsApp")
+        self.assertTrue(0 <= int(manual["Puntaje"]) <= 100)
+        self.assertIn("EPO-DEEP", manual["Productos"])
+        self.assertIn("Sitio comercial", manual["Fuente"])
+        self.assertTrue(pros.enlace_google_maps(manual.to_dict()).startswith(
+            "https://www.google.com/maps/search/?api=1&query=Calle%20Sinaloa%2012"))
+        self.assertTrue(any("pros_descargar_todos" == b.key for b in at.get("download_button")),
+                        "debe poder exportarse la lista completa en CSV")
+
+        at.selectbox(key="pros_elegido").select(clave)
+        at.run()
+        self.assertEqual(at.selectbox(key=f"pros_estado_{clave}").value, "Cotización")
+        at.selectbox(key=f"pros_estado_{clave}").select("Seguimiento")
+        at.text_area(key=f"pros_notas_{clave}").set_value("Llamar después de compartir catálogo")
+        at.button(key="pros_actualizar").click()
+        at.run()
+        self.assertFalse(at.error, [e.value for e in at.error])
+        cambiado = pd.read_excel(xlsx, sheet_name="Prospectos", dtype=str, keep_default_na=False)
+        self.assertEqual(cambiado.loc[cambiado["Clave"] == clave, "Estado"].iloc[0], "Seguimiento")
+        at.multiselect(key="pros_filtro_estado").select("Seguimiento")
+        at.run()
+        self.assertEqual(at.selectbox(key="pros_elegido").options,
+                         ["Carpintería del Valle · Ciudad Obregón, Sonora"])
+        self.assertFalse(at.checkbox(key="manual_permiso").value,
+                         "cada prospecto nuevo debe reconfirmar el uso autorizado")
+        self.assertEqual(at.text_input(key="manual_origen").value, "")
+        at.text_input(key="manual_empresa").set_value("Carpintería del Valle")
+        at.selectbox(key="manual_giro").select("carpinterias")
+        at.text_input(key="manual_origen").set_value("Ficha pública")
+        at.checkbox(key="manual_permiso").check()
+        at.button(key="manual_guardar").click()
+        at.run()
+        self.assertTrue(any("No se duplicó" in w.value for w in at.warning))
+        self.assertEqual(len(pd.read_excel(xlsx, sheet_name="Prospectos")), 2)
+
+        at2 = self.abrir(token=TestFlujoAcceso.token_admin, paso="persistencia del alta manual")
+        self.ir_a(at2, "🎯 Prospección Comercial")
+        self.assertTrue(any("Carpintería del Valle" in o for o in at2.selectbox(key="pros_elegido").options))
+        self.assertIn("Carpintería del Valle", pd.read_excel(xlsx, sheet_name="Prospectos")["Empresa"].tolist())
 
 
 if __name__ == "__main__":
