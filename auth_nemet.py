@@ -53,6 +53,7 @@ MODULOS = {
     "dashboard": ("📊 Dashboard & Resumen", ("admin", "editor", "usuario")),
     "inventario": ("📦 Control de Inventario y Edición", ("admin", "editor")),
     "clientes": ("👥 Gestión de Clientes", ("admin", "editor")),
+    "prospeccion": ("🎯 Prospección Comercial", ("admin", "editor")),
     "cotizador_area": ("📏 Cotizador por Área y Milimétrico", ("admin", "editor", "usuario")),
     "cotizador_comercial": ("📝 Cotizador Comercial Profesional", ("admin", "editor", "usuario")),
     "historial": ("📋 Historial de Cotizaciones (Folios)", ("admin", "editor", "usuario")),
