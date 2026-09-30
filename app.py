@@ -1106,25 +1106,33 @@ def _descripcion_error_base(error):
     return "Esta es la causa exacta del fallo; pásala a soporte si el problema continúa."
 
 
+def _diagnostico_base_markdown():
+    """Líneas del diagnóstico de la base de usuarios (compartidas por las pantallas)."""
+    info = auth.info_conexion()
+    if not info:
+        return None
+    uso = info.get("ruta_en_uso") or "—"
+    if info.get("copia"):
+        uso += "   ← copia temporal: el original no admite escritura"
+    return (
+        f"- Archivo configurado: `{info.get('ruta_configurada') or '—'}`\n"
+        f"- Archivo en uso: `{uso}`\n"
+        f"- ¿Admite escritura?: {'**no**' if info.get('solo_lectura') else 'sí'}\n"
+        f"- Columnas reparadas al arrancar: {', '.join(info.get('columnas_agregadas') or []) or 'ninguna'}\n"
+        f"- Escrituras rechazadas: {auth.fallos_escritura()}\n"
+        f"- Último error de escritura: `{auth.ultimo_error_escritura() or info.get('error_escritura') or '—'}`")
+
+
 def pantalla_error_base(error):
     """Muestra el motivo real de un fallo de la base de usuarios (sin traceback censurado)."""
     estilos_marca()
     cabecera_marca()
     st.error("🚨 **La app no puede usar la base de usuarios.**\n\n" + _descripcion_error_base(error))
     st.code(f"{type(error).__name__}: {error}", language="text")
-    info = auth.info_conexion()
-    if info:
+    detalle = _diagnostico_base_markdown()
+    if detalle:
         with st.expander("🔎 Diagnóstico de la base de usuarios", expanded=True):
-            uso = info.get("ruta_en_uso") or "—"
-            if info.get("copia"):
-                uso += "   ← copia temporal: el original no admite escritura"
-            st.markdown(
-                f"- Archivo configurado: `{info.get('ruta_configurada') or '—'}`\n"
-                f"- Archivo en uso: `{uso}`\n"
-                f"- ¿Admite escritura?: {'**no**' if info.get('solo_lectura') else 'sí'}\n"
-                f"- Columnas reparadas al arrancar: {', '.join(info.get('columnas_agregadas') or []) or 'ninguna'}\n"
-                f"- Escrituras rechazadas: {auth.fallos_escritura()}\n"
-                f"- Último error de escritura: `{auth.ultimo_error_escritura() or info.get('error_escritura') or '—'}`")
+            st.markdown(detalle)
             st.caption("Truco útil: en Streamlit Cloud, *Manage app* → *Logs* guarda el detalle completo, "
                        "pero el texto de arriba ya es la causa exacta.")
 
@@ -1226,6 +1234,15 @@ def pantalla_login(conn, secreto, ttl, aviso_semilla=None):
 
     st.caption("¿Olvidaste tu contraseña? Pide a un administrador que la restablezca desde el "
                "panel de administración; nadie puede recuperarla porque se guarda cifrada.")
+
+    with st.expander("🔧 ¿Problemas para entrar?"):
+        detalle = _diagnostico_base_markdown()
+        if detalle:
+            st.markdown(detalle)
+            st.caption("Si algo falla, la app muestra el motivo exacto en pantalla antes de "
+                       "cualquier cuadro de error genérico.")
+        else:
+            st.caption("La app no pudo leer el estado de la base de usuarios.")
     if not obtener_secret("auth", "session_secret"):
         st.caption("💡 Sugerencia de seguridad: define `[auth] session_secret` en los Secrets para "
                    "rotar la clave que firma las sesiones y `[auth] session_minutos` para ajustar "

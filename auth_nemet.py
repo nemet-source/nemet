@@ -353,14 +353,19 @@ def _probar_escritura(conn):
         return False, error
 
 
-def _error_de_solo_lectura(error):
-    """True si el error dice que el archivo/carpeta no admite escritura (y no un bloqueo)."""
+def _error_del_sistema_de_archivos(error):
+    """True si el error viene del disco (permisos, solo lectura, lleno) y no de un bloqueo.
+
+    Sirve para decidir si vale la pena trabajar sobre una copia: un bloqueo temporal se
+    reintenta (SQLite ya espera con `busy_timeout`), pero un disco que no admite escritura
+    no se arregla solo.
+    """
     texto = str(error or "").lower()
     if "locked" in texto or "busy" in texto:
-        return False  # ocupada por otra operación: se reintenta, no es de solo lectura
+        return False  # ocupada por otra operación: se reintenta, no se copia la base
     return any(pista in texto for pista in (
         "readonly", "read-only", "read only", "unable to open database", "permission",
-        "disk i/o error", "attempt to write"))
+        "disk i/o error", "disk is full", "disk full", "attempt to write"))
 
 
 def _copia_escribible(ruta):
@@ -432,7 +437,7 @@ def conectar(ruta, copia_escribible=True):
     info = {"ruta_configurada": ruta, "ruta_en_uso": ruta, "copia": False,
             "solo_lectura": not ok, "columnas_agregadas": list(agregadas),
             "error_escritura": "" if ok else f"{type(error).__name__}: {error}"}
-    if not ok and copia_escribible and error is not None and _error_de_solo_lectura(error):
+    if not ok and copia_escribible and error is not None and _error_del_sistema_de_archivos(error):
         destino = _copia_escribible(ruta)
         if destino:
             try:
