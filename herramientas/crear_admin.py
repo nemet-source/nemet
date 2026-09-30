@@ -53,6 +53,13 @@ def main():
 
     conn = auth.conectar(args.db)
     auth.inicializar_db(conn)
+    info = auth.info_conexion(conn)
+    if info.get("columnas_agregadas"):
+        print(f"🧩 Esquema reparado: faltaban las columnas {', '.join(info['columnas_agregadas'])}.")
+    if info.get("copia"):
+        print(f"⚠️  {args.db} no admite escritura ({info.get('error_escritura') or 'sin permiso'});")
+        print(f"   se trabajará sobre la copia escribible {info['ruta_en_uso']}.")
+
 
     admins = auth.contar_admins_activos(conn)
     if admins and not args.forzar:
@@ -86,7 +93,7 @@ def main():
         return 1
 
     print(f"✅ {mensaje}")
-    print(f"   Base de usuarios: {os.path.abspath(args.db)}")
+    print(f"   Base de usuarios: {auth.ruta_efectiva(conn) or os.path.abspath(args.db)}")
     if args.generar:
         print(f"   Contraseña temporal: {password}")
     print("   Al iniciar sesión, la app pedirá cambiar la contraseña (es provisional).")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Batería de pruebas de acceso y prospección NEMET (16 pruebas).
+"""Batería de pruebas de acceso y prospección NEMET (17 pruebas).
 
 Ejecuta la app real con `streamlit.testing.v1.AppTest` sobre una **copia temporal**
 del proyecto (con su propio Excel y su propia base de usuarios), así que nunca toca
@@ -9,7 +9,7 @@ entorno equivalentes a los Secrets.
 Los métodos están numerados porque forman un flujo encadenado (login, cambio
 obligatorio de contraseña, panel de administración). Unittest los ejecuta en orden.
 
-Uso:  python tests_flujo_app.py     →  "16/16 OK" si todo pasa.
+Uso:  python tests_flujo_app.py     →  "17/17 OK" si todo pasa.
 """
 import json
 import os
@@ -603,6 +603,36 @@ class TestFlujoAcceso(unittest.TestCase):
                         [w.value for w in at.warning])
         self.assertTrue(any("Encontrados: 2 · Nuevos: 2" in i.value for i in at.info),
                         [i.value for i in at.info])
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                     "con root los permisos de solo lectura no aplican")
+    def test_17_con_la_base_en_solo_lectura_la_app_avisa_y_deja_entrar(self):
+        """Regresión del fallo reportado: `sqlite3.OperationalError` en el UPDATE del login.
+
+        En Streamlit Cloud el mensaje salía censurado («original error message is
+        redacted») y nadie podía entrar. Ahora la app avisa en pantalla, usa una copia
+        escribible para no dejar fuera al equipo y el acceso con credenciales correctas
+        sigue funcionando.
+        """
+        # Se apunta la app a una copia de la base con permisos de solo lectura (el
+        # caché de conexiones está ligado a la ruta, así que esta copia se abre aparte).
+        copia_ro = os.path.join(self.tmp.name, "usuarios_solo_lectura.db")
+        shutil.copyfile(self.ruta_db, copia_ro)
+        os.chmod(copia_ro, 0o444)  # base del despliegue que no admite escritura
+        anterior = os.environ["NEMET_DB_USUARIOS"]
+        os.environ["NEMET_DB_USUARIOS"] = copia_ro
+        try:
+            at = self.abrir(paso="base de solo lectura")
+            avisos = " ".join(w.value for w in at.warning)
+            self.assertIn("no admite escritura", avisos)
+            self.assertIn("copia temporal", avisos)
+            # El cuadro rojo de traceback no debe aparecer: se explica la causa real.
+            self.assertFalse(any("redacted" in e.value for e in at.error), [e.value for e in at.error])
+            at = self.entrar(at, "jefe", PASSWORD_ADMIN, "base de solo lectura")
+            self.assertEqual(self.opciones_menu(at)[0], "📊 Dashboard & Resumen")
+        finally:
+            os.environ["NEMET_DB_USUARIOS"] = anterior
+            os.chmod(copia_ro, 0o644)
 
 
 class _ManejadorOverpass(BaseHTTPRequestHandler):

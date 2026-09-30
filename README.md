@@ -114,6 +114,7 @@ repositorio público, cambiarlo a privado no borra el acceso histórico a copias
 |---|---|
 | No aparece **🎯 Prospección Comercial** | Comprueba que el cambio esté incorporado en la **rama que despliega Streamlit** y que ese despliegue terminó sin errores. Si se usa `main`, fusiona primero el PR de la funcionalidad. El rol **Usuario** no ve el CRM; accede como Admin/Editor. |
 | Solo aparece el login o falta administrador | Configura `[auth]` en los **Secrets privados** del despliegue. Nunca compartas contraseñas o tokens en un issue, chat o commit. |
+| Al pulsar **Entrar** sale un cuadro rojo `sqlite3.OperationalError` y nadie puede pasar | La app **ya no se queda ahí**: repara sola el esquema (columnas que falten), el ingreso nunca depende de la bitácora y, si `nemet_usuarios.db` no admite escritura, avisa en pantalla y sigue con una **copia temporal** para que puedas entrar. El **motivo exacto** aparece ahora dentro de la app (Streamlit censura el mensaje del traceback) y con más detalle en *Manage app* → *Logs*. Si el aviso persiste, corrige permisos del despliegue o define `[auth] db` con una ruta escribible. |
 | La búsqueda devuelve error o no encuentra negocios | **No es el tamaño de la consulta**: si falla igual con 30 km y todos los giros que con 5 km y una sola carpintería, el problema es el servidor, no el radio. La app ya prueba varios servidores públicos de Overpass y reintenta el límite por IP (HTTP 429), así que pulsa **Reintentar** en el recuadro de alternativas. Si sigue el error, la IP de Streamlit Cloud está limitada/bloqueada de forma temporal: espera unos minutos o revisa el estado en <https://overpass-api.de/api/status>. Mientras tanto usa las **alternativas sin red**: importar un CSV de negocios públicos o **Agregar manualmente**. Ninguna ficha se inventa cuando falla la red. |
 | Guarda, pero desaparece tras reiniciar | El archivo `Prospectos` se crea en el Excel **del servidor**, no en el teléfono; el disco de Streamlit Cloud es efímero. Exporta CSV regularmente y configura respaldo **solo en un repositorio privado verificable**, con la misma rama/historial. |
 
@@ -199,6 +200,13 @@ esperar el intervalo anti-spam de un minuto). Solo contiene hashes y la bitácor
 >
 > ℹ️ No subas una base generada en tu máquina de pruebas: en la nube la base se crea en el primer
 > arranque a partir de los Secrets y el respaldo automático la mantiene actualizada.
+>
+> 🛟 **Si la base no se puede escribir** (archivo o carpeta de solo lectura, permisos del servidor o
+> esquema viejo), la app no deja a nadie fuera: al arrancar comprueba la escritura, repara las
+> columnas que falten, permite entrar aunque la bitácora falle y, cuando el archivo del repositorio
+> es de solo lectura, trabaja sobre una copia temporal en la carpeta del sistema (`<tmp>/nemet_datos/`)
+> avisándolo en pantalla. Los cambios de usuarios de esa sesión se pierden al reiniciar el servidor:
+> lo correcto es arreglar los permisos o fijar `[auth] db` (Secrets) a una ruta escribible.
 
 ### Panel de administración
 
@@ -248,9 +256,9 @@ streamlit run app.py
 
 # Baterías de pruebas
 python tests_bateria.py        #  24/24  identidad de marca (assets, tema)
-python tests_autenticacion.py  #  50/50  hashes, roles, sesiones, reglas duras, asistente CLI
+python tests_autenticacion.py  #  55/55  hashes, roles, sesiones, bases dañadas o de solo lectura, asistente CLI
 python tests_prospeccion.py    #  22/22 giros, Google Maps, CSV, alta manual y privacidad (sin red)
-python tests_flujo_app.py      #  15/15 acceso + CRM y alta manual (AppTest, copia temporal)
+python tests_flujo_app.py      #  17/17 acceso + CRM y alta manual (AppTest, copia temporal)
 ```
 
 Sin `[auth]` en los Secrets la app arranca, pero muestra la pantalla de acceso y avisa que no hay

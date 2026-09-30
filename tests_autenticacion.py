@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Batería de pruebas de la autenticación NEMET (50 pruebas).
+"""Batería de pruebas de la autenticación NEMET (55 pruebas).
 
 Cubre `auth_nemet.py` (hashes, roles, sesiones, reglas duras) y la integración en
 `app.py` (gate de acceso, módulos protegidos, secretos fuera de Git).
 
-Uso:  python tests_autenticacion.py     →  "50/50 OK" si todo pasa.
+Uso:  python tests_autenticacion.py     →  "55/55 OK" si todo pasa.
 """
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -471,6 +472,131 @@ class TestIntegracionApp(unittest.TestCase):
             self.assertEqual(tercera.returncode, 1)
             self.assertIn("al menos", tercera.stdout)
             conexion.close()
+
+
+# ============================================================ bases problemáticas
+@unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                 "con root los permisos de solo lectura no aplican")
+class TestBasesProblematicas(unittest.TestCase):
+    """Regresión del fallo que dejó a todo el equipo fuera de la app.
+
+    El UPDATE de `ultimo_acceso` del inicio de sesión lanzaba `sqlite3.OperationalError`
+    (mensaje censurado por Streamlit) cuando la base venía con esquema viejo o cuando el
+    archivo/carpeta no admitía escritura, así que nadie podía entrar ni con la contraseña
+    correcta. Ahora el esquema se repara solo, el acceso nunca depende de la bitácora y,
+    si el archivo del repositorio no se puede escribir, se trabaja en una copia avisando
+    en pantalla.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.ruta = os.path.join(self.dir.name, "nemet_usuarios.db")
+
+    def tearDown(self):
+        # Se devuelven los permisos para que la carpeta temporal se pueda borrar.
+        if os.path.exists(self.ruta):
+            os.chmod(self.ruta, 0o644)
+        os.chmod(self.dir.name, 0o755)
+        self.dir.cleanup()
+
+    def _dejar_solo_lectura(self):
+        os.chmod(self.ruta, 0o444)
+        os.chmod(self.dir.name, 0o555)
+
+    def test_51_una_base_con_esquema_viejo_se_repara_y_permite_entrar(self):
+        # Base de una versión anterior: sin ultimo_acceso, intentos_fallidos ni bloqueado_hasta.
+        conn = sqlite3.connect(self.ruta)
+        conn.executescript("""
+            CREATE TABLE usuarios (id INTEGER PRIMARY KEY AUTOINCREMENT, usuario TEXT NOT NULL,
+              usuario_norm TEXT NOT NULL UNIQUE, nombre TEXT NOT NULL DEFAULT '',
+              correo TEXT NOT NULL DEFAULT '', rol TEXT NOT NULL, password_hash TEXT NOT NULL,
+              debe_cambiar INTEGER NOT NULL DEFAULT 0, activo INTEGER NOT NULL DEFAULT 1,
+              creado_en TEXT NOT NULL, creado_por TEXT NOT NULL DEFAULT '',
+              actualizado_en TEXT NOT NULL DEFAULT '', password_cambiada_en TEXT NOT NULL DEFAULT '');
+        """)
+        conn.execute("INSERT INTO usuarios (usuario, usuario_norm, rol, password_hash, creado_en)"
+                     " VALUES ('jefe', 'jefe', 'admin', ?, '2026-01-01')", (auth.hash_password(PASSWORD_ADMIN),))
+        conn.commit()
+        conn.close()
+
+        reparada = auth.conectar(self.ruta)  # antes: el login moría con "no such column"
+        columnas = {fila[1] for fila in reparada.execute("PRAGMA table_info(usuarios)")}
+        self.assertTrue({"ultimo_acceso", "intentos_fallidos", "bloqueado_hasta"} <= columnas)
+        self.assertEqual(auth.info_conexion(reparada)["columnas_agregadas"],
+                         ["ultimo_acceso", "intentos_fallidos", "bloqueado_hasta"])
+        self.assertFalse(auth.info_conexion(reparada)["solo_lectura"])
+        usuario, mensaje = auth.autenticar(reparada, "jefe", PASSWORD_ADMIN)
+        self.assertIsNotNone(usuario)
+        self.assertEqual(mensaje, "Sesión iniciada.")
+        self.assertTrue(usuario["ultimo_acceso"])  # el UPDATE del login ya se guarda
+        reparada.close()
+
+    def test_52_una_base_de_solo_lectura_deja_entrar_igual(self):
+        conn = auth.conectar(self.ruta)
+        auth.sembrar_admin_inicial(conn, "jefe", PASSWORD_ADMIN)
+        conn.close()
+        self._dejar_solo_lectura()
+
+        # Sin copia escribible: la anotación falla, pero el acceso correcto entra igual.
+        sin_copia = auth.conectar(self.ruta, copia_escribible=False)
+        self.assertTrue(auth.info_conexion(sin_copia)["solo_lectura"])
+        fallos = auth.fallos_escritura()
+        usuario, mensaje = auth.autenticar(sin_copia, "jefe", PASSWORD_ADMIN)
+        self.assertIsNotNone(usuario)
+        self.assertEqual(mensaje, "Sesión iniciada.")
+        self.assertGreater(auth.fallos_escritura(), fallos)  # el fallo se anota, no se oculta
+        self.assertIn("readonly", auth.ultimo_error_escritura().lower())
+        self.assertIsNone(auth.autenticar(sin_copia, "jefe", "clave-mala-123")[0])  # la clave se sigue validando
+        sin_copia.close()
+
+    def test_53_con_base_de_solo_lectura_la_app_usa_una_copia_escribible(self):
+        conn = auth.conectar(self.ruta)
+        auth.sembrar_admin_inicial(conn, "jefe", PASSWORD_ADMIN)
+        conn.close()
+        self._dejar_solo_lectura()
+
+        conn = auth.conectar(self.ruta)
+        info = auth.info_conexion(conn)
+        self.assertTrue(info["copia"])
+        self.assertNotEqual(info["ruta_en_uso"], self.ruta)
+        self.assertTrue(os.path.exists(info["ruta_en_uso"]))
+        self.assertFalse(info["solo_lectura"])
+        usuario, mensaje = auth.autenticar(conn, "jefe", PASSWORD_ADMIN)
+        self.assertIsNotNone(usuario)
+        self.assertEqual(mensaje, "Sesión iniciada.")
+        self.assertTrue(usuario["ultimo_acceso"])  # en la copia sí se guarda
+        self.assertEqual(dict(conn.execute("SELECT usuario, rol FROM usuarios").fetchone()),
+                         {"usuario": "jefe", "rol": "admin"})  # las cuentas viajan en la copia
+        conn.close()
+
+    def test_55_la_clave_de_sesiones_es_estable_aunque_la_base_sea_de_solo_lectura(self):
+        conn = auth.conectar(self.ruta)
+        auth.sembrar_admin_inicial(conn, "jefe", PASSWORD_ADMIN)
+        conn.close()
+        self._dejar_solo_lectura()
+
+        conn = auth.conectar(self.ruta, copia_escribible=False)  # sin copia no se puede persistir
+        auth._SECRETO_EN_MEMORIA = ""
+        primera = auth.secreto_sesion(conn)
+        segunda = auth.secreto_sesion(conn)
+        self.assertTrue(primera)
+        self.assertEqual(primera, segunda, "la clave debe sobrevivir a las recargas de la app")
+        token = auth.crear_token(primera, auth.obtener_por_login(conn, "jefe"))
+        self.assertIsNotNone(auth.leer_token(segunda, token))
+        conn.close()
+
+    def test_54_la_bitacora_no_tumba_el_acceso_cuando_no_se_puede_escribir(self):
+        conn = auth.conectar(self.ruta)
+        auth.sembrar_admin_inicial(conn, "jefe", PASSWORD_ADMIN)
+        with auth._LOCK:  # base sin bitácora: los eventos no se pueden registrar
+            conn.execute("DROP TABLE eventos")
+            conn.commit()
+        fallos = auth.fallos_escritura()
+        usuario, mensaje = auth.autenticar(conn, "jefe", PASSWORD_ADMIN)
+        self.assertIsNotNone(usuario)
+        self.assertEqual(mensaje, "Sesión iniciada.")
+        self.assertGreater(auth.fallos_escritura(), fallos)
+        conn.close()
 
 
 if __name__ == "__main__":
