@@ -93,6 +93,56 @@ confundirlos con un intento fallido.
 
 ---
 
+## Segunda vuelta de mejoras (30-sep-2026): menos espera y memoria de servidores
+
+Con la lista de servidores ya en producción quedaban tres desperdicios medibles, todos del
+mismo origen (la IP compartida del despliegue). Se corrigieron así:
+
+### 5. Un HTTP 429 ya no hace esperar a nadie
+
+Antes, el primer servidor que contestaba «429» costaba hasta 5 s de espera **y** una segunda
+petición al mismo servidor antes de probar otro. Si esa IP está limitada, esa espera casi
+nunca sirve. Ahora la consulta va en **dos vueltas**:
+
+1. **Primera vuelta, sin pausas:** cada servidor se pregunta **una** vez. Un 429 pasa al
+   siguiente al instante, porque otro servidor puede tener turno libre ahora mismo.
+2. **Segunda vuelta, solo si todos limitaron:** se vuelve **una sola vez** a cada servidor
+   que dio 429, después de la pausa que pidió en `Retry-After` y empezando por el que pidió
+   la espera más corta. Así se respeta la política de Overpass (nunca insistir antes del
+   turno) sin cobrarle esa espera a quien está buscando.
+
+`Retry-After` se entiende ahora en sus **dos formatos** válidos (segundos y fecha HTTP); si
+no viene o viene mal, se usa una pausa corta y cortés en vez de suponer turno libre.
+
+### 6. La app recuerda qué servidor funciona
+
+`_orden_servidores()` guarda, **solo en memoria del proceso**, el último servidor que
+entregó resultados y cuáles acaban de fallar:
+
+- el que respondió se pregunta **primero** en la búsqueda siguiente;
+- el que limitó por IP pasa **al final de la cola** 5 minutos (2 minutos si fue caída de red);
+- **ningún servidor se descarta jamás**: si todos están enfriándose se preguntan igual,
+  empezando por el que antes queda libre. Una búsqueda pedida por una persona siempre se
+  intenta completa.
+
+La memoria guarda únicamente URLs públicas y marcas de tiempo —nunca consultas, resultados
+ni credenciales—, se borra al reiniciar la app y no crece: los enfriamientos vencidos se
+olvidan solos.
+
+**Efecto medible:** una búsqueda cuyo primer servidor está bloqueado pasaba de ~5 s perdidos
++ 2 peticiones inútiles a **0 s de espera y 1 petición**; y la búsqueda siguiente arranca ya
+por el servidor que sí responde (1 petición en vez de recorrer la lista otra vez).
+
+### 7. En pantalla: qué contestó cada servidor
+
+Cuando la búsqueda falla, el recuadro de alternativas incluye **🔎 Qué contestó cada
+servidor** con una línea por servidor (`overpass.kumi.systems: límite de peticiones (HTTP
+429)`), y el mensaje de error queda corto y legible. Se mantiene la regla de seguridad: solo
+**host + motivo redactado por la app**, nunca rutas, parámetros ni el texto de la excepción
+de red (que puede incrustar credenciales de un proxy).
+
+---
+
 ## Cómo se probó
 
 `tests_flujo_app.py::test_16_busqueda_desplegada_contra_un_servidor_overpass_local` ejecuta la
@@ -103,13 +153,23 @@ producción:
 
 | Escenario | Resultado comprobado |
 |---|---|
-| 429 con `Retry-After` y luego 200 | reintenta una vez, encuentra 3 fichas y dice qué servidor respondió |
-| 429 siempre | error claro que nombra CSV y alta manual, sin fichas anteriores en pantalla |
+| 429 con `Retry-After` y luego 200 | vuelve **una** vez tras el turno pedido, encuentra 3 fichas y dice qué servidor respondió |
+| 429 siempre | error claro que nombra CSV y alta manual, con el detalle **por servidor** y sin fichas anteriores en pantalla |
 | botón **Reintentar** | relanza la búsqueda y muestra resultados |
 | el servidor no completa la consulta | baja de 12 km a 6 km, avisa y filtra por el radio nuevo |
 
-Baterías completas: `tests_prospeccion.py` 29/29 · `tests_flujo_app.py` 16/16 ·
-`tests_autenticacion.py` 50/50 · `tests_bateria.py` 24/24.
+Y sin red, en `tests_prospeccion.py::TestVariosServidoresOverpass`:
+
+| Escenario | Resultado comprobado |
+|---|---|
+| un servidor limita y otro está libre | se cambia de servidor **sin esperar** (`time.sleep` no se llama) |
+| todos limitan por IP | una sola segunda oportunidad, empezando por el `Retry-After` más corto |
+| `Retry-After` en segundos, fecha HTTP, ausente o absurdo | espera acotada, nunca negativa ni infinita |
+| búsqueda tras un fallo | se empieza por el servidor que respondió; el que limitó queda al final |
+| todos fallaron antes | la siguiente búsqueda los intenta igual: la memoria solo reordena |
+
+Baterías completas: `tests_prospeccion.py` 35/35 · `tests_flujo_app.py` 17/17 ·
+`tests_autenticacion.py` 55/55 · `tests_bateria.py` 24/24.
 
 ### Verlo en el despliegue real (sin exponer secretos)
 

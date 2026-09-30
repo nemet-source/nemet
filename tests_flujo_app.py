@@ -565,8 +565,14 @@ class TestFlujoAcceso(unittest.TestCase):
         self.assertIn("No hay respuesta de OpenStreetMap/Overpass", at.error[0].value)
         self.assertIn("CSV", at.error[0].value)
         self.assertIn("manualmente", at.error[0].value)
-        self.assertEqual(len(prueba.peticiones), 2, "429: un reintento y a otro servidor")
+        self.assertEqual(len(prueba.peticiones), 2,
+                         "429: se vuelve una sola vez, tras el turno que pidió el servidor")
         self.assertIn("around:5000,27.48642,-109.94079", prueba.peticiones[0])
+        detalle = " ".join(m.value for m in at.markdown)
+        self.assertIn("límite de peticiones (HTTP 429)", detalle,
+                      "la pantalla debe distinguir el límite por IP de una caída de red")
+        self.assertIn("127.0.0.1", detalle, "debe nombrarse el servidor que falló")
+        self.assertNotIn("/api/interpreter", detalle, "solo el host, nunca la ruta ni parámetros")
         self.assertTrue(any(b.key == "pros_reintentar" for b in at.button),
                         "debe ofrecerse reintentar")
         self.assertNotIn("pros_resultados", at.session_state,

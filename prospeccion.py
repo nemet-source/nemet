@@ -3,9 +3,12 @@
 Usa fichas de negocios publicadas en OpenStreetMap (Overpass + Nominatim)
 o giros declarados en archivos CSV propios.
 El puntaje combina afinidad de giro, señales públicas y perfil con fuente; no predice compras.
-La consulta a Overpass se intenta en varios servidores públicos en orden, porque la IP de
-salida de Streamlit Cloud es compartida y esos servidores limitan por IP; si ninguno
-responde, la búsqueda termina con un error claro y NUNCA con fichas inventadas.
+La consulta a Overpass se intenta en varios servidores públicos, porque la IP de salida de
+Streamlit Cloud es compartida y esos servidores limitan por IP: un HTTP 429 pasa al
+siguiente servidor sin esperar y solo se reintenta tras el turno que pidió `Retry-After`.
+La app recuerda cuál respondió para empezar por él la próxima vez y aparta un rato al que
+acaba de fallar; si ninguno responde, la búsqueda termina con un error claro que dice
+servidor por servidor qué pasó, y NUNCA con fichas inventadas.
 Sin Streamlit ni acceso al Excel: las búsquedas, reglas y deduplicación se pueden probar
 sin red ni modificar los datos de la empresa.
 """
@@ -18,7 +21,8 @@ import re
 import threading
 import time
 import unicodedata
-from datetime import date
+from datetime import date, datetime, timezone
+from email.utils import parsedate_to_datetime
 from functools import lru_cache
 from urllib.parse import parse_qs, quote, urlparse
 
@@ -52,9 +56,23 @@ FUENTE_OSM = "© OpenStreetMap contributors (ODbL)"
 # Nominatim público: como máximo 1 petición por segundo en este proceso.
 _GEO_LOCK = threading.Lock()
 _ULTIMA_GEO = 0.0
+# Memoria de servidores de Overpass, compartida por todas las sesiones del proceso:
+# qué servidor respondió la última vez y cuáles acaban de fallar. Solo guarda URLs
+# públicas y marcas de tiempo; jamás consultas, resultados ni credenciales.
+_SERVIDORES_LOCK = threading.Lock()
+_SERVIDORES_EN_ESPERA = {}  # url -> instante monotónico a partir del cual conviene reintentar
+_SERVIDOR_PREFERIDO = None  # último servidor que sí entregó resultados
 TIEMPO_OVERPASS = 35      # segundos por intento; la consulta pide [timeout:25] al servidor
 PRESUPUESTO_BUSQUEDA = 75  # techo total de reintentos: la interfaz no se queda colgada
-ESPERA_429_MAX = 5        # espera máxima tras un "Too Many Requests" antes de cambiar de servidor
+ESPERA_429_MAX = 5        # espera máxima tras un "Too Many Requests" antes de reintentar
+ESPERA_429_PREDETERMINADA = 2  # si el servidor no dice `Retry-After`, una pausa corta y cortés
+# Un servidor que acaba de fallar pasa al final de la cola durante un rato: así la siguiente
+# búsqueda no vuelve a gastar el tiempo del usuario en el mismo servidor que limita esta IP.
+# Nunca se descarta: si todos están enfriándose se preguntan igual, empezando por el que
+# antes queda libre. Esta memoria vive solo en el proceso; no se guarda en disco.
+ENFRIAMIENTO_429 = 300    # límite por IP (HTTP 429): 5 minutos al final de la cola
+ENFRIAMIENTO_FALLO = 120  # sin conexión, rechazo o respuesta inválida: 2 minutos
+ENFRIAMIENTO_MAX = 900    # ningún servidor se aparta más de 15 minutos
 RADIO_MINIMO = 1          # crear_consulta_osm no acepta menos de 1 km
 
 
@@ -208,7 +226,16 @@ PALABRAS_GIRO = (
 
 
 class ErrorBusqueda(Exception):
-    """Error de red, ubicación o fuente de datos apto para mostrar en la interfaz."""
+    """Error de red, ubicación o fuente de datos apto para mostrar en la interfaz.
+
+    `intentos` es una lista opcional de (servidor, motivo) para que la pantalla pueda
+    mostrar el detalle servidor por servidor. Solo contiene hosts públicos y motivos
+    redactados por la app: nunca rutas, parámetros ni texto de excepciones de red.
+    """
+
+    def __init__(self, mensaje, intentos=()):
+        super().__init__(mensaje)
+        self.intentos = tuple(intentos)
 
 
 def normalizar(valor):
@@ -589,14 +616,22 @@ class _FalloOverpass(Exception):
     def resumen(self):
         return "; ".join(f"{servidor}: {motivo}" for servidor, motivo in self.intentos) or "sin servidores"
 
+    def resumen_corto(self, maximo=3):
+        """Los primeros motivos, para un mensaje legible; el detalle completo va aparte."""
+        primeros = "; ".join(f"{servidor}: {motivo}" for servidor, motivo in self.intentos[:maximo])
+        restantes = len(self.intentos) - maximo
+        if restantes > 0:
+            return f"{primeros}; y {restantes} servidor{'es' if restantes > 1 else ''} más"
+        return primeros or "sin servidores"
+
     def mensaje(self):
         if self.saturado:
             return ("Los servidores de OpenStreetMap no alcanzaron a completar la búsqueda "
                     "con este radio. Reduce el radio o elige menos giros y reintenta; si sigue "
                     "igual, usa una alternativa sin red: importar un CSV de negocios públicos "
                     "o dar de alta el prospecto manualmente.")
-        return ("No hay respuesta de OpenStreetMap/Overpass desde este servidor "
-                f"({self.resumen()}). Reintenta en unos minutos, reduce el radio o usa una "
+        return ("No hay respuesta de OpenStreetMap/Overpass desde este despliegue "
+                f"({self.resumen_corto()}). Reintenta en unos minutos, reduce el radio o usa una "
                 "alternativa sin red: importar un CSV de negocios públicos o dar de alta el "
                 "prospecto manualmente.")
 
@@ -618,74 +653,174 @@ def _estado(respuesta):
 
 
 def _espera_tras_429(respuesta):
-    """Segundos que el servidor pide esperar antes de volver a preguntarle (acotados)."""
+    """Segundos que el servidor pide esperar antes de volver a preguntarle (acotados).
+
+    `Retry-After` puede venir en segundos (`120`) o como fecha HTTP
+    (`Wed, 30 Sep 2026 20:15:00 GMT`); ambos formatos son válidos y se entienden. Si el
+    servidor no lo declara o lo declara mal, se usa una pausa corta y cortés en vez de
+    suponer que ya hay turno libre.
+    """
     try:
-        pedida = float(respuesta.headers.get("Retry-After") or 0)
-    except (AttributeError, TypeError, ValueError):
-        return ESPERA_429_MAX
-    return max(1.0, min(pedida, ESPERA_429_MAX))
+        pedida = respuesta.headers.get("Retry-After")
+    except (AttributeError, TypeError):
+        return ESPERA_429_PREDETERMINADA
+    if pedida in (None, ""):
+        return ESPERA_429_PREDETERMINADA
+    try:
+        segundos = float(pedida)
+    except (TypeError, ValueError):
+        try:
+            momento = parsedate_to_datetime(str(pedida))
+        except (TypeError, ValueError):
+            return ESPERA_429_PREDETERMINADA
+        if momento is None:
+            return ESPERA_429_PREDETERMINADA
+        if momento.tzinfo is None:
+            momento = momento.replace(tzinfo=timezone.utc)
+        segundos = (momento - datetime.now(timezone.utc)).total_seconds()
+    return max(0.0, min(segundos, ESPERA_429_MAX))
+
+
+def reiniciar_memoria_servidores():
+    """Olvida qué servidor funcionó y cuáles fallaron (la usan las pruebas)."""
+    global _SERVIDOR_PREFERIDO
+    with _SERVIDORES_LOCK:
+        _SERVIDORES_EN_ESPERA.clear()
+        _SERVIDOR_PREFERIDO = None
+
+
+def _apartar_servidor(url, segundos):
+    """Manda al final de la cola al servidor que acaba de fallar, por un rato."""
+    with _SERVIDORES_LOCK:
+        ahora = time.monotonic()
+        hasta = ahora + max(0.0, min(float(segundos), ENFRIAMIENTO_MAX))
+        for vencido in [u for u, v in _SERVIDORES_EN_ESPERA.items() if v <= ahora]:
+            _SERVIDORES_EN_ESPERA.pop(vencido, None)  # la memoria no crece con servidores ya libres
+        _SERVIDORES_EN_ESPERA[url] = max(hasta, _SERVIDORES_EN_ESPERA.get(url, 0.0))
+
+
+def _recordar_servidor_util(url):
+    """El servidor que entregó resultados se pregunta primero la próxima vez."""
+    global _SERVIDOR_PREFERIDO
+    with _SERVIDORES_LOCK:
+        _SERVIDOR_PREFERIDO = url
+        _SERVIDORES_EN_ESPERA.pop(url, None)
+
+
+def _orden_servidores(urls=None):
+    """Servidores a preguntar, en orden, según lo aprendido en búsquedas anteriores.
+
+    Primero el que respondió la última vez (en Streamlit Cloud la IP es compartida y casi
+    siempre es el mismo el que tiene turno), después el resto en el orden publicado y al
+    final los que acaban de fallar, empezando por el que antes queda libre. **Ningún
+    servidor se descarta**: si todos están enfriándose se preguntan igual, porque una
+    búsqueda pedida por una persona vale más que la heurística.
+    """
+    servidores = tuple(urls if urls is not None else OVERPASS_URLS)
+    ahora = time.monotonic()
+    with _SERVIDORES_LOCK:
+        esperando = {u: v for u, v in _SERVIDORES_EN_ESPERA.items() if u in servidores and v > ahora}
+        preferido = _SERVIDOR_PREFERIDO
+    libres = [u for u in servidores if u not in esperando]
+    if preferido in libres:
+        libres.remove(preferido)
+        libres.insert(0, preferido)
+    apartados = sorted((u for u in servidores if u in esperando), key=lambda u: esperando[u])
+    return tuple(libres + apartados)
+
+
+def _preguntar_a_overpass(url, consulta, restante):
+    """Una sola petición a un servidor. Devuelve (resultado, dato) sin propagar excepciones.
+
+    Resultados: `ok` con el cuerpo JSON, `429` con los segundos de espera que pidió el
+    servidor, `saturado` si aceptó la consulta pero no la terminó, o `fallo` con el motivo.
+    El motivo NUNCA incluye el texto de la excepción: un error de proxy o de TLS puede
+    incrustar credenciales y eso no debe llegar a la pantalla.
+    """
+    try:
+        respuesta = requests.post(url, data={"data": consulta}, headers=CABECERAS,
+                                  timeout=max(5, min(TIEMPO_OVERPASS, restante)))
+    except requests.Timeout:
+        return "fallo", "no respondió a tiempo"
+    except requests.RequestException:
+        return "fallo", "sin conexión"
+    estado = _estado(respuesta)
+    if estado == 429:
+        return "429", _espera_tras_429(respuesta)
+    try:
+        respuesta.raise_for_status()
+        cuerpo = respuesta.json()
+    except requests.HTTPError:
+        return "fallo", f"rechazó la petición (HTTP {estado})" if estado else "rechazó la petición"
+    except ValueError:
+        return "fallo", "respuesta no válida"
+    if not isinstance(cuerpo, dict) or not isinstance(cuerpo.get("elements"), list):
+        return "fallo", "respuesta incompleta"
+    if cuerpo.get("remark"):
+        # El servidor arrancó la consulta pero no la terminó (suele ser su [timeout:25]);
+        # no es un fallo de la app ni del radio pedido, y el servidor sigue sano.
+        return "saturado", "no completó la consulta"
+    return "ok", cuerpo
 
 
 def _consultar_overpass(consulta, presupuesto=PRESUPUESTO_BUSQUEDA):
-    """Pregunta la misma consulta a los servidores públicos de Overpass, en orden.
+    """Pregunta la misma consulta a los servidores públicos de Overpass, en dos vueltas.
 
-    Devuelve (cuerpo JSON, servidor que respondió). Un servidor que rechaza la petición
-    (HTTP 429/403/406), que no conecta o que no responde a tiempo no aborta la búsqueda:
-    se pasa al siguiente. Ante un 429 se espera lo que indique `Retry-After` y se
-    reintenta una vez, como pide la política de uso de Overpass, antes de cambiar de
-    servidor. Si ninguno responde se lanza `_FalloOverpass` con el motivo de cada uno.
+    Devuelve (cuerpo JSON, servidor que respondió).
+
+    - **Primera vuelta, sin esperas:** cada servidor se pregunta una sola vez, empezando
+      por el que funcionó la última vez. Un HTTP 429 (límite por IP) ya no detiene la
+      búsqueda ni hace esperar: otro servidor puede tener turno libre **ahora**.
+    - **Segunda vuelta, solo con los que limitaron:** se reintenta una vez cada uno
+      **después** de la pausa que pidió en `Retry-After`, empezando por el que pidió menos
+      espera, como exige la política de uso de Overpass.
+    - Todo cabe en un presupuesto de tiempo total para que la interfaz no se cuelgue, y
+      cada fallo se recuerda para no volver a empezar por ese servidor en la siguiente
+      búsqueda. Si ninguno responde se lanza `_FalloOverpass` con el motivo de cada uno.
     """
     inicio = time.monotonic()
-    fallos = []
+    motivos = {}    # host -> motivo, en el orden en que se preguntó (uno por servidor)
+    limitados = []  # (espera pedida, instante del 429, url) para la segunda vuelta
     saturado = False
-    for url in OVERPASS_URLS:
-        restante = presupuesto - (time.monotonic() - inicio)
-        if fallos and restante < 5:
+
+    def restante():
+        return presupuesto - (time.monotonic() - inicio)
+
+    for url in _orden_servidores():
+        if motivos and restante() < 5:
             break  # no seguir esperando: mejor avisar y ofrecer la alternativa sin red
-        for ronda in (1, 2):
-            restante = presupuesto - (time.monotonic() - inicio)
-            if ronda > 1 and restante < 5:
-                break
-            try:
-                respuesta = requests.post(url, data={"data": consulta}, headers=CABECERAS,
-                                          timeout=max(5, min(TIEMPO_OVERPASS, restante)))
-            except requests.Timeout:
-                fallos.append((_servidor_de(url), "no respondió a tiempo"))
-                break
-            except requests.RequestException:
-                # Sin conexión, DNS o TLS: el detalle queda en la traza, no en pantalla.
-                fallos.append((_servidor_de(url), "sin conexión"))
-                break
-            if _estado(respuesta) == 429:
-                if ronda == 1:
-                    espera = _espera_tras_429(respuesta)
-                    if time.monotonic() - inicio + espera < presupuesto:
-                        time.sleep(espera)
-                        continue
-                fallos.append((_servidor_de(url), "límite de peticiones (HTTP 429)"))
-                break
-            estado = _estado(respuesta)
-            try:
-                respuesta.raise_for_status()
-                cuerpo = respuesta.json()
-            except requests.HTTPError:
-                fallos.append((_servidor_de(url),
-                               f"rechazó la petición (HTTP {estado})" if estado else "rechazó la petición"))
-                break
-            except ValueError:
-                fallos.append((_servidor_de(url), "respuesta no válida"))
-                break
-            if not isinstance(cuerpo, dict) or not isinstance(cuerpo.get("elements"), list):
-                fallos.append((_servidor_de(url), "respuesta incompleta"))
-                break
-            if cuerpo.get("remark"):
-                # El servidor arrancó la consulta pero no la terminó (suele ser su
-                # [timeout:25]); no es un fallo de la app ni del radio pedido.
-                saturado = True
-                fallos.append((_servidor_de(url), "no completó la consulta"))
-                break
-            return cuerpo, url
-    raise _FalloOverpass(fallos, saturado)
+        resultado, dato = _preguntar_a_overpass(url, consulta, restante())
+        if resultado == "ok":
+            _recordar_servidor_util(url)
+            return dato, url
+        if resultado == "429":
+            limitados.append((dato, time.monotonic(), url))
+            _apartar_servidor(url, max(dato, ENFRIAMIENTO_429))
+            motivos[_servidor_de(url)] = "límite de peticiones (HTTP 429)"
+        elif resultado == "saturado":
+            saturado = True  # el servidor está sano: no se aparta, la consulta fue muy grande
+            motivos[_servidor_de(url)] = dato
+        else:
+            _apartar_servidor(url, ENFRIAMIENTO_FALLO)
+            motivos[_servidor_de(url)] = dato
+
+    for pedida, cuando, url in sorted(limitados, key=lambda intento: intento[0]):
+        espera = max(0.0, min(pedida - (time.monotonic() - cuando), ESPERA_429_MAX))
+        if restante() < espera + 5:
+            break
+        if espera:
+            time.sleep(espera)  # respetar el turno que pidió el servidor, nunca insistir antes
+        resultado, dato = _preguntar_a_overpass(url, consulta, restante())
+        if resultado == "ok":
+            _recordar_servidor_util(url)
+            return dato, url
+        if resultado == "saturado":
+            saturado = True
+            motivos[_servidor_de(url)] = dato
+        elif resultado != "429":
+            motivos[_servidor_de(url)] = dato
+
+    raise _FalloOverpass(motivos.items(), saturado)
 
 
 def buscar_osm_detallada(ciudad, radio_km, sectores, catalogo):
@@ -714,7 +849,7 @@ def buscar_osm_detallada(ciudad, radio_km, sectores, catalogo):
                               f"se repitió con {nuevo:g} km.")
                 radio, reducido = nuevo, True
                 continue
-            raise ErrorBusqueda(fallo.mensaje()) from None
+            raise ErrorBusqueda(fallo.mensaje(), fallo.intentos) from None
     resultados = []
     for elemento in cuerpo["elements"][:MAX_RESULTADOS]:
         prospecto = _elemento_a_candidato(elemento, nombre_ciudad, sectores, catalogo, centro=(lat, lon))

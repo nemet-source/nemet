@@ -1618,9 +1618,17 @@ def alternativas_sin_osm():
             "así que un segundo intento suele bastar.\n"
             "- **Importar un CSV** de negocios públicos (el bloque se abre solo al final).\n"
             "- **Agregar el prospecto manualmente** con los datos que ya tengas.")
+        detalle = st.session_state.get("pros_fallo_detalle") or []
+        if detalle:
+            # Solo host y motivo: nunca rutas, parámetros ni texto de excepciones de red.
+            with st.expander("🔎 Qué contestó cada servidor"):
+                st.markdown("\n".join(f"- **{servidor}**: {motivo}" for servidor, motivo in detalle))
+                st.caption("«Límite de peticiones (HTTP 429)» significa que ese servidor "
+                           "reservó su turno para otra IP, no que la consulta esté mal.")
         if st.button("🔁 Reintentar la búsqueda", key="pros_reintentar", type="primary",
                      width="stretch"):
             st.session_state.pop("pros_fallo_osm", None)
+            st.session_state.pop("pros_fallo_detalle", None)
             st.session_state["pros_reintentar"] = True
             st.rerun()
 
@@ -1755,6 +1763,7 @@ def _contenido_prospeccion(inventario):
     if buscar or reintentar:
         st.session_state.pop("pros_resultados", None)  # nunca confundir fichas anteriores con un intento fallido
         st.session_state.pop("pros_fallo_osm", None)
+        st.session_state.pop("pros_fallo_detalle", None)
         try:
             with st.spinner("Buscando negocios y contrastando con clientes existentes..."):
                 encontrados, detalle = buscar_prospectos_osm(ciudad, radio, tuple(sectores), catalogo)
@@ -1775,9 +1784,12 @@ def _contenido_prospeccion(inventario):
                            "para descubrir negocios que pudieron quedar fuera.")
         except (pros.ErrorBusqueda, ValueError) as error:
             st.session_state["pros_fallo_osm"] = str(error)
+            # Detalle servidor por servidor para saber si fue límite por IP o falta de red.
+            st.session_state["pros_fallo_detalle"] = list(getattr(error, "intentos", ()))
             st.error(str(error))
         except Exception as error:
             st.session_state["pros_fallo_osm"] = f"No se pudo realizar la búsqueda: {error}"
+            st.session_state["pros_fallo_detalle"] = []
             st.error(st.session_state["pros_fallo_osm"])
 
     alternativas_sin_osm()
