@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Batería de pruebas de acceso y prospección NEMET (15 pruebas).
+"""Batería de pruebas de acceso y prospección NEMET (16 pruebas).
 
 Ejecuta la app real con `streamlit.testing.v1.AppTest` sobre una **copia temporal**
 del proyecto (con su propio Excel y su propia base de usuarios), así que nunca toca
@@ -9,15 +9,19 @@ entorno equivalentes a los Secrets.
 Los métodos están numerados porque forman un flujo encadenado (login, cambio
 obligatorio de contraseña, panel de administración). Unittest los ejecuta en orden.
 
-Uso:  python tests_flujo_app.py     →  "15/15 OK" si todo pasa.
+Uso:  python tests_flujo_app.py     →  "16/16 OK" si todo pasa.
 """
+import json
 import os
 import shutil
 import sys
 import tempfile
+import threading
 import unittest
 from datetime import date
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
+from urllib.parse import parse_qs
 
 import pandas as pd
 import prospeccion as pros
@@ -313,7 +317,10 @@ class TestFlujoAcceso(unittest.TestCase):
         cliente_existente = pros._elemento_a_candidato({
             "type": "node", "id": 9002, "tags": {"name": "Nemet", "craft": "tiler"},
         }, "Hermosillo, Sonora", ("aplicadores",), ())
-        with patch("prospeccion.buscar_osm", return_value=[candidato, cliente_existente]) as buscar:
+        with patch("prospeccion.buscar_osm_detallada",
+                  return_value=([candidato, cliente_existente],
+                                {"servidor": "servidor-de-prueba", "radio_pedido": 30,
+                                 "radio_usado": 30, "avisos": []})) as buscar:
             at.button(key="pros_buscar").click()
             at.run()
             self.assertFalse(at.exception, [e.value for e in at.exception])
@@ -336,7 +343,10 @@ class TestFlujoAcceso(unittest.TestCase):
         self.assertAlmostEqual(guardados.at[0, "Latitud"], 27.495)
         self.assertIn("644", guardados.at[0, "WhatsApp"])
         self.assertGreater(guardados.at[0, "Puntaje"], 80)
-        with patch("prospeccion.buscar_osm", return_value=[candidato, cliente_existente]):
+        with patch("prospeccion.buscar_osm_detallada",
+                  return_value=([candidato, cliente_existente],
+                                {"servidor": "servidor-de-prueba", "radio_pedido": 30,
+                                 "radio_usado": 30, "avisos": []})):
             at.button(key="pros_buscar").click()
             at.run()
         self.assertTrue(any("Nuevos: 0" in e.value for e in at.info))
@@ -506,6 +516,163 @@ class TestFlujoAcceso(unittest.TestCase):
         self.ir_a(at2, "🎯 Prospección Comercial")
         self.assertTrue(any("Carpintería del Valle" in o for o in at2.selectbox(key="pros_elegido").options))
         self.assertIn("Carpintería del Valle", pd.read_excel(xlsx, sheet_name="Prospectos")["Empresa"].tolist())
+
+    def test_16_busqueda_desplegada_contra_un_servidor_overpass_local(self):
+        """Prueba la búsqueda REAL de la app desplegada, de punta a punta.
+
+        Solo se sustituye la lista de servidores por uno local que imita a Overpass: la
+        consulta, el reintento, el parseo, la clasificación, el filtro por radio, el Excel
+        y la interfaz son los de producción. Sirve para ver qué hace la app cuando el
+        servicio falla de verdad (429 por IP y consulta que no se completa).
+        """
+        # Cada escenario usa otra ciudad/radio: la búsqueda se cachea media hora y así
+        # ninguna prueba se come el resultado de otra.
+        # --- 1) El servidor limita por IP (429) y la app reintenta antes de rendirse ---
+        prueba = ServidorOverpassDePrueba("429 luego ok").arrancar()
+        try:
+            with patch.object(pros, "OVERPASS_URLS", (prueba.url,)):
+                at = self.abrir(token=TestFlujoAcceso.token_admin, paso="búsqueda desplegada")
+                self.ir_a(at, "🎯 Prospección Comercial")
+                at.text_input(key="pros_ciudad").set_value("Obregón, Sonora")
+                at.button(key="pros_buscar").click()
+                at.run()
+                self.assertFalse(at.exception, [e.value for e in at.exception])
+        finally:
+            prueba.detener()
+        self.assertEqual(len(prueba.peticiones), 2, "un 429 se reintenta una vez, no se abandona")
+        self.assertIn("around:30000,27.48642,-109.94079", prueba.peticiones[0])
+        self.assertIn('nwr["craft"', prueba.peticiones[0])
+        self.assertTrue(any("Encontrados: 3 · Nuevos: 3" in i.value for i in at.info),
+                        [i.value for i in at.info])
+        self.assertTrue(any(c.value.startswith("Servidor consultado: 127.0.0.1") for c in at.caption),
+                        "la interfaz dice qué servidor respondió, sin rutas ni credenciales")
+        self.assertTrue(any("Carpintería del Sol" in o for s in at.selectbox for o in s.options),
+                        "la ficha pública debe aparecer como candidato")
+
+        # --- 2) Si ningún servidor responde: error claro y alternativas sin red ---
+        prueba = ServidorOverpassDePrueba("429").arrancar()
+        try:
+            with patch.object(pros, "OVERPASS_URLS", (prueba.url,)):
+                at.text_input(key="pros_ciudad").set_value("Ciudad Obregón")
+                at.slider(key="pros_radio").set_value(5)
+                at.run()
+                at.button(key="pros_buscar").click()
+                at.run()
+                self.assertFalse(at.exception, [e.value for e in at.exception])
+        finally:
+            prueba.detener()
+        self.assertTrue(at.error, "un fallo total debe verse, no esconderse")
+        self.assertIn("No hay respuesta de OpenStreetMap/Overpass", at.error[0].value)
+        self.assertIn("CSV", at.error[0].value)
+        self.assertIn("manualmente", at.error[0].value)
+        self.assertEqual(len(prueba.peticiones), 2, "429: un reintento y a otro servidor")
+        self.assertIn("around:5000,27.48642,-109.94079", prueba.peticiones[0])
+        self.assertTrue(any(b.key == "pros_reintentar" for b in at.button),
+                        "debe ofrecerse reintentar")
+        self.assertNotIn("pros_resultados", at.session_state,
+                         "un intento fallido nunca deja fichas anteriores en pantalla")
+
+        # --- 3) «Reintentar» relanza la búsqueda: el servicio ya responde ---
+        prueba = ServidorOverpassDePrueba("ok").arrancar()
+        try:
+            with patch.object(pros, "OVERPASS_URLS", (prueba.url,)):
+                at.button(key="pros_reintentar").click()
+                at.run()
+                self.assertFalse(at.exception, [e.value for e in at.exception])
+        finally:
+            prueba.detener()
+        self.assertEqual(len(prueba.peticiones), 1)
+        self.assertTrue(any("Encontrados: 2 · Nuevos: 2" in i.value for i in at.info),
+                        [i.value for i in at.info])
+        self.assertFalse(at.error, "tras reintentar no debe quedarse el error anterior")
+        self.assertFalse(any(b.key == "pros_reintentar" for b in at.button),
+                         "sin fallo no se ofrecen alternativas")
+
+        # --- 4) El servidor acepta la consulta pero no la termina: baja el radio y avisa ---
+        prueba = ServidorOverpassDePrueba("no completa luego ok").arrancar()
+        try:
+            with patch.object(pros, "OVERPASS_URLS", (prueba.url,)):
+                at.slider(key="pros_radio").set_value(12)
+                at.run()
+                at.button(key="pros_buscar").click()
+                at.run()
+                self.assertFalse(at.exception, [e.value for e in at.exception])
+        finally:
+            prueba.detener()
+        self.assertTrue(any("12 km" in w.value and "6 km" in w.value for w in at.warning),
+                        [w.value for w in at.warning])
+        self.assertTrue(any("Encontrados: 2 · Nuevos: 2" in i.value for i in at.info),
+                        [i.value for i in at.info])
+
+
+class _ManejadorOverpass(BaseHTTPRequestHandler):
+    """Atiende POST /api/interpreter como Overpass, con el modo que le pida la prueba."""
+
+    def log_message(self, *args):
+        pass  # sin ruido en la salida de las pruebas
+
+    def do_POST(self):
+        prueba = self.server.prueba
+        largo = int(self.headers.get("Content-Length") or 0)
+        forma = parse_qs(self.rfile.read(largo).decode("utf-8"))
+        prueba.peticiones.append(forma.get("data", [""])[0])
+        if prueba.modo in ("429", "429 luego ok") and (
+                prueba.modo == "429" or len(prueba.peticiones) == 1):
+            self._responder(429, b'{"remark":"limite de peticiones"}', {"Retry-After": "1"})
+        elif prueba.modo == "no completa luego ok" and len(prueba.peticiones) == 1:
+            self._responder(200, json.dumps({"remark": "runtime error: Query timed out",
+                                             "elements": []}).encode("utf-8"))
+        else:
+            cuerpo = json.dumps({"elements": prueba.ELEMENTOS}).encode("utf-8")
+            self._responder(200, cuerpo)
+
+    def _responder(self, estado, cuerpo, cabeceras=None):
+        self.send_response(estado)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(cuerpo)))
+        for clave, valor in (cabeceras or {}).items():
+            self.send_header(clave, valor)
+        self.end_headers()
+        self.wfile.write(cuerpo)
+
+
+class ServidorOverpassDePrueba:
+    """Servidor HTTP local que imita a Overpass para probar la búsqueda real de la app.
+
+    No inventa negocios: devuelve el mismo tipo de fichas públicas que Overpass (con
+    coordenadas reales de Ciudad Obregón) y reproduce los dos fallos que la app debe saber
+    manejar: el límite por IP (HTTP 429 con `Retry-After`) y la consulta que el servidor
+    acepta pero no termina.
+    """
+
+    ELEMENTOS = [
+        {"type": "node", "id": 5001, "lat": 27.49, "lon": -109.94,
+         "tags": {"name": "Carpintería del Sol", "craft": "carpenter", "addr:suburb": "Centro",
+                  "contact:phone": "+52 644 109 4422"}},
+        {"type": "node", "id": 5002, "lat": 27.60, "lon": -109.90,
+         "tags": {"name": "Ebanistería Yaqui", "craft": "cabinet_maker"}},
+        {"type": "node", "id": 5003, "lat": 27.20, "lon": -109.95,
+         "tags": {"name": "Muebles del Mayo", "craft": "furniture_maker"}},  # ~32 km: fuera de 30 km
+        {"type": "way", "id": 5004, "center": {"lat": 27.50, "lon": -109.93},
+         "tags": {"name": "Pisos Obregón", "craft": "tiler", "phone": "662 109 4455"}},
+        {"type": "node", "id": 5005, "lat": 27.48, "lon": -109.93,
+         "tags": {"name": "Panadería Yaqui", "shop": "bakery"}},  # otro giro: se descarta
+    ]
+
+    def __init__(self, modo="ok"):
+        self.modo = modo
+        self.peticiones = []
+        self._http = ThreadingHTTPServer(("127.0.0.1", 0), _ManejadorOverpass)
+        self._http.prueba = self
+        self.url = f"http://127.0.0.1:{self._http.server_address[1]}/api/interpreter"
+
+    def arrancar(self):
+        threading.Thread(target=self._http.serve_forever, daemon=True).start()
+        return self
+
+    def detener(self):
+        self._http.shutdown()
+        self._http.server_close()
 
 
 if __name__ == "__main__":
