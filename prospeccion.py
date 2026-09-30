@@ -3,6 +3,9 @@
 Usa fichas de negocios publicadas en OpenStreetMap (Overpass + Nominatim)
 o giros declarados en archivos CSV propios.
 El puntaje combina afinidad de giro, señales públicas y perfil con fuente; no predice compras.
+La consulta a Overpass se intenta en varios servidores públicos en orden, porque la IP de
+salida de Streamlit Cloud es compartida y esos servidores limitan por IP; si ninguno
+responde, la búsqueda termina con un error claro y NUNCA con fichas inventadas.
 Sin Streamlit ni acceso al Excel: las búsquedas, reglas y deduplicación se pueden probar
 sin red ni modificar los datos de la empresa.
 """
@@ -22,7 +25,23 @@ from urllib.parse import parse_qs, quote, urlparse
 import requests
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+# Instancia principal de Overpass: reparte por turnos entre z y lz4 y cada servidor cuenta
+# sus peticiones por IP de salida.
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+# Servidores públicos en orden de intento (lista de la wiki de OSM:
+# https://wiki.openstreetmap.org/wiki/Overpass_API#Public_Overpass_API_instances).
+# La app se ejecuta en Streamlit Cloud, donde la IP de salida es COMPARTIDA con otras apps:
+# allí la instancia principal responde 429 (límite por IP) o rechaza la petición, y el fallo no
+# depende del tamaño de la consulta. Por eso se pregunta a varios servidores antes de rendirse.
+# Ninguno recibe credenciales: la consulta solo lleva coordenadas y etiquetas cerradas.
+OVERPASS_URLS = (
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+    OVERPASS_URL,
+    "https://z.overpass-api.de/api/interpreter",
+    "https://lz4.overpass-api.de/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+)
 # Identificar la aplicación ante los servidores comunitarios; no hacer búsquedas en segundo plano.
 CABECERAS = {
     "User-Agent": "NEMET-Prospeccion/1.0 (https://github.com/nemet-source/nemet)",
@@ -33,6 +52,10 @@ FUENTE_OSM = "© OpenStreetMap contributors (ODbL)"
 # Nominatim público: como máximo 1 petición por segundo en este proceso.
 _GEO_LOCK = threading.Lock()
 _ULTIMA_GEO = 0.0
+TIEMPO_OVERPASS = 35      # segundos por intento; la consulta pide [timeout:25] al servidor
+PRESUPUESTO_BUSQUEDA = 75  # techo total de reintentos: la interfaz no se queda colgada
+ESPERA_429_MAX = 5        # espera máxima tras un "Too Many Requests" antes de cambiar de servidor
+RADIO_MINIMO = 1          # crear_consulta_osm no acepta menos de 1 km
 
 
 def respaldo_github_privado(repo: str, token: str) -> tuple[bool, str]:
@@ -550,30 +573,168 @@ def _elemento_a_candidato(elemento, ciudad, sectores, catalogo, centro=None):
     )
 
 
-def buscar_osm(ciudad, radio_km, sectores, catalogo):
-    """Busca negocios reales; no persiste datos ni devuelve fichas sin giro/nombre."""
+class _FalloOverpass(Exception):
+    """Ningún servidor de Overpass entregó resultados; guarda el motivo de cada uno.
+
+    A propósito NO arrastra el texto de la excepción de red ni las cabeceras: un error de
+    proxy o de TLS puede incrustar credenciales en su mensaje y eso nunca debe llegar a la
+    pantalla. `resumen()` solo nombra servidor y motivo.
+    """
+
+    def __init__(self, intentos, saturado=False):
+        self.intentos = list(intentos)
+        self.saturado = saturado  # algún servidor aceptó la consulta pero no la terminó
+        super().__init__(self.resumen())
+
+    def resumen(self):
+        return "; ".join(f"{servidor}: {motivo}" for servidor, motivo in self.intentos) or "sin servidores"
+
+    def mensaje(self):
+        if self.saturado:
+            return ("Los servidores de OpenStreetMap no alcanzaron a completar la búsqueda "
+                    "con este radio. Reduce el radio o elige menos giros y reintenta; si sigue "
+                    "igual, usa una alternativa sin red: importar un CSV de negocios públicos "
+                    "o dar de alta el prospecto manualmente.")
+        return ("No hay respuesta de OpenStreetMap/Overpass desde este servidor "
+                f"({self.resumen()}). Reintenta en unos minutos, reduce el radio o usa una "
+                "alternativa sin red: importar un CSV de negocios públicos o dar de alta el "
+                "prospecto manualmente.")
+
+
+def _servidor_de(url):
+    """Solo el host del servidor, para poder informar sin exponer rutas ni credenciales."""
+    try:
+        return urlparse(url).netloc or str(url)
+    except (ValueError, TypeError):
+        return "servidor"
+
+
+def _estado(respuesta):
+    """Código HTTP de la respuesta, o 0 si el servidor no lo declaró."""
+    try:
+        return int(respuesta.status_code)
+    except (AttributeError, TypeError, ValueError):
+        return 0
+
+
+def _espera_tras_429(respuesta):
+    """Segundos que el servidor pide esperar antes de volver a preguntarle (acotados)."""
+    try:
+        pedida = float(respuesta.headers.get("Retry-After") or 0)
+    except (AttributeError, TypeError, ValueError):
+        return ESPERA_429_MAX
+    return max(1.0, min(pedida, ESPERA_429_MAX))
+
+
+def _consultar_overpass(consulta, presupuesto=PRESUPUESTO_BUSQUEDA):
+    """Pregunta la misma consulta a los servidores públicos de Overpass, en orden.
+
+    Devuelve (cuerpo JSON, servidor que respondió). Un servidor que rechaza la petición
+    (HTTP 429/403/406), que no conecta o que no responde a tiempo no aborta la búsqueda:
+    se pasa al siguiente. Ante un 429 se espera lo que indique `Retry-After` y se
+    reintenta una vez, como pide la política de uso de Overpass, antes de cambiar de
+    servidor. Si ninguno responde se lanza `_FalloOverpass` con el motivo de cada uno.
+    """
+    inicio = time.monotonic()
+    fallos = []
+    saturado = False
+    for url in OVERPASS_URLS:
+        restante = presupuesto - (time.monotonic() - inicio)
+        if fallos and restante < 5:
+            break  # no seguir esperando: mejor avisar y ofrecer la alternativa sin red
+        for ronda in (1, 2):
+            restante = presupuesto - (time.monotonic() - inicio)
+            if ronda > 1 and restante < 5:
+                break
+            try:
+                respuesta = requests.post(url, data={"data": consulta}, headers=CABECERAS,
+                                          timeout=max(5, min(TIEMPO_OVERPASS, restante)))
+            except requests.Timeout:
+                fallos.append((_servidor_de(url), "no respondió a tiempo"))
+                break
+            except requests.RequestException:
+                # Sin conexión, DNS o TLS: el detalle queda en la traza, no en pantalla.
+                fallos.append((_servidor_de(url), "sin conexión"))
+                break
+            if _estado(respuesta) == 429:
+                if ronda == 1:
+                    espera = _espera_tras_429(respuesta)
+                    if time.monotonic() - inicio + espera < presupuesto:
+                        time.sleep(espera)
+                        continue
+                fallos.append((_servidor_de(url), "límite de peticiones (HTTP 429)"))
+                break
+            estado = _estado(respuesta)
+            try:
+                respuesta.raise_for_status()
+                cuerpo = respuesta.json()
+            except requests.HTTPError:
+                fallos.append((_servidor_de(url),
+                               f"rechazó la petición (HTTP {estado})" if estado else "rechazó la petición"))
+                break
+            except ValueError:
+                fallos.append((_servidor_de(url), "respuesta no válida"))
+                break
+            if not isinstance(cuerpo, dict) or not isinstance(cuerpo.get("elements"), list):
+                fallos.append((_servidor_de(url), "respuesta incompleta"))
+                break
+            if cuerpo.get("remark"):
+                # El servidor arrancó la consulta pero no la terminó (suele ser su
+                # [timeout:25]); no es un fallo de la app ni del radio pedido.
+                saturado = True
+                fallos.append((_servidor_de(url), "no completó la consulta"))
+                break
+            return cuerpo, url
+    raise _FalloOverpass(fallos, saturado)
+
+
+def buscar_osm_detallada(ciudad, radio_km, sectores, catalogo):
+    """Busca negocios reales y devuelve también el detalle de cómo se hizo la búsqueda.
+
+    Devuelve (fichas, detalle). `detalle` indica el servidor que respondió, el radio que
+    se usó al final y los avisos que la interfaz debe mostrar; no contiene datos de la
+    empresa ni credenciales. Si todos los servidores aceptan la consulta pero ninguno la
+    completa, se reintenta una sola vez con la mitad del radio y se avisa del cambio.
+    """
     # Valida *antes* de llamar a geocodificación.
     crear_consulta_osm(0, 0, radio_km, sectores)
     lat, lon, nombre_ciudad = ubicar_ciudad(ciudad)
-    consulta = crear_consulta_osm(lat, lon, radio_km, sectores)
-    try:
-        respuesta = requests.post(OVERPASS_URL, data={"data": consulta}, headers=CABECERAS, timeout=35)
-        respuesta.raise_for_status()
-        cuerpo = respuesta.json()
-    except requests.RequestException as exc:
-        raise ErrorBusqueda("OpenStreetMap/Overpass no respondió. Reintenta luego o importa un CSV de negocios.") from exc
-    except ValueError as exc:
-        raise ErrorBusqueda("Overpass devolvió una respuesta no válida. Reintenta más tarde.") from exc
-    if not isinstance(cuerpo, dict) or cuerpo.get("remark") or not isinstance(cuerpo.get("elements"), list):
-        raise ErrorBusqueda("Overpass no pudo completar la búsqueda. Reduce el radio o reintenta después.")
+    radio = float(radio_km)
+    avisos = []
+    reducido = False
+    while True:
+        consulta = crear_consulta_osm(lat, lon, radio, sectores)
+        try:
+            cuerpo, servidor = _consultar_overpass(consulta)
+            break
+        except _FalloOverpass as fallo:
+            if fallo.saturado and not reducido and radio > RADIO_MINIMO:
+                nuevo = max(RADIO_MINIMO, radio / 2)
+                avisos.append(f"Ningún servidor completó la búsqueda con {radio:g} km; "
+                              f"se repitió con {nuevo:g} km.")
+                radio, reducido = nuevo, True
+                continue
+            raise ErrorBusqueda(fallo.mensaje()) from None
     resultados = []
     for elemento in cuerpo["elements"][:MAX_RESULTADOS]:
         prospecto = _elemento_a_candidato(elemento, nombre_ciudad, sectores, catalogo, centro=(lat, lon))
         # Overpass puede incluir un polígono que apenas roza el círculo, cuyo centro
         # cae fuera del radio solicitado. No mostrarlo como negocio dentro del radio.
-        if prospecto and (not prospecto["Distancia_km"] or prospecto["Distancia_km"] <= radio_km):
+        if prospecto and (not prospecto["Distancia_km"] or prospecto["Distancia_km"] <= radio):
             resultados.append(prospecto)
-    return sorted(resultados, key=lambda p: (-p["Puntaje"], p["Empresa"].casefold()))
+    detalle = {
+        "servidor": _servidor_de(servidor),
+        "radio_pedido": float(radio_km),
+        "radio_usado": radio,
+        "avisos": avisos,
+    }
+    return sorted(resultados, key=lambda p: (-p["Puntaje"], p["Empresa"].casefold())), detalle
+
+
+def buscar_osm(ciudad, radio_km, sectores, catalogo):
+    """Busca negocios reales; no persiste datos ni devuelve fichas sin giro/nombre."""
+    fichas, _detalle = buscar_osm_detallada(ciudad, radio_km, sectores, catalogo)
+    return fichas
 
 
 def candidato_de_archivo(fila, catalogo, ciudad_default=""):

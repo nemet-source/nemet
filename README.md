@@ -32,6 +32,11 @@ Administrador y Editor en el menú **🎯 Prospección Comercial**.
    Nominatim); otras ciudades se ubican con Nominatim. Overpass devuelve hasta 300 fichas
    etiquetadas. Los resultados de consultas iguales se guardan en caché 30 minutos; no hay
    búsquedas en segundo plano.
+   La consulta se intenta en **varios servidores públicos de Overpass, en orden** (kumi.systems,
+   private.coffee, overpass-api.de, z, lz4 y VK Maps), porque la IP de salida de Streamlit Cloud
+   es compartida y esos servidores limitan por IP. La interfaz indica qué servidor respondió.
+   Si todos aceptan la consulta pero ninguno la termina, se reintenta una vez con la mitad del
+   radio y se avisa del cambio.
    Los giros incluyen carpinterías, fabricantes de muebles/mesas, artesanos, tiendas de manualidades,
    decoradores, restauradores, aplicadores de pisos, constructoras, distribuidores, manufactura y
    arquitectura. Un artista o tienda de arte es un **posible** prospecto, no un comprador confirmado.
@@ -109,7 +114,7 @@ repositorio público, cambiarlo a privado no borra el acceso histórico a copias
 |---|---|
 | No aparece **🎯 Prospección Comercial** | Comprueba que el cambio esté incorporado en la **rama que despliega Streamlit** y que ese despliegue terminó sin errores. Si se usa `main`, fusiona primero el PR de la funcionalidad. El rol **Usuario** no ve el CRM; accede como Admin/Editor. |
 | Solo aparece el login o falta administrador | Configura `[auth]` en los **Secrets privados** del despliegue. Nunca compartas contraseñas o tokens en un issue, chat o commit. |
-| La búsqueda devuelve error o no encuentra negocios | Comprueba acceso HTTPS a Overpass desde el servidor y cobertura de OpenStreetMap en esa zona; prueba menos giros/radio. Ciudad Obregón ya no necesita Nominatim. **Agregar manualmente** y **CSV** no necesitan los servicios OSM. No se generan contactos ficticios cuando falla la red. |
+| La búsqueda devuelve error o no encuentra negocios | **No es el tamaño de la consulta**: si falla igual con 30 km y todos los giros que con 5 km y una sola carpintería, el problema es el servidor, no el radio. La app ya prueba varios servidores públicos de Overpass y reintenta el límite por IP (HTTP 429), así que pulsa **Reintentar** en el recuadro de alternativas. Si sigue el error, la IP de Streamlit Cloud está limitada/bloqueada de forma temporal: espera unos minutos o revisa el estado en <https://overpass-api.de/api/status>. Mientras tanto usa las **alternativas sin red**: importar un CSV de negocios públicos o **Agregar manualmente**. Ninguna ficha se inventa cuando falla la red. |
 | Guarda, pero desaparece tras reiniciar | El archivo `Prospectos` se crea en el Excel **del servidor**, no en el teléfono; el disco de Streamlit Cloud es efímero. Exporta CSV regularmente y configura respaldo **solo en un repositorio privado verificable**, con la misma rama/historial. |
 
 ## 🔐 Acceso, roles y administración de usuarios

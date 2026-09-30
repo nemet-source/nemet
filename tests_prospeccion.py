@@ -22,8 +22,10 @@ CATALOGO = (
 )
 
 
-def respuesta(datos, status=200):
+def respuesta(datos, status=200, cabeceras=None):
     r = Mock()
+    r.status_code = status
+    r.headers = cabeceras if cabeceras is not None else {}
     r.json.return_value = datos
     if status != 200:
         r.raise_for_status.side_effect = requests.HTTPError(f"HTTP {status}")
@@ -387,14 +389,103 @@ class TestRed(unittest.TestCase):
         self.assertIn("[timeout:25]", post.call_args.kwargs["data"]["data"])
         self.assertEqual(post.call_args.kwargs["timeout"], 35)
 
+    @patch("prospeccion.time.sleep")
     @patch("prospeccion.requests.post")
-    def test_error_no_crea_lista_ficticia(self, post):
+    def test_error_no_crea_lista_ficticia(self, post, dormir):
         post.return_value = respuesta({}, 429)
         with self.assertRaises(pros.ErrorBusqueda):
             pros.buscar_osm("Hermosillo", 12, ("aplicadores",), CATALOGO)
         post.return_value = respuesta({"remark": "runtime error", "elements": []})
         with self.assertRaises(pros.ErrorBusqueda):
             pros.buscar_osm("Hermosillo", 12, ("aplicadores",), CATALOGO)
+
+
+class TestVariosServidoresOverpass(unittest.TestCase):
+    """La app corre en Streamlit Cloud: la IP de salida es compartida y los servidores
+    públicos limitan por IP, así que un fallo NO puede depender de un solo servidor."""
+
+    def tearDown(self):
+        pros.ubicar_ciudad.cache_clear()
+
+    CARPINTERIA = {"type": "node", "id": 4242, "lat": 27.49, "lon": -109.94,
+                   "tags": {"name": "Carpintería del Sol", "craft": "carpenter",
+                            "contact:phone": "+52 644 109 4422"}}
+
+    def test_servidores_publicos_son_https_unicos_y_sin_credenciales(self):
+        self.assertGreaterEqual(len(pros.OVERPASS_URLS), 3, "un solo servidor no es un plan B")
+        self.assertEqual(len(pros.OVERPASS_URLS), len(set(pros.OVERPASS_URLS)))
+        for url in pros.OVERPASS_URLS:
+            self.assertTrue(url.startswith("https://"), url)
+            self.assertNotIn("@", url, "ningún servidor recibe credenciales incrustadas")
+        self.assertIn(pros.OVERPASS_URL, pros.OVERPASS_URLS)
+
+    @patch("prospeccion.time.sleep")
+    @patch("prospeccion.requests.post")
+    def test_limite_por_ip_reintenta_una_vez_y_cambia_de_servidor(self, post, dormir):
+        """HTTP 429: se espera lo que pide el servidor y, si insiste, se pregunta a otro."""
+        post.side_effect = [respuesta({}, 429, {"Retry-After": "2"}), respuesta({}, 429),
+                            respuesta({"elements": [self.CARPINTERIA]}, 200)]
+        fichas = pros.buscar_osm("Ciudad Obregón, Sonora", 5, ("carpinterias",), CATALOGO)
+        self.assertEqual([f["Empresa"] for f in fichas], ["Carpintería del Sol"])
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual({pros._servidor_de(c.args[0]) for c in post.call_args_list[:2]},
+                         {"overpass.kumi.systems"}, "el reintento es contra el mismo servidor")
+        self.assertEqual(pros._servidor_de(post.call_args_list[2].args[0]), "overpass.private.coffee")
+        dormir.assert_called_once_with(2.0)
+
+    @patch("prospeccion.requests.post")
+    def test_servidor_sin_conexion_se_salta_y_se_usa_el_siguiente(self, post):
+        post.side_effect = [requests.ConnectionError("se cortó la conexión"),
+                            respuesta({"elements": [self.CARPINTERIA]}, 200)]
+        fichas = pros.buscar_osm("Ciudad Obregón, Sonora", 5, ("carpinterias",), CATALOGO)
+        self.assertEqual([f["Empresa"] for f in fichas], ["Carpintería del Sol"])
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(pros._servidor_de(post.call_args_list[1].args[0]), "overpass.private.coffee")
+
+    @patch("prospeccion.requests.post")
+    def test_si_ninguno_responde_el_error_explica_y_no_filtra_credenciales(self, post):
+        # Un proxy que pide credenciales las incrusta en el mensaje de la excepción.
+        post.side_effect = requests.exceptions.ProxyError(
+            "407 Proxy Authentication Required for https://usuario:clave-falsa-de-prueba@proxy:8080/")
+        with self.assertRaises(pros.ErrorBusqueda) as fallo:
+            pros.buscar_osm("Ciudad Obregón, Sonora", 5, ("carpinterias",), CATALOGO)
+        mensaje = str(fallo.exception)
+        self.assertNotIn("clave-falsa-de-prueba", mensaje)
+        self.assertNotIn("Authorization", mensaje)
+        self.assertNotIn("proxy:8080", mensaje)
+        self.assertIn("CSV", mensaje)
+        self.assertIn("manualmente", mensaje)
+        self.assertEqual(post.call_count, len(pros.OVERPASS_URLS), "se agotan los servidores")
+
+    @patch("prospeccion.requests.post")
+    def test_servidor_que_no_completa_la_consulta_baja_el_radio_una_vez_y_avisa(self, post):
+        post.side_effect = ([respuesta({"remark": "runtime error: Query timed out",
+                                        "elements": []}, 200)] * len(pros.OVERPASS_URLS)
+                            + [respuesta({"elements": [self.CARPINTERIA]}, 200)])
+        fichas, detalle = pros.buscar_osm_detallada("Ciudad Obregón, Sonora", 30, ("carpinterias",), CATALOGO)
+        self.assertEqual([f["Empresa"] for f in fichas], ["Carpintería del Sol"])
+        self.assertEqual(detalle["radio_pedido"], 30)
+        self.assertEqual(detalle["radio_usado"], 15)
+        self.assertEqual(len(detalle["avisos"]), 1)
+        self.assertIn("30 km", detalle["avisos"][0])
+        self.assertIn("15 km", detalle["avisos"][0])
+
+    @patch("prospeccion.requests.post")
+    def test_si_ni_con_menos_radio_completa_no_hay_fichas(self, post):
+        post.return_value = respuesta({"remark": "runtime error", "elements": []})
+        with self.assertRaises(pros.ErrorBusqueda) as fallo:
+            pros.buscar_osm("Ciudad Obregón, Sonora", 30, ("carpinterias",), CATALOGO)
+        self.assertIn("no alcanzaron a completar", str(fallo.exception))
+        self.assertEqual(post.call_count, 2 * len(pros.OVERPASS_URLS),
+                         "una sola reducción de radio, no una cascada de peticiones")
+
+    @patch("prospeccion.requests.post")
+    def test_detalle_informa_solo_el_servidor_que_respondio(self, post):
+        post.return_value = respuesta({"elements": [self.CARPINTERIA]}, 200)
+        _, detalle = pros.buscar_osm_detallada("Ciudad Obregón, Sonora", 5, ("carpinterias",), CATALOGO)
+        self.assertEqual(detalle["servidor"], "overpass.kumi.systems")
+        self.assertNotIn("/", detalle["servidor"], "solo el host, nunca la ruta ni parámetros")
+        self.assertEqual(detalle["avisos"], [])
 
 
 if __name__ == "__main__":

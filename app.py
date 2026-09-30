@@ -1483,11 +1483,38 @@ def panel_usuarios(conn):
 # ==========================================
 @st.cache_data(ttl=1800, show_spinner=False)
 def buscar_prospectos_osm(ciudad, radio, sectores, catalogo):
-    """Caché de media hora: no repetir consultas idénticas a los servidores públicos."""
-    return pros.buscar_osm(ciudad, radio, sectores, catalogo)
+    """Caché de media hora: no repetir consultas idénticas a los servidores públicos.
+
+    Devuelve (fichas, detalle); el detalle dice qué servidor respondió y si hubo que
+    reducir el radio, para poder informarlo en pantalla sin adivinar.
+    """
+    return pros.buscar_osm_detallada(ciudad, radio, sectores, catalogo)
 
 
-def formulario_prospecto_manual(catalogo):
+def alternativas_sin_osm():
+    """Si OpenStreetMap no responde, ofrece salidas que NO dependen de la red.
+
+    Nunca se inventan negocios ni contactos: reintentar (ahora contra varios servidores),
+    importar un CSV propio o dar de alta el prospecto a mano.
+    """
+    if not st.session_state.get("pros_fallo_osm"):
+        return
+    with st.container(border=True):
+        st.markdown("#### 🛟 OpenStreetMap no respondió: alternativas sin red")
+        st.caption("Ninguna ficha se inventó ni se guardó. Estas rutas funcionan sin Internet:")
+        st.markdown(
+            "- **Reintentar**: la búsqueda ya prueba varios servidores públicos de Overpass, "
+            "así que un segundo intento suele bastar.\n"
+            "- **Importar un CSV** de negocios públicos (el bloque se abre solo al final).\n"
+            "- **Agregar el prospecto manualmente** con los datos que ya tengas.")
+        if st.button("🔁 Reintentar la búsqueda", key="pros_reintentar", type="primary",
+                     width="stretch"):
+            st.session_state.pop("pros_fallo_osm", None)
+            st.session_state["pros_reintentar"] = True
+            st.rerun()
+
+
+def formulario_prospecto_manual(catalogo, expandido=False):
     """Alta directa en el Excel local; nunca geocodifica domicilios ni envía mensajes."""
     if st.session_state.pop("manual_limpiar_despues_de_guardar", False):
         # El permiso y el origen deben confirmarse otra vez para CADA nuevo negocio.
@@ -1496,7 +1523,7 @@ def formulario_prospecto_manual(catalogo):
                       "correo", "sitio", "redes", "url_fuente", "latitud", "longitud", "origen",
                       "estado", "ultimo", "proximo", "notas", "permiso"):
             st.session_state.pop(f"manual_{campo}", None)
-    with st.expander("➕ Agregar prospecto manualmente"):
+    with st.expander("➕ Agregar prospecto manualmente", expanded=expandido):
         st.caption("Registra solo datos **comerciales** publicados o que la empresa compartió con permiso. "
                    "No hace falta buscar en OpenStreetMap ni importar un archivo.")
         with st.form("form_alta_prospecto"):
@@ -1612,17 +1639,23 @@ def _contenido_prospeccion(inventario):
             "Giros a buscar", list(pros.SECTORES), default=list(pros.SECTORES),
             format_func=lambda s: pros.SECTORES[s]["nombre"], key="pros_sectores")
         buscar = st.form_submit_button("🔎 Buscar negocios", key="pros_buscar")
-    if buscar:
+    # El botón «Reintentar» de las alternativas vuelve a lanzar la misma búsqueda.
+    reintentar = st.session_state.pop("pros_reintentar", False)
+    if buscar or reintentar:
         st.session_state.pop("pros_resultados", None)  # nunca confundir fichas anteriores con un intento fallido
+        st.session_state.pop("pros_fallo_osm", None)
         try:
             with st.spinner("Buscando negocios y contrastando con clientes existentes..."):
-                encontrados = buscar_prospectos_osm(ciudad, radio, tuple(sectores), catalogo)
+                encontrados, detalle = buscar_prospectos_osm(ciudad, radio, tuple(sectores), catalogo)
                 nuevos, repetidos, clientes = nuevos_prospectos(encontrados)
             st.session_state["pros_resultados"] = nuevos
-            st.session_state["pros_origen"] = f"OpenStreetMap · {ciudad.strip()} · {radio} km"
+            st.session_state["pros_origen"] = f"OpenStreetMap · {ciudad.strip()} · {detalle['radio_usado']:g} km"
             st.session_state["pros_version"] = st.session_state.get("pros_version", 0) + 1
             st.info(f"Encontrados: {len(encontrados)} · Nuevos: {len(nuevos)} · "
                     f"Ya guardados: {repetidos} · Ya clientes: {clientes}.")
+            st.caption(f"Servidor consultado: {detalle['servidor']} · fuente: {pros.FUENTE_OSM}")
+            for aviso in detalle.get("avisos", []):
+                st.warning(aviso)
             if not encontrados:
                 st.warning("No hay negocios etiquetados para esos giros en esta zona de OpenStreetMap. "
                            "Prueba otro radio o importa un CSV de negocios públicos.")
@@ -1630,13 +1663,17 @@ def _contenido_prospeccion(inventario):
                 st.warning("Se alcanzó el límite de fichas de esta búsqueda. Reduce el radio o elige menos giros "
                            "para descubrir negocios que pudieron quedar fuera.")
         except (pros.ErrorBusqueda, ValueError) as error:
+            st.session_state["pros_fallo_osm"] = str(error)
             st.error(str(error))
         except Exception as error:
-            st.error(f"No se pudo realizar la búsqueda: {error}")
+            st.session_state["pros_fallo_osm"] = f"No se pudo realizar la búsqueda: {error}"
+            st.error(st.session_state["pros_fallo_osm"])
 
-    formulario_prospecto_manual(catalogo)
+    alternativas_sin_osm()
+    formulario_prospecto_manual(catalogo, expandido=bool(st.session_state.get("pros_fallo_osm")))
 
-    with st.expander("📂 Importar un CSV de negocios (alternativa si faltan fichas públicas)"):
+    with st.expander("📂 Importar un CSV de negocios (alternativa si faltan fichas públicas)",
+                     expanded=bool(st.session_state.get("pros_fallo_osm"))):
         st.caption("Solo datos de contacto **comercial** publicados o aportados con autorización. "
                    "Obligatorias: `Empresa`, `Giro` (o `Segmento`). Opcionales: ciudad, zona, dirección, "
                    "teléfono, **WhatsApp publicado**, correo, web, redes, coordenadas y productos del negocio. "
