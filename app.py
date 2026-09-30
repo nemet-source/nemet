@@ -3,6 +3,7 @@ import math
 import os
 import re
 import smtplib
+import sqlite3
 import threading
 import time
 import unicodedata
@@ -304,7 +305,10 @@ def _respaldar_core(mensaje, rutas_extra=None):
             git_config.set_value("user", "name", "NEMET Bot")
             git_config.set_value("user", "email", "bot@nemet.app")
 
-        candidatas = [EXCEL_FILE, RUTA_DB_USUARIOS]
+        # Se respalda la base que la app está usando de verdad (si el archivo del
+        # repositorio no admitía escritura, la copia escribible vive fuera de él y el
+        # filtro de rutas de abajo la descarta sin romper nada).
+        candidatas = [EXCEL_FILE, auth.ruta_efectiva() or RUTA_DB_USUARIOS]
         if isinstance(rutas_extra, str):
             rutas_extra = [rutas_extra]
         candidatas.extend(rutas_extra or [])
@@ -980,9 +984,13 @@ MODULOS_MENU = [
 
 
 @st.cache_resource(show_spinner=False)
-def conexion_usuarios():
-    """Conexión única (cacheada) a la base de usuarios de la app."""
-    conn = auth.conectar(ruta_db_usuarios())
+def conexion_usuarios(ruta):
+    """Conexión única (cacheada) a la base de usuarios de la app.
+
+    La ruta entra como argumento para que el caché quede ligado al archivo en uso
+    (y no a la primera base que se abrió en el proceso).
+    """
+    conn = auth.conectar(ruta)
     auth.inicializar_db(conn)
     return conn
 
@@ -1073,6 +1081,86 @@ def cerrar_sesion(conn, motivo="Cierre de sesión del usuario."):
         st.session_state.pop(clave, None)
 
 
+def _descripcion_error_base(error):
+    """Explica en español, y de forma accionable, el error real de la base de usuarios.
+
+    Streamlit reemplaza el mensaje del traceback por «the original error message is
+    redacted»; por eso el motivo se muestra aquí en texto propio.
+    """
+    texto = f"{type(error).__name__}: {error}"
+    bajo = texto.lower()
+    if "no such column" in bajo or "no such table" in bajo:
+        return ("La base de usuarios tiene un **esquema viejo o incompleto**. La app la repara "
+                "sola al arrancar; si este aviso sigue apareciendo, restaura el último respaldo "
+                "de `nemet_usuarios.db`.")
+    if ("readonly" in bajo or "read-only" in bajo or "unable to open database" in bajo
+            or "permission" in bajo or "disk i/o" in bajo):
+        return ("La base de usuarios está en un archivo o carpeta que **no admite escritura** "
+                "(permisos del servidor o disco montado como solo lectura).")
+    if "locked" in bajo or "busy" in bajo:
+        return ("Otra operación está usando la base de usuarios y la dejó **bloqueada**. "
+                "Espera unos segundos y vuelve a intentar el acceso.")
+    if "malformed" in bajo or "not a database" in bajo or "encrypted" in bajo:
+        return ("El archivo de la base de usuarios parece **dañado**. Restaura el último respaldo "
+                "de `nemet_usuarios.db`.")
+    return "Esta es la causa exacta del fallo; pásala a soporte si el problema continúa."
+
+
+def pantalla_error_base(error):
+    """Muestra el motivo real de un fallo de la base de usuarios (sin traceback censurado)."""
+    estilos_marca()
+    cabecera_marca()
+    st.error("🚨 **La app no puede usar la base de usuarios.**\n\n" + _descripcion_error_base(error))
+    st.code(f"{type(error).__name__}: {error}", language="text")
+    info = auth.info_conexion()
+    if info:
+        with st.expander("🔎 Diagnóstico de la base de usuarios", expanded=True):
+            uso = info.get("ruta_en_uso") or "—"
+            if info.get("copia"):
+                uso += "   ← copia temporal: el original no admite escritura"
+            st.markdown(
+                f"- Archivo configurado: `{info.get('ruta_configurada') or '—'}`\n"
+                f"- Archivo en uso: `{uso}`\n"
+                f"- ¿Admite escritura?: {'**no**' if info.get('solo_lectura') else 'sí'}\n"
+                f"- Columnas reparadas al arrancar: {', '.join(info.get('columnas_agregadas') or []) or 'ninguna'}\n"
+                f"- Escrituras rechazadas: {auth.fallos_escritura()}\n"
+                f"- Último error de escritura: `{auth.ultimo_error_escritura() or info.get('error_escritura') or '—'}`")
+            st.caption("Truco útil: en Streamlit Cloud, *Manage app* → *Logs* guarda el detalle completo, "
+                       "pero el texto de arriba ya es la causa exacta.")
+
+
+def avisos_base_de_usuarios():
+    """Avisa, una vez por sesión, de los problemas de escritura o de esquema de la base."""
+    info = auth.info_conexion()
+    if not info:
+        return
+    clave = (info.get("ruta_en_uso"), info.get("copia"), info.get("solo_lectura"),
+             tuple(info.get("columnas_agregadas") or ()), auth.fallos_escritura() > 0)
+    if st.session_state.get("_aviso_base_visto") == clave:
+        return
+    st.session_state["_aviso_base_visto"] = clave
+    agregadas = info.get("columnas_agregadas") or []
+    if agregadas:
+        st.info("🧩 Se actualizó el esquema de la base de usuarios (faltaban: "
+                + ", ".join(f"`{columna}`" for columna in agregadas)
+                + "). El acceso ya funciona con normalidad.")
+    if info.get("copia"):
+        st.warning("⚠️ **La base de usuarios del repositorio no admite escritura** "
+                   f"(`{info.get('ruta_configurada')}`: {info.get('error_escritura') or 'sin permiso'}). "
+                   f"Para no dejar a nadie fuera, la app está usando una copia temporal en "
+                   f"`{info.get('ruta_en_uso')}`.\n\n"
+                   "Los cambios de usuarios y contraseñas de esta sesión **se perderán cuando el "
+                   "servidor se reinicie**. Pide a soporte que revise los permisos del despliegue "
+                   "o que configure `[auth] db` (Secrets) con una ruta escribible.")
+    elif info.get("solo_lectura"):
+        st.error("🚨 **La base de usuarios no admite escrituras ahora mismo y no se pudo usar una "
+                 f"copia**: {info.get('error_escritura') or 'sin permiso'}. Se puede entrar, pero "
+                 "nada se guardará hasta que se resuelva.")
+    if auth.fallos_escritura():
+        st.warning(f"⚠️ {auth.fallos_escritura()} escrituras rechazadas en la base de usuarios. "
+                   f"Último error: `{auth.ultimo_error_escritura() or '—'}`")
+
+
 def pantalla_login(conn, secreto, ttl, aviso_semilla=None):
     """Formulario de acceso. Devuelve None (la sesión se fija y se recarga la app)."""
     estilos_marca()
@@ -1123,12 +1211,17 @@ def pantalla_login(conn, secreto, ttl, aviso_semilla=None):
         entrar = st.form_submit_button("Entrar", type="primary", key="acceso_entrar")
 
     if entrar:
-        datos, mensaje = auth.autenticar(conn, usuario, password, zona=ZONA_HORARIA)
+        try:
+            datos, mensaje = auth.autenticar(conn, usuario, password, zona=ZONA_HORARIA)
+        except (sqlite3.Error, OSError) as error:
+            # Nunca más un cuadro rojo con el mensaje censurado: aquí se ve la causa real.
+            pantalla_error_base(error)
+            datos, mensaje = None, None
         if datos:
             st.session_state["_usuario"] = datos
             _fijar_token(datos, secreto, ttl)
             st.rerun()
-        else:
+        elif mensaje:
             st.error(f"❌ {mensaje}")
 
     st.caption("¿Olvidaste tu contraseña? Pide a un administrador que la restablezca desde el "
@@ -1176,6 +1269,7 @@ def pantalla_cambio_obligatorio(conn, usuario, secreto, ttl):
 def ejecutar_gate_acceso():
     """Punto único de entrada: sin sesión válida no se ejecuta ni un módulo de negocio."""
     conn = CONN
+    avisos_base_de_usuarios()  # esquema reparado, base de solo lectura, escrituras rechazadas…
     aviso_semilla = sembrar_administrador_inicial(conn)
     secreto = auth.secreto_sesion(conn, obtener_secret("auth", "session_secret"))
     ttl = minutos_de_sesion()
@@ -2033,8 +2127,14 @@ def _contenido_prospeccion(inventario):
 # ==========================================
 # ACCESO (se ejecuta antes de tocar cualquier dato)
 # ==========================================
-CONN = conexion_usuarios()
-SESION = ejecutar_gate_acceso()
+# Cualquier fallo de la base de usuarios se explica en pantalla con su motivo real:
+# Streamlit reemplaza el mensaje del traceback por «original error message is redacted».
+try:
+    CONN = conexion_usuarios(ruta_db_usuarios())
+    SESION = ejecutar_gate_acceso()
+except (sqlite3.Error, OSError) as error:
+    pantalla_error_base(error)
+    st.stop()
 
 # ==========================================
 # ESTADO INICIAL

@@ -28,7 +28,9 @@ import json
 import os
 import re
 import secrets
+import shutil
 import sqlite3
+import tempfile
 import threading
 import time
 import unicodedata
@@ -238,13 +240,47 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 """
 
+# Catálogo de columnas de `usuarios`. Sirve para crear la tabla desde cero y para
+# **reparar** bases creadas por versiones anteriores: si al archivo le faltaba una
+# columna (p. ej. `ultimo_acceso`), el UPDATE que hace el inicio de sesión terminaba en
+# `sqlite3.OperationalError` y nadie podía entrar.
+COLUMNAS_USUARIOS = (
+    ("id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
+    ("usuario", "TEXT NOT NULL"),
+    ("usuario_norm", "TEXT NOT NULL UNIQUE"),
+    ("nombre", "TEXT NOT NULL DEFAULT ''"),
+    ("correo", "TEXT NOT NULL DEFAULT ''"),
+    ("rol", "TEXT NOT NULL"),
+    ("password_hash", "TEXT NOT NULL"),
+    ("debe_cambiar", "INTEGER NOT NULL DEFAULT 0"),
+    ("activo", "INTEGER NOT NULL DEFAULT 1"),
+    ("creado_en", "TEXT NOT NULL"),
+    ("creado_por", "TEXT NOT NULL DEFAULT ''"),
+    ("actualizado_en", "TEXT NOT NULL DEFAULT ''"),
+    ("ultimo_acceso", "TEXT NOT NULL DEFAULT ''"),
+    ("password_cambiada_en", "TEXT NOT NULL DEFAULT ''"),
+    ("intentos_fallidos", "INTEGER NOT NULL DEFAULT 0"),
+    ("bloqueado_hasta", "TEXT NOT NULL DEFAULT ''"),
+)
+
+# Columnas que se pueden agregar con ALTER TABLE a una base existente (todas menos la llave).
+COLUMNAS_MIGRABLES = tuple((nombre, definicion) for nombre, definicion in COLUMNAS_USUARIOS
+                           if nombre != "id")
+
+# Estado del proceso sobre la base en uso (para el diagnóstico que muestra la app).
+_INFO_POR_CONEXION = {}      # id(conexión) -> diagnóstico de esa conexión
+_ULTIMA_INFO = {}            # último diagnóstico calculado (lo lee la interfaz)
+_FALLOS_ESCRITURA = 0        # escrituras rechazadas por la base desde que arrancó la app
+_ULTIMO_ERROR_ESCRITURA = ""
+_SECRETO_EN_MEMORIA = ""     # clave de sesiones cuando no se puede guardar en la base
+
 COLUMNAS_PUBLICAS = ("id", "usuario", "nombre", "correo", "rol", "activo", "debe_cambiar",
                      "creado_en", "creado_por", "actualizado_en", "ultimo_acceso",
                      "bloqueado_hasta", "intentos_fallidos")
 
 
-def conectar(ruta):
-    """Abre (creando si hace falta) la base de usuarios. Devuelve la conexión."""
+def _abrir(ruta):
+    """Crea la carpeta, conecta y deja el esquema al día. Devuelve (conexión, columnas reparadas)."""
     carpeta = os.path.dirname(os.path.abspath(ruta))
     if carpeta:
         os.makedirs(carpeta, exist_ok=True)
@@ -255,7 +291,185 @@ def conectar(ruta):
         conn.execute("PRAGMA busy_timeout = 10000")
         conn.executescript(ESQUEMA)
         conn.commit()
+    return conn, asegurar_columnas(conn)
+
+
+def asegurar_columnas(conn):
+    """Agrega a `usuarios` las columnas que falten (bases creadas por versiones anteriores).
+
+    Es idempotente y no revienta el arranque: si la base es de solo lectura no se puede
+    migrar, se anotan los errores y la app lo avisa en pantalla.
+    """
+    agregadas = []
+    try:
+        with _LOCK:
+            existentes = {fila[1] for fila in conn.execute("PRAGMA table_info(usuarios)")}
+            for nombre, definicion in COLUMNAS_MIGRABLES:
+                if nombre in existentes:
+                    continue
+                # ALTER TABLE no admite NOT NULL sin valor por omisión; esas columnas
+                # (usuario, rol, password_hash...) se agregan sin la restricción.
+                if "NOT NULL" in definicion.upper() and "DEFAULT" not in definicion.upper():
+                    definicion = definicion.replace("NOT NULL", "").strip()
+                conn.execute(f"ALTER TABLE usuarios ADD COLUMN {nombre} {definicion}")
+                agregadas.append(nombre)
+            if agregadas:
+                conn.commit()
+    except sqlite3.Error as error:
+        _anotar_error_escritura(error)
+        with _LOCK:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+    return agregadas
+
+
+def _probar_escritura(conn):
+    """Comprueba que la base admita escrituras. Devuelve (ok, error).
+
+    Sin esta comprobación el primer aviso llegaba hasta el UPDATE del inicio de sesión,
+    con un `sqlite3.OperationalError` que Streamlit muestra censurado. Se escribe la
+    cabecera con `PRAGMA user_version` (mismo valor) a propósito: es una escritura real
+    —así SQLite tiene que crear el archivo `-journal` junto a la base, que es justo lo
+    que falla en una carpeta o disco de solo lectura— sin agregar páginas ni tablas.
+    """
+    try:
+        with _LOCK:
+            try:
+                conn.commit()
+            except sqlite3.Error:
+                pass
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            conn.execute(f"PRAGMA user_version = {version}")
+            conn.commit()
+        return True, None
+    except sqlite3.Error as error:
+        with _LOCK:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+        return False, error
+
+
+def _error_de_solo_lectura(error):
+    """True si el error dice que el archivo/carpeta no admite escritura (y no un bloqueo)."""
+    texto = str(error or "").lower()
+    if "locked" in texto or "busy" in texto:
+        return False  # ocupada por otra operación: se reintenta, no es de solo lectura
+    return any(pista in texto for pista in (
+        "readonly", "read-only", "read only", "unable to open database", "permission",
+        "disk i/o error", "attempt to write"))
+
+
+def _copia_escribible(ruta):
+    """Copia la base a una carpeta que sí admita escritura y devuelve la ruta (o None).
+
+    Es la red de seguridad para despliegues donde el archivo del repositorio queda en un
+    sistema de archivos de solo lectura: la app sigue funcionando (con aviso en pantalla)
+    en lugar de dejar a todo el equipo fuera. La copia vive en la carpeta temporal, nunca
+    en el repositorio: así no ensucia el control de versiones ni los respaldos.
+    """
+    if not os.path.exists(ruta):
+        return None
+    candidatas = [os.path.join(tempfile.gettempdir(), "nemet_datos", os.path.basename(ruta))]
+    for destino in candidatas:
+        try:
+            os.makedirs(os.path.dirname(destino), exist_ok=True)
+            shutil.copyfile(ruta, destino)  # copia, nunca mueve: el original queda intacto
+            prueba = sqlite3.connect(destino, timeout=10)
+            try:
+                prueba.execute("PRAGMA journal_mode = DELETE")
+            finally:
+                prueba.close()
+            return destino
+        except (OSError, sqlite3.Error):
+            continue
+    return None
+
+
+def _anotar_error_escritura(error):
+    """Suma un fallo de escritura y guarda el mensaje para el diagnóstico en pantalla."""
+    global _FALLOS_ESCRITURA, _ULTIMO_ERROR_ESCRITURA
+    _FALLOS_ESCRITURA += 1
+    _ULTIMO_ERROR_ESCRITURA = f"{type(error).__name__}: {error}"
+
+
+def _escribir(conn, sql, parametros=()):
+    """Escritura «mejor esfuerzo»: si la base la rechaza, se anota y se continúa.
+
+    Entrar al sistema no puede depender de la bitácora: cuando el archivo es de solo
+    lectura (o le falta una columna) el acceso con credenciales correctas sigue adelante
+    y la app avisa de que los cambios no se están guardando.
+    """
+    try:
+        with _LOCK:
+            conn.execute(sql, parametros)
+            conn.commit()
+        return True
+    except sqlite3.Error as error:
+        _anotar_error_escritura(error)
+        with _LOCK:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+        return False
+
+
+def conectar(ruta, copia_escribible=True):
+    """Abre (creando si hace falta) la base de usuarios. Devuelve la conexión.
+
+    Además deja el esquema al día, comprueba que la base admita escrituras y, si el
+    archivo configurado no se puede escribir (permisos o disco de solo lectura), continúa
+    sobre una copia escribible para que nadie se quede sin poder entrar. `info_conexion()`
+    informa de todo eso y la app lo muestra en pantalla.
+    """
+    ruta = os.fspath(ruta)
+    conn, agregadas = _abrir(ruta)
+    ok, error = _probar_escritura(conn)
+    info = {"ruta_configurada": ruta, "ruta_en_uso": ruta, "copia": False,
+            "solo_lectura": not ok, "columnas_agregadas": list(agregadas),
+            "error_escritura": "" if ok else f"{type(error).__name__}: {error}"}
+    if not ok and copia_escribible and error is not None and _error_de_solo_lectura(error):
+        destino = _copia_escribible(ruta)
+        if destino:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+            conn, agregadas_copia = _abrir(destino)
+            ok_copia, error_copia = _probar_escritura(conn)
+            info.update(ruta_en_uso=destino, copia=True, solo_lectura=not ok_copia,
+                        columnas_agregadas=list(agregadas) + list(agregadas_copia),
+                        error_escritura="" if ok_copia else f"{type(error_copia).__name__}: {error_copia}")
+    global _ULTIMA_INFO
+    _INFO_POR_CONEXION[id(conn)] = dict(info)
+    _ULTIMA_INFO = dict(info)
     return conn
+
+
+def info_conexion(conn=None):
+    """Diagnóstico de la base en uso: ruta real, si admite escritura y columnas reparadas."""
+    if conn is not None:
+        return dict(_INFO_POR_CONEXION.get(id(conn)) or _ULTIMA_INFO)
+    return dict(_ULTIMA_INFO)
+
+
+def ruta_efectiva(conn=None):
+    """Archivo SQLite que se está usando de verdad (puede ser la copia escribible)."""
+    return (info_conexion(conn).get("ruta_en_uso") or None)
+
+
+def fallos_escritura():
+    """Cuántas escrituras ha rechazado la base desde que arrancó el proceso."""
+    return _FALLOS_ESCRITURA
+
+
+def ultimo_error_escritura():
+    """Mensaje del último fallo de escritura (cadena vacía si no hubo ninguno)."""
+    return _ULTIMO_ERROR_ESCRITURA
 
 
 def inicializar_db(conn):
@@ -263,6 +477,8 @@ def inicializar_db(conn):
     with _LOCK:
         conn.executescript(ESQUEMA)
         conn.commit()
+    asegurar_columnas(conn)
+    with _LOCK:
         return int(conn.execute("SELECT COUNT(*) FROM usuarios").fetchone()[0])
 
 
@@ -279,16 +495,31 @@ LIMITE_EVENTOS = 5000  # la bitácora se poda para que el archivo no crezca sin 
 
 
 def registrar_evento(conn, accion, actor="", actor_id=None, objetivo="", detalle="", zona=None):
-    """Bitácora de auditoría. Nunca recibe contraseñas."""
-    with _LOCK:
-        conn.execute(
-            "INSERT INTO eventos (fecha, actor, actor_id, accion, objetivo, detalle) VALUES (?,?,?,?,?,?)",
-            (ahora(zona).isoformat(timespec="seconds"), str(actor or ""),
-             int(actor_id) if actor_id else None, str(accion), str(objetivo or ""), str(detalle or "")))
-        total = int(conn.execute("SELECT COUNT(*) FROM eventos").fetchone()[0])
-        if total > LIMITE_EVENTOS:
-            conn.execute("DELETE FROM eventos WHERE id <= (SELECT MAX(id) - ? FROM eventos)", (LIMITE_EVENTOS,))
-        conn.commit()
+    """Bitácora de auditoría. Nunca recibe contraseñas.
+
+    Es «mejor esfuerzo»: si la base no admite la escritura (solo lectura, bloqueo) se
+    anota el fallo y se sigue; la app lo reporta con `fallos_escritura()` en pantalla en
+    vez de tumbar el inicio de sesión.
+    """
+    try:
+        with _LOCK:
+            conn.execute(
+                "INSERT INTO eventos (fecha, actor, actor_id, accion, objetivo, detalle) VALUES (?,?,?,?,?,?)",
+                (ahora(zona).isoformat(timespec="seconds"), str(actor or ""),
+                 int(actor_id) if actor_id else None, str(accion), str(objetivo or ""), str(detalle or "")))
+            total = int(conn.execute("SELECT COUNT(*) FROM eventos").fetchone()[0])
+            if total > LIMITE_EVENTOS:
+                conn.execute("DELETE FROM eventos WHERE id <= (SELECT MAX(id) - ? FROM eventos)", (LIMITE_EVENTOS,))
+            conn.commit()
+        return True
+    except sqlite3.Error as error:
+        _anotar_error_escritura(error)
+        with _LOCK:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+        return False
 
 
 def listar_eventos(conn, limite=200):
@@ -478,15 +709,13 @@ def autenticar(conn, usuario, password, zona=None):
     valida, rehash = verificar_password(password, fila["password_hash"])
     momento = ahora(zona).isoformat(timespec="seconds")
     if not valida:
-        intentos = int(datos["intentos_fallidos"] or 0) + 1
+        intentos = int(datos.get("intentos_fallidos") or 0) + 1
         bloqueo = ""
         if intentos >= MAX_INTENTOS_FALLIDOS:
             bloqueo = (ahora(zona) + timedelta(minutes=BLOQUEO_MINUTOS)).isoformat(timespec="seconds")
             intentos = 0
-        with _LOCK:
-            conn.execute("UPDATE usuarios SET intentos_fallidos = ?, bloqueado_hasta = ? WHERE id = ?",
-                         (intentos, bloqueo, int(datos["id"])))
-            conn.commit()
+        _escribir(conn, "UPDATE usuarios SET intentos_fallidos = ?, bloqueado_hasta = ? WHERE id = ?",
+                  (intentos, bloqueo, int(datos["id"])))
         detalle = (f"Bloqueo temporal de {BLOQUEO_MINUTOS} min tras {MAX_INTENTOS_FALLIDOS} intentos."
                    if bloqueo else f"Intento fallido {intentos}/{MAX_INTENTOS_FALLIDOS}.")
         registrar_evento(conn, "inicio_sesion_fallido", objetivo=datos["usuario"],
@@ -497,14 +726,12 @@ def autenticar(conn, usuario, password, zona=None):
         return None, "Usuario o contraseña incorrectos."
 
     if rehash:
-        with _LOCK:
-            conn.execute("UPDATE usuarios SET password_hash = ? WHERE id = ?",
-                         (hash_password(password), int(datos["id"])))
-            conn.commit()
-    with _LOCK:
-        conn.execute("UPDATE usuarios SET ultimo_acceso = ?, intentos_fallidos = 0, bloqueado_hasta = '' "
-                     "WHERE id = ?", (momento, int(datos["id"])))
-        conn.commit()
+        _escribir(conn, "UPDATE usuarios SET password_hash = ? WHERE id = ?",
+                  (hash_password(password), int(datos["id"])))
+    # El acceso ya está validado: si esta anotación falla (base de solo lectura) el
+    # usuario entra igual y la app lo avisa; antes, este UPDATE tumbaba el ingreso.
+    _escribir(conn, "UPDATE usuarios SET ultimo_acceso = ?, intentos_fallidos = 0, bloqueado_hasta = '' "
+                    "WHERE id = ?", (momento, int(datos["id"])))
     registrar_evento(conn, "inicio_sesion", actor=datos["usuario"], actor_id=datos["id"],
                      objetivo=datos["usuario"], detalle=f"Rol: {etiqueta_rol(datos['rol'])}.", zona=zona)
     return obtener_usuario(conn, datos["id"]), "Sesión iniciada."
@@ -522,23 +749,31 @@ def secreto_sesion(conn, secreto_configurado=None):
     cada respaldo). Esa clave nunca es una contraseña: si el repositorio pudiera
     ser público, configura `session_secret` en los Secrets.
     """
+    global _SECRETO_EN_MEMORIA
     if secreto_configurado:
         return str(secreto_configurado)
-    with _LOCK:
-        fila = conn.execute("SELECT valor FROM meta WHERE clave = 'secreto_sesiones'").fetchone()
+    try:
+        with _LOCK:
+            fila = conn.execute("SELECT valor FROM meta WHERE clave = 'secreto_sesiones'").fetchone()
         if fila and fila["valor"]:
             return fila["valor"]
-        generado = secrets.token_urlsafe(32)
-        conn.execute("INSERT OR REPLACE INTO meta (clave, valor) VALUES ('secreto_sesiones', ?)", (generado,))
-        conn.commit()
+    except sqlite3.Error as error:
+        _anotar_error_escritura(error)
+    if _SECRETO_EN_MEMORIA:
+        return _SECRETO_EN_MEMORIA
+    generado = secrets.token_urlsafe(32)
+    # Si no se puede guardar (base de solo lectura) la clave vale para esta ejecución:
+    # las sesiones siguen vivas entre recargas y solo se pierden al reiniciar.
+    if not _escribir(conn, "INSERT OR REPLACE INTO meta (clave, valor) VALUES ('secreto_sesiones', ?)", (generado,)):
+        _SECRETO_EN_MEMORIA = generado
     return generado
 
 
 def rotar_secreto_sesion(conn, actor=None, zona=None):
     """Invalida todas las sesiones activas (cambia la clave de firma)."""
-    with _LOCK:
-        conn.execute("DELETE FROM meta WHERE clave = 'secreto_sesiones'")
-        conn.commit()
+    global _SECRETO_EN_MEMORIA
+    _SECRETO_EN_MEMORIA = ""  # la rotación siempre debe producir una clave nueva
+    _escribir(conn, "DELETE FROM meta WHERE clave = 'secreto_sesiones'")
     registrar_evento(conn, "sesiones_revocadas", actor=(actor or {}).get("usuario", ""),
                      actor_id=(actor or {}).get("id"), detalle="Se rotó la clave de firma de sesiones.", zona=zona)
     return secreto_sesion(conn)
