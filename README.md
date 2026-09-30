@@ -32,9 +32,13 @@ Administrador y Editor en el menú **🎯 Prospección Comercial**.
    Nominatim); otras ciudades se ubican con Nominatim. Overpass devuelve hasta 300 fichas
    etiquetadas. Los resultados de consultas iguales se guardan en caché 30 minutos; no hay
    búsquedas en segundo plano.
-   La consulta se intenta en **varios servidores públicos de Overpass, en orden** (kumi.systems,
+   La consulta se intenta en **varios servidores públicos de Overpass** (kumi.systems,
    private.coffee, overpass-api.de, z, lz4 y VK Maps), porque la IP de salida de Streamlit Cloud
-   es compartida y esos servidores limitan por IP. La interfaz indica qué servidor respondió.
+   es compartida y esos servidores limitan por IP. Un **HTTP 429 ya no hace esperar**: se pasa al
+   siguiente servidor de inmediato y solo si **todos** limitan se vuelve una vez, tras la pausa que
+   cada uno pidió en `Retry-After`. La app **recuerda cuál respondió** para empezar por él en la
+   siguiente búsqueda y aparta unos minutos al que acaba de fallar (nunca lo descarta). La interfaz
+   indica qué servidor respondió y, si la búsqueda falla, **qué contestó cada servidor**.
    Si todos aceptan la consulta pero ninguno la termina, se reintenta una vez con la mitad del
    radio y se avisa del cambio.
    Los giros incluyen carpinterías, fabricantes de muebles/mesas, artesanos, tiendas de manualidades,
@@ -115,7 +119,7 @@ repositorio público, cambiarlo a privado no borra el acceso histórico a copias
 | No aparece **🎯 Prospección Comercial** | Comprueba que el cambio esté incorporado en la **rama que despliega Streamlit** y que ese despliegue terminó sin errores. Si se usa `main`, fusiona primero el PR de la funcionalidad. El rol **Usuario** no ve el CRM; accede como Admin/Editor. |
 | Solo aparece el login o falta administrador | Configura `[auth]` en los **Secrets privados** del despliegue. Nunca compartas contraseñas o tokens en un issue, chat o commit. |
 | Al pulsar **Entrar** sale un cuadro rojo `sqlite3.OperationalError` y nadie puede pasar | La app **ya no se queda ahí**: repara sola el esquema (columnas que falten), el ingreso nunca depende de la bitácora y, si `nemet_usuarios.db` no admite escritura, avisa en pantalla y sigue con una **copia temporal** para que puedas entrar. El **motivo exacto** aparece ahora dentro de la app (Streamlit censura el mensaje del traceback) y con más detalle en *Manage app* → *Logs*. Si el aviso persiste, corrige permisos del despliegue o define `[auth] db` con una ruta escribible. |
-| La búsqueda devuelve error o no encuentra negocios | **No es el tamaño de la consulta**: si falla igual con 30 km y todos los giros que con 5 km y una sola carpintería, el problema es el servidor, no el radio. La app ya prueba varios servidores públicos de Overpass y reintenta el límite por IP (HTTP 429), así que pulsa **Reintentar** en el recuadro de alternativas. Si sigue el error, la IP de Streamlit Cloud está limitada/bloqueada de forma temporal: espera unos minutos o revisa el estado en <https://overpass-api.de/api/status>. Mientras tanto usa las **alternativas sin red**: importar un CSV de negocios públicos o **Agregar manualmente**. Ninguna ficha se inventa cuando falla la red. |
+| La búsqueda devuelve error o no encuentra negocios | **No es el tamaño de la consulta**: si falla igual con 30 km y todos los giros que con 5 km y una sola carpintería, el problema es el servidor, no el radio. La app prueba varios servidores públicos de Overpass, cambia de servidor sin esperar cuando uno limita por IP (HTTP 429) y en **🔎 Qué contestó cada servidor** puedes ver el motivo de cada uno; pulsa **Reintentar** en el recuadro de alternativas. Si sigue el error, la IP de Streamlit Cloud está limitada/bloqueada de forma temporal: espera unos minutos o revisa el estado en <https://overpass-api.de/api/status>. Mientras tanto usa las **alternativas sin red**: importar un CSV de negocios públicos o **Agregar manualmente**. Ninguna ficha se inventa cuando falla la red. |
 | Guarda, pero desaparece tras reiniciar | El archivo `Prospectos` se crea en el Excel **del servidor**, no en el teléfono; el disco de Streamlit Cloud es efímero. Exporta CSV regularmente y configura respaldo **solo en un repositorio privado verificable**, con la misma rama/historial. |
 
 ## 🔐 Acceso, roles y administración de usuarios

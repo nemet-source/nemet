@@ -5,6 +5,8 @@ Uso: python tests_prospeccion.py
 """
 import ast
 import csv
+import time
+from email.utils import formatdate
 from io import StringIO
 from pathlib import Path
 import unittest
@@ -351,8 +353,13 @@ class TestReglas(unittest.TestCase):
 
 
 class TestRed(unittest.TestCase):
+    def setUp(self):
+        # La app recuerda qué servidor respondió: cada prueba parte del orden publicado.
+        pros.reiniciar_memoria_servidores()
+
     def tearDown(self):
         pros.ubicar_ciudad.cache_clear()
+        pros.reiniciar_memoria_servidores()
 
     @patch("prospeccion.requests.get")
     def test_geocodificacion_con_corte_mexico_y_ciudades_habituales_sin_peticion(self, get):
@@ -404,8 +411,12 @@ class TestVariosServidoresOverpass(unittest.TestCase):
     """La app corre en Streamlit Cloud: la IP de salida es compartida y los servidores
     públicos limitan por IP, así que un fallo NO puede depender de un solo servidor."""
 
+    def setUp(self):
+        pros.reiniciar_memoria_servidores()
+
     def tearDown(self):
         pros.ubicar_ciudad.cache_clear()
+        pros.reiniciar_memoria_servidores()
 
     CARPINTERIA = {"type": "node", "id": 4242, "lat": 27.49, "lon": -109.94,
                    "tags": {"name": "Carpintería del Sol", "craft": "carpenter",
@@ -421,17 +432,116 @@ class TestVariosServidoresOverpass(unittest.TestCase):
 
     @patch("prospeccion.time.sleep")
     @patch("prospeccion.requests.post")
-    def test_limite_por_ip_reintenta_una_vez_y_cambia_de_servidor(self, post, dormir):
-        """HTTP 429: se espera lo que pide el servidor y, si insiste, se pregunta a otro."""
-        post.side_effect = [respuesta({}, 429, {"Retry-After": "2"}), respuesta({}, 429),
+    def test_limite_por_ip_pregunta_a_otro_servidor_sin_hacer_esperar(self, post, dormir):
+        """HTTP 429: no se pierde tiempo esperando si otro servidor puede responder ya."""
+        post.side_effect = [respuesta({}, 429, {"Retry-After": "2"}),
                             respuesta({"elements": [self.CARPINTERIA]}, 200)]
         fichas = pros.buscar_osm("Ciudad Obregón, Sonora", 5, ("carpinterias",), CATALOGO)
         self.assertEqual([f["Empresa"] for f in fichas], ["Carpintería del Sol"])
-        self.assertEqual(post.call_count, 3)
-        self.assertEqual({pros._servidor_de(c.args[0]) for c in post.call_args_list[:2]},
-                         {"overpass.kumi.systems"}, "el reintento es contra el mismo servidor")
-        self.assertEqual(pros._servidor_de(post.call_args_list[2].args[0]), "overpass.private.coffee")
-        dormir.assert_called_once_with(2.0)
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual([pros._servidor_de(c.args[0]) for c in post.call_args_list],
+                         ["overpass.kumi.systems", "overpass.private.coffee"])
+        dormir.assert_not_called()
+
+    @patch("prospeccion.time.sleep")
+    @patch("prospeccion.requests.post")
+    def test_si_todos_limitan_se_respeta_retry_after_y_se_reintenta_una_vez(self, post, dormir):
+        """Si TODOS limitan por IP, recién entonces se espera el turno que pidió cada uno.
+
+        Se vuelve primero al que pidió menos espera y solo una vez por servidor: la
+        política de Overpass prohíbe insistir antes del `Retry-After`, y una cascada de
+        reintentos dejaría la interfaz colgada.
+        """
+        ultimo = len(pros.OVERPASS_URLS) - 1
+        limites = [respuesta({}, 429, {"Retry-After": "9"}) for _ in pros.OVERPASS_URLS]
+        limites[ultimo] = respuesta({}, 429, {"Retry-After": "1"})  # el que antes tendrá turno
+        post.side_effect = limites + [respuesta({"elements": [self.CARPINTERIA]}, 200)]
+        fichas = pros.buscar_osm("Ciudad Obregón, Sonora", 5, ("carpinterias",), CATALOGO)
+        self.assertEqual([f["Empresa"] for f in fichas], ["Carpintería del Sol"])
+        self.assertEqual(post.call_count, len(pros.OVERPASS_URLS) + 1,
+                         "una sola segunda oportunidad, no una cascada")
+        self.assertEqual(post.call_args_list[-1].args[0], pros.OVERPASS_URLS[ultimo],
+                         "se vuelve primero al servidor que pidió la espera más corta")
+        dormir.assert_called_once()
+        self.assertLessEqual(dormir.call_args.args[0], 1.0, "nunca se espera más de lo pedido")
+        self.assertGreater(dormir.call_args.args[0], 0)
+
+    def test_retry_after_entiende_segundos_fecha_http_y_valores_absurdos(self):
+        """`Retry-After` es válido en segundos o como fecha HTTP; nunca cuelga la búsqueda."""
+        self.assertEqual(pros._espera_tras_429(respuesta({}, 429, {"Retry-After": "3"})), 3.0)
+        self.assertEqual(pros._espera_tras_429(respuesta({}, 429, {"Retry-After": "3600"})),
+                         pros.ESPERA_429_MAX, "una espera larguísima se acota")
+        fecha = formatdate(time.time() + 3, usegmt=True)
+        espera = pros._espera_tras_429(respuesta({}, 429, {"Retry-After": fecha}))
+        self.assertTrue(0 < espera <= 3.0, espera)
+        self.assertEqual(pros._espera_tras_429(respuesta({}, 429, {"Retry-After": "ayer"})),
+                         pros.ESPERA_429_PREDETERMINADA)
+        self.assertEqual(pros._espera_tras_429(respuesta({}, 429)),
+                         pros.ESPERA_429_PREDETERMINADA, "sin cabecera, pausa corta y cortés")
+        pasada = formatdate(time.time() - 60, usegmt=True)
+        self.assertEqual(pros._espera_tras_429(respuesta({}, 429, {"Retry-After": pasada})), 0.0)
+
+    @patch("prospeccion.requests.post")
+    def test_recuerda_el_servidor_que_respondio_y_lo_pregunta_primero(self, post):
+        """El turno libre suele ser del mismo servidor: empezar por él ahorra el fallo."""
+        post.side_effect = [requests.ConnectionError("sin red"), requests.ConnectionError("sin red"),
+                            respuesta({"elements": [self.CARPINTERIA]}, 200)]
+        pros.buscar_osm("Ciudad Obregón, Sonora", 5, ("carpinterias",), CATALOGO)
+        self.assertEqual(pros._servidor_de(post.call_args_list[2].args[0]), "overpass-api.de")
+
+        post.reset_mock(side_effect=True)
+        post.return_value = respuesta({"elements": [self.CARPINTERIA]}, 200)
+        fichas = pros.buscar_osm("Ciudad Obregón, Sonora", 5, ("carpinterias",), CATALOGO)
+        self.assertEqual([f["Empresa"] for f in fichas], ["Carpintería del Sol"])
+        self.assertEqual(post.call_count, 1, "no se repite el recorrido de servidores caídos")
+        self.assertEqual(pros._servidor_de(post.call_args.args[0]), "overpass-api.de")
+
+    @patch("prospeccion.time.sleep")
+    @patch("prospeccion.requests.post")
+    def test_el_servidor_que_limito_por_ip_pasa_al_final_en_la_siguiente_busqueda(self, post, dormir):
+        """No gastar el tiempo del usuario empezando por quien acaba de bloquear esta IP."""
+        post.side_effect = [respuesta({}, 429, {"Retry-After": "30"}),
+                            respuesta({"elements": [self.CARPINTERIA]}, 200)]
+        pros.buscar_osm("Ciudad Obregón, Sonora", 5, ("carpinterias",), CATALOGO)
+
+        post.reset_mock(side_effect=True)
+        post.side_effect = requests.ConnectionError("sin red")  # así se ve el orden completo
+        with self.assertRaises(pros.ErrorBusqueda):
+            pros.buscar_osm("Hermosillo, Sonora", 5, ("carpinterias",), CATALOGO)
+        orden = [pros._servidor_de(c.args[0]) for c in post.call_args_list]
+        self.assertEqual(orden[0], "overpass.private.coffee", "primero el que sí respondió")
+        self.assertEqual(orden[-1], "overpass.kumi.systems", "al final el que limitó por IP")
+        self.assertEqual(sorted(orden), sorted(pros._servidor_de(u) for u in pros.OVERPASS_URLS),
+                         "ningún servidor se descarta ni se pregunta dos veces")
+
+    @patch("prospeccion.requests.post")
+    def test_ningun_servidor_queda_descartado_aunque_todos_hayan_fallado(self, post):
+        """La memoria solo reordena: una búsqueda pedida por una persona siempre se intenta."""
+        post.side_effect = requests.ConnectionError("sin red")
+        with self.assertRaises(pros.ErrorBusqueda):
+            pros.buscar_osm("Ciudad Obregón, Sonora", 5, ("carpinterias",), CATALOGO)
+        self.assertEqual(post.call_count, len(pros.OVERPASS_URLS))
+
+        post.reset_mock(side_effect=True)
+        post.return_value = respuesta({"elements": [self.CARPINTERIA]}, 200)
+        fichas = pros.buscar_osm("Ciudad Obregón, Sonora", 5, ("carpinterias",), CATALOGO)
+        self.assertEqual([f["Empresa"] for f in fichas], ["Carpintería del Sol"])
+        self.assertEqual(post.call_count, 1)
+        self.assertIn(post.call_args.args[0], pros.OVERPASS_URLS)
+
+    def test_la_memoria_de_servidores_no_guarda_consultas_ni_crece_sin_limite(self):
+        """Solo URLs públicas y marcas de tiempo; los enfriamientos vencidos se olvidan."""
+        pros._apartar_servidor("https://ejemplo-vencido.test/api/interpreter", 0)
+        pros._apartar_servidor(pros.OVERPASS_URLS[0], 60)
+        self.assertLessEqual(len(pros._SERVIDORES_EN_ESPERA), 2)
+        for url, vence in pros._SERVIDORES_EN_ESPERA.items():
+            self.assertIsInstance(url, str)
+            self.assertIsInstance(vence, float)
+        self.assertEqual(pros._orden_servidores()[-1], pros.OVERPASS_URLS[0])
+        pros.reiniciar_memoria_servidores()
+        self.assertEqual(pros._SERVIDORES_EN_ESPERA, {})
+        self.assertEqual(pros._orden_servidores(), pros.OVERPASS_URLS,
+                         "sin memoria se usa el orden publicado")
 
     @patch("prospeccion.requests.post")
     def test_servidor_sin_conexion_se_salta_y_se_usa_el_siguiente(self, post):
