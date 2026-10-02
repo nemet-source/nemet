@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Batería de pruebas de acceso y prospección NEMET (17 pruebas).
+"""Batería de pruebas de acceso y prospección NEMET (18 pruebas).
 
 Ejecuta la app real con `streamlit.testing.v1.AppTest` sobre una **copia temporal**
 del proyecto (con su propio Excel y su propia base de usuarios), así que nunca toca
@@ -639,6 +639,56 @@ class TestFlujoAcceso(unittest.TestCase):
         finally:
             os.environ["NEMET_DB_USUARIOS"] = anterior
             os.chmod(copia_ro, 0o644)
+
+    def test_18_si_overpass_falla_la_interfaz_usa_denue_y_no_expone_el_token(self):
+        """El fallo de transporte de OSM activa DENUE si se configuró un token privado."""
+        token = "token-falso-para-prueba"
+        registro = {
+            "Id": "922221", "Nombre": "Carpintería de Prueba DENUE", "Razon_social": "",
+            "Clase_actividad": "Carpintería y fabricación de productos de madera",
+            "Estrato": "6 a 10 personas", "Tipo_vialidad": "CALLE", "Calle": "CENTRAL",
+            "Num_Exterior": "25", "Num_Interior": "", "Colonia": "CENTRO", "CP": "85000",
+            "Ubicacion": "Ciudad Obregón, Cajeme, Sonora", "Telefono": "6441094321",
+            "Correo_e": "", "Sitio_internet": "", "Latitud": "27.49", "Longitud": "-109.94",
+        }
+        candidato = pros._registro_denue_a_candidato(
+            registro, "Ciudad Obregón, Sonora", tuple(pros.SECTORES), ("EPOXY PISOS",),
+            centro=(27.48642, -109.94079))
+        with patch.dict(os.environ, {"NEMET_INEGI_DENUE_TOKEN": token}):
+            with patch("prospeccion.buscar_osm_detallada", side_effect=pros.ErrorBusqueda(
+                    "No hay respuesta de OpenStreetMap/Overpass desde este despliegue.",
+                    (("overpass.kumi.systems", "no respondió a tiempo"),))) as osm:
+                with patch("prospeccion.buscar_denue_detallada", return_value=(
+                        [candidato], {"servidor": "api.inegi.org.mx", "radio_pedido": 30,
+                                      "radio_usado": 5, "avisos": ["DENUE permite un máximo de 5 km."]})) as denue:
+                    at = self.abrir(token=TestFlujoAcceso.token_admin, paso="respaldo DENUE")
+                    self.ir_a(at, "🎯 Prospección Comercial")
+                    at.text_input(key="pros_ciudad").set_value("Obregón (prueba DENUE), Sonora")
+                    at.button(key="pros_buscar").click()
+                    at.run()
+                    self.assertFalse(at.exception, [e.value for e in at.exception])
+                    osm.assert_called_once()
+                    denue.assert_called_once()
+                    self.assertEqual(denue.call_args.args[-1], token)
+                    self.assertTrue(any("OpenStreetMap/Overpass no respondió" in w.value for w in at.warning),
+                                    [w.value for w in at.warning])
+
+                    # La fuente DENUE también se puede elegir directamente sin pasar por Overpass.
+                    at.radio(key="pros_fuente_busqueda").set_value("DENUE (INEGI)")
+                    at.run()
+                    at.button(key="pros_buscar").click()
+                    at.run()
+                    self.assertFalse(at.exception, [e.value for e in at.exception])
+                    self.assertEqual(osm.call_count, 1, "la fuente directa no debe llamar a Overpass")
+                    self.assertEqual(denue.call_count, 2)
+        self.assertFalse(at.error, [e.value for e in at.error])
+        self.assertTrue(any("DENUE (INEGI)" in c.value for c in at.caption),
+                        [c.value for c in at.caption])
+        self.assertTrue(any("Carpintería de Prueba DENUE" in o for s in at.selectbox for o in s.options),
+                        "la ficha de DENUE queda disponible como candidata")
+        render = " ".join([*(c.value for c in at.caption), *(m.value for m in at.markdown),
+                           *(e.value for e in at.error), *(w.value for w in at.warning)])
+        self.assertNotIn(token, render)
 
 
 class _ManejadorOverpass(BaseHTTPRequestHandler):
