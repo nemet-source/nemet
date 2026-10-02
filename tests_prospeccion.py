@@ -598,5 +598,124 @@ class TestVariosServidoresOverpass(unittest.TestCase):
         self.assertEqual(detalle["avisos"], [])
 
 
+class TestDENUE(unittest.TestCase):
+    REGISTRO_CARPINTERIA = {
+        "Id": "987654", "Nombre": "Carpintería del Sol", "Razon_social": "CARPINTERIA DEL SOL SA",
+        "Clase_actividad": "Carpintería y fabricación de productos de madera",
+        "Estrato": "11 a 30 personas", "Tipo_vialidad": "CALLE", "Calle": "BASE",
+        "Num_Exterior": "10", "Num_Interior": "2", "Colonia": "CENTRO", "CP": "85000",
+        "Ubicacion": "CIUDAD OBREGÓN, Cajeme, SONORA", "Telefono": "+52 644 109 4422",
+        "Correo_e": "ventas@carpinteria.example.mx", "Sitio_internet": "carpinteria.example.mx",
+        "Latitud": "27.49000", "Longitud": "-109.94000",
+    }
+
+    def setUp(self):
+        pros.ubicar_ciudad.cache_clear()
+
+    def tearDown(self):
+        pros.ubicar_ciudad.cache_clear()
+
+    def test_consulta_oficial_codifica_token_y_limita_busqueda(self):
+        url = pros.crear_consulta_denue(27.48642, -109.94079, 5, ("carpinterias",), "token/falso?uno")
+        self.assertTrue(url.startswith(pros.DENUE_API_URL + "/Buscar/"))
+        self.assertIn("27.48642,-109.94079/5000/", url)
+        self.assertIn("carpinter", url)
+        self.assertIn("token%2Ffalso%3Funo", url, "el token es un segmento codificado, no una ruta libre")
+        self.assertNotIn("overpass", url)
+        with self.assertRaisesRegex(ValueError, "1 y 5 km"):
+            pros.crear_consulta_denue(27.4, -109.9, 6, ("carpinterias",), "token")
+        with self.assertRaises(ValueError):
+            pros.crear_consulta_denue(27.4, -109.9, 5, (), "token")
+        with self.assertRaises(pros.ErrorBusqueda) as fallo:
+            pros.crear_consulta_denue(27.4, -109.9, 5, ("carpinterias",), "")
+        self.assertIn("[inegi].denue_token", str(fallo.exception))
+        self.assertNotIn("https://", str(fallo.exception))
+
+    @patch("prospeccion.requests.get")
+    @patch("prospeccion.ubicar_ciudad", return_value=(27.48642, -109.94079, "Ciudad Obregón, Sonora"))
+    def test_busca_y_convierte_solo_giros_comerciales_relevantes(self, ubicar, get):
+        get.return_value = respuesta([self.REGISTRO_CARPINTERIA, {
+            "Id": "123", "Nombre": "Panadería Yaqui", "Clase_actividad": "Panificación tradicional",
+            "Latitud": "27.49", "Longitud": "-109.94",
+        }])
+        fichas, detalle = pros.buscar_denue_detallada(
+            "Ciudad Obregón, Sonora", 5, ("carpinterias",), CATALOGO, "token-prueba-no-publicar")
+        ubicar.assert_called_once_with("Ciudad Obregón, Sonora")
+        self.assertEqual(get.call_count, 1)
+        self.assertEqual(get.call_args.kwargs["timeout"], pros.TIEMPO_DENUE)
+        self.assertFalse(get.call_args.kwargs["allow_redirects"], "no reenviar el token en una redirección")
+        self.assertEqual(len(fichas), 1)
+        ficha = fichas[0]
+        self.assertEqual(ficha["Clave"], "denue/987654")
+        self.assertEqual(ficha["Empresa"], "Carpintería del Sol")
+        self.assertEqual(ficha["Segmento"], pros.SECTORES["carpinterias"]["nombre"])
+        self.assertEqual(ficha["Fuente"], pros.FUENTE_DENUE)
+        self.assertEqual(ficha["URL_fuente"], pros.URL_DENUE)
+        self.assertNotIn("token-prueba-no-publicar", ficha["URL_fuente"])
+        self.assertEqual(ficha["Actividad_DENUE"], self.REGISTRO_CARPINTERIA["Clase_actividad"])
+        self.assertEqual(ficha["Estrato_Denue"], "11 a 30 personas")
+        self.assertEqual(ficha["Dirección"], "CALLE BASE 10 Int. 2, CENTRO, C.P. 85000")
+        self.assertEqual(ficha["Ciudad"], "CIUDAD OBREGÓN, Cajeme, SONORA")
+        self.assertEqual(ficha["Teléfono"], "+52 644 109 4422")
+        self.assertEqual(ficha["Correo"], "ventas@carpinteria.example.mx")
+        self.assertEqual(ficha["Sitio_web"], "https://carpinteria.example.mx")
+        self.assertEqual(ficha["Distancia_km"], 0.4)
+        self.assertEqual(ficha["Fuente_perfil"], "", "no inventar perfil ni bonificar tamaño automáticamente")
+        self.assertEqual(detalle["servidor"], "api.inegi.org.mx")
+        self.assertEqual(detalle["radio_usado"], 5.0)
+        self.assertEqual(detalle["avisos"], [])
+
+    @patch("prospeccion.requests.get")
+    @patch("prospeccion.ubicar_ciudad", return_value=(27.48642, -109.94079, "Ciudad Obregón, Sonora"))
+    def test_aplica_el_maximo_oficial_de_5_km_y_lo_informa(self, ubicar, get):
+        get.return_value = respuesta([self.REGISTRO_CARPINTERIA])
+        fichas, detalle = pros.buscar_denue_detallada(
+            "Ciudad Obregón, Sonora", 30, ("carpinterias",), CATALOGO, "token")
+        self.assertEqual(fichas[0]["Distancia_km"], 0.4)
+        self.assertIn("/5000/", get.call_args.args[0])
+        self.assertEqual(detalle["radio_pedido"], 30.0)
+        self.assertEqual(detalle["radio_usado"], 5.0)
+        self.assertTrue(any("máximo de 5 km" in aviso for aviso in detalle["avisos"]))
+
+    @patch("prospeccion.ubicar_ciudad")
+    def test_sin_token_no_hace_geocodificacion_ni_peticion(self, ubicar):
+        with patch("prospeccion.requests.get") as get:
+            with self.assertRaises(pros.ErrorBusqueda) as fallo:
+                pros.buscar_denue_detallada("Ciudad Obregón", 5, ("carpinterias",), CATALOGO, "")
+        self.assertIn("[inegi].denue_token", str(fallo.exception))
+        ubicar.assert_not_called()
+        get.assert_not_called()
+
+    @patch("prospeccion.ubicar_ciudad", return_value=(27.48642, -109.94079, "Ciudad Obregón, Sonora"))
+    def test_errores_de_api_no_exponen_el_token(self, ubicar):
+        secreto = "secreto-falso-denue-123"
+        with patch("prospeccion.requests.get", side_effect=requests.Timeout(
+                f"falló https://proxy:8080/{secreto}")):
+            with self.assertRaises(pros.ErrorBusqueda) as fallo_red:
+                pros.buscar_denue_detallada("Ciudad Obregón", 5, ("carpinterias",), CATALOGO, secreto)
+        self.assertNotIn(secreto, str(fallo_red.exception))
+        self.assertIn("DENUE (INEGI)", str(fallo_red.exception))
+
+        with patch("prospeccion.requests.get", return_value=respuesta({}, status=403)):
+            with self.assertRaises(pros.ErrorBusqueda) as fallo_token:
+                pros.buscar_denue_detallada("Ciudad Obregón", 5, ("carpinterias",), CATALOGO, secreto)
+        self.assertNotIn(secreto, str(fallo_token.exception))
+        self.assertIn("rechazó el token", str(fallo_token.exception))
+        self.assertEqual(fallo_token.exception.intentos,
+                         (("api.inegi.org.mx", "token no válido o sin autorización"),))
+
+    def test_clasificacion_denue_prioriza_la_actividad_sobre_el_nombre(self):
+        self.assertEqual(pros._sector_denue({
+            "Nombre": "Muebles del Mayo", "Clase_actividad": "Fabricación de muebles para el hogar",
+        }), "mobiliario")
+        self.assertEqual(pros._sector_denue({
+            "Nombre": "Pinturas Obregón", "Clase_actividad": "Comercio al por menor de pinturas",
+        }), "distribuidores")
+        self.assertEqual(pros._sector_denue({
+            "Nombre": "Carpintería del Sol", "Clase_actividad": "Servicios de reparación y mantenimiento",
+        }), "carpinterias")
+        self.assertIsNone(pros._sector_denue({"Nombre": "Panadería", "Clase_actividad": "Panificación tradicional"}))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

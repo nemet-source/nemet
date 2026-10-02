@@ -12,7 +12,7 @@ las cuentas y el acceso.
 | 📊 Dashboard & Resumen | Métricas generales (SKUs, clientes, valor del inventario, SKUs por reabastecer). | Admin · Editor · Usuario |
 | 📦 Control de Inventario y Edición | Edición directa de la hoja `Inventario`. `StockActual`, `AlertaStock`, `PrecioBaseSinIVA`, `IVA 16%` y `ValorInventario` se calculan automáticamente al guardar. | Admin · Editor |
 | 👥 Gestión de Clientes | Alta/edición de clientes en la hoja `Clientes`. | Admin · Editor |
-| 🎯 Prospección Comercial | **NEMET PROSPECTOR:** búsqueda, mapa, puntuación explicable, borrador de WhatsApp y agenda comercial en la hoja `Prospectos`; también admite CSV. | Admin · Editor |
+| 🎯 Prospección Comercial | **NEMET PROSPECTOR:** búsqueda OSM con respaldo DENUE (INEGI), mapa, puntuación explicable, borrador de WhatsApp y agenda comercial en la hoja `Prospectos`; también admite CSV. | Admin · Editor |
 | 📏 Cotizador por Área y Milimétrico | Calcula el material necesario (`m² × mm × rendimiento`, con el rendimiento y la proporción A:B de la hoja `Cat_Productos`) y recomienda la presentación más económica. | Admin · Editor · Usuario |
 | 📝 Cotizador Comercial Profesional | Carrito manual por SKU. | Admin · Editor · Usuario |
 | 📋 Historial de Cotizaciones | Consulta, búsqueda y borrado (con confirmación) de folios `COT-AAAA-NNN`. El borrado total es solo para administradores. | Admin · Editor · Usuario |
@@ -41,6 +41,17 @@ Administrador y Editor en el menú **🎯 Prospección Comercial**.
    indica qué servidor respondió y, si la búsqueda falla, **qué contestó cada servidor**.
    Si todos aceptan la consulta pero ninguno la termina, se reintenta una vez con la mitad del
    radio y se avisa del cambio.
+   Si Overpass no responde o no encuentra fichas, la búsqueda usa automáticamente el **DENUE del INEGI**
+   cuando hay token configurado; también se puede elegir DENUE directamente. Es una fuente oficial
+   independiente de Overpass que devuelve nombre, clase de actividad SCIAN, ubicación, estrato de personal
+   ocupado y los contactos empresariales que tenga publicados. La clasificación se basa en la actividad
+   económica del registro (y en el nombre solo cuando esa actividad no permite clasificar); no se deduce
+   que la empresa use resinas ni se bonifica el tamaño automáticamente. La API DENUE requiere un token
+   de INEGI y limita el método geográfico a **5 km**: si se solicitó más, la pantalla informa que consulta
+   únicamente ese máximo alrededor del centro. Configúralo en los Secrets privados como
+   `[inegi].denue_token` o mediante `NEMET_INEGI_DENUE_TOKEN`; no lo escribas en el código ni en el chat.
+   Ciudad Obregón y Hermosillo usan centros conocidos; otras ciudades se ubican con Nominatim, por lo que
+   esas consultas aún requieren disponibilidad de ese servicio.
    Los giros incluyen carpinterías, fabricantes de muebles/mesas, artesanos, tiendas de manualidades,
    decoradores, restauradores, aplicadores de pisos, constructoras, distribuidores, manufactura y
    arquitectura. Un artista o tienda de arte es un **posible** prospecto, no un comprador confirmado.
@@ -99,7 +110,9 @@ tablas grandes quedan opcionales para desplazamiento horizontal. No requiere ins
 **Privacidad y límites:** usa únicamente datos de contacto empresariales publicados o compartidos
 con autorización; no busques números privados ni envíes campañas no solicitadas. Las fichas OSM se
 atribuyen a © OpenStreetMap contributors (ODbL) y enlazan su fuente; la cobertura, exactitud,
-telefonía y actividad pueden ser limitadas. Overpass/Nominatim necesitan salida HTTPS y pueden no
+telefonía y actividad pueden ser limitadas. Los registros DENUE enlazan el portal oficial del INEGI y
+conservan la clase de actividad y el estrato de personal para verificarlos; un registro tampoco demuestra
+que el establecimiento siga operando. Overpass/Nominatim y DENUE necesitan salida HTTPS y pueden no
 estar disponibles; el CSV es alternativa para datos obtenidos lícitamente. Comprueba datos, stock y
 permisos antes de contactar. El Excel/CSV puede contener notas comerciales sensibles: **mantén
 privado el repositorio de respaldos**. A 30/09/2026 `nemet-source/nemet` es **público**: NO lo
@@ -119,7 +132,7 @@ repositorio público, cambiarlo a privado no borra el acceso histórico a copias
 | No aparece **🎯 Prospección Comercial** | Comprueba que el cambio esté incorporado en la **rama que despliega Streamlit** y que ese despliegue terminó sin errores. Si se usa `main`, fusiona primero el PR de la funcionalidad. El rol **Usuario** no ve el CRM; accede como Admin/Editor. |
 | Solo aparece el login o falta administrador | Configura `[auth]` en los **Secrets privados** del despliegue. Nunca compartas contraseñas o tokens en un issue, chat o commit. |
 | Al pulsar **Entrar** sale un cuadro rojo `sqlite3.OperationalError` y nadie puede pasar | La app **ya no se queda ahí**: repara sola el esquema (columnas que falten), el ingreso nunca depende de la bitácora y, si `nemet_usuarios.db` no admite escritura, avisa en pantalla y sigue con una **copia temporal** para que puedas entrar. El **motivo exacto** aparece ahora dentro de la app (Streamlit censura el mensaje del traceback) y con más detalle en *Manage app* → *Logs*. Si el aviso persiste, corrige permisos del despliegue o define `[auth] db` con una ruta escribible. |
-| La búsqueda devuelve error o no encuentra negocios | **No es el tamaño de la consulta**: si falla igual con 30 km y todos los giros que con 5 km y una sola carpintería, el problema es el servidor, no el radio. La app prueba varios servidores públicos de Overpass, cambia de servidor sin esperar cuando uno limita por IP (HTTP 429) y en **🔎 Qué contestó cada servidor** puedes ver el motivo de cada uno; pulsa **Reintentar** en el recuadro de alternativas. Si sigue el error, la IP de Streamlit Cloud está limitada/bloqueada de forma temporal: espera unos minutos o revisa el estado en <https://overpass-api.de/api/status>. Mientras tanto usa las **alternativas sin red**: importar un CSV de negocios públicos o **Agregar manualmente**. Ninguna ficha se inventa cuando falla la red. |
+| La búsqueda devuelve error o no encuentra negocios | **No es necesariamente el radio**: la app prueba varios servidores públicos de Overpass y, si fallan o no hay fichas, usa DENUE (INEGI) cuando está configurado. DENUE necesita el token privado `[inegi].denue_token` y su API permite hasta 5 km por consulta; si aún no tienes token, solicita uno en <https://www.inegi.org.mx/servicios/api_denue.html> y agrégalo a Secrets. Revisa **🔎 Qué contestó cada fuente** para distinguir fallos y pulsa **Reintentar**. Si ambos servicios están caídos, importa un CSV de negocios públicos o **Agrega manualmente**. Ninguna ficha se inventa cuando falla una fuente. |
 | Guarda, pero desaparece tras reiniciar | El archivo `Prospectos` se crea en el Excel **del servidor**, no en el teléfono; el disco de Streamlit Cloud es efímero. Exporta CSV regularmente y configura respaldo **solo en un repositorio privado verificable**, con la misma rama/historial. |
 
 ## 🔐 Acceso, roles y administración de usuarios

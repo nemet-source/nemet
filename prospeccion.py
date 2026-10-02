@@ -1,14 +1,14 @@
 """Descubrimiento y clasificación de negocios para la prospección NEMET.
 
-Usa fichas de negocios publicadas en OpenStreetMap (Overpass + Nominatim)
-o giros declarados en archivos CSV propios.
+Usa fichas de negocios publicadas en OpenStreetMap (Overpass + Nominatim),
+registros comerciales del DENUE (INEGI) o giros declarados en archivos CSV propios.
 El puntaje combina afinidad de giro, señales públicas y perfil con fuente; no predice compras.
 La consulta a Overpass se intenta en varios servidores públicos, porque la IP de salida de
 Streamlit Cloud es compartida y esos servidores limitan por IP: un HTTP 429 pasa al
 siguiente servidor sin esperar y solo se reintenta tras el turno que pidió `Retry-After`.
 La app recuerda cuál respondió para empezar por él la próxima vez y aparta un rato al que
-acaba de fallar; si ninguno responde, la búsqueda termina con un error claro que dice
-servidor por servidor qué pasó, y NUNCA con fichas inventadas.
+acaba de fallar; si ninguno responde, informa qué pasó y puede recurrir al DENUE del INEGI
+cuando hay un token configurado. Si las fuentes fallan, nunca devuelve fichas inventadas.
 Sin Streamlit ni acceso al Excel: las búsquedas, reglas y deduplicación se pueden probar
 sin red ni modificar los datos de la empresa.
 """
@@ -53,6 +53,55 @@ CABECERAS = {
 }
 MAX_RESULTADOS = 300
 FUENTE_OSM = "© OpenStreetMap contributors (ODbL)"
+FUENTE_DENUE = "DENUE (INEGI)"
+URL_DENUE = "https://www.inegi.org.mx/app/mapa/denue/default.aspx"
+DENUE_API_URL = "https://www.inegi.org.mx/app/api/denue/v1/consulta"
+DENUE_RADIO_MAX_KM = 5  # límite oficial del método Buscar del DENUE
+TIEMPO_DENUE = 18
+# Términos estáticos y acotados: nunca se inserta texto libre del formulario en la URL.
+# La API Buscar acepta condiciones separadas por comas y un radio de hasta 5,000 m.
+DENUE_TERMINOS = {
+    "aplicadores": ("pisos", "recubrimientos", "impermeabilizantes", "acabados"),
+    "carpinterias": ("carpintería", "carpintero", "ebanistería", "ebanista"),
+    "mobiliario": ("fabricación de muebles", "fabricante de muebles", "mesas de madera"),
+    "artesanos": ("artesanías", "artesano", "escultura", "tallado de madera", "resina"),
+    "manualidades": ("manualidades", "materiales para manualidades", "mercería"),
+    "decoracion": ("decoración de interiores", "diseño de interiores", "interiorismo"),
+    "restauracion": ("restauración de muebles", "tapicería", "tapicero"),
+    "constructoras": ("constructoras", "construcción", "acabados de construcción"),
+    "distribuidores": ("ferretería", "materiales de construcción", "pinturas", "pisos"),
+    "industria": ("taller industrial", "manufactura", "fabricación"),
+    "arquitectura": ("arquitectura", "arquitectos", "diseño arquitectónico"),
+}
+# Las descripciones de actividad del DENUE son la evidencia principal. Se prueban primero
+# las clases específicas; los nombres se usan solo como respaldo cuando la actividad es
+# demasiado genérica o no viene informada.
+DENUE_PATRONES_ACTIVIDAD = (
+    ("mobiliario", r"\b(?:fabricacion|elaboracion|manufactura) de (?:muebles?|mesas?)\b"),
+    ("restauracion", r"\b(?:tapiceria|tapiceros?|restauracion de muebles|reparacion de muebles)\b"),
+    ("carpinterias", r"\b(?:carpinteria|carpinteros?|ebanisteria|ebanistas?)\b|\bfabricacion de productos de madera\b"),
+    ("manualidades", r"\b(?:manualidades|articulos de merceria|materiales para manualidades)\b"),
+    ("artesanos", r"\b(?:artesanias|artesanos?|escultura|tallado de madera|arte en resina)\b"),
+    ("distribuidores", r"\b(?:ferreteria|madereria|materiales de construccion)\b|\bcomercio al por (?:mayor|menor) de (?:pinturas?|pisos|recubrimientos|madera)\b"),
+    ("arquitectura", r"\b(?:servicios de arquitectura|arquitectos?|despachos? de arquitectura|diseno arquitectonico)\b"),
+    ("decoracion", r"\b(?:decoracion de interiores|diseno de interiores|interiorismo)\b"),
+    ("aplicadores", r"\b(?:colocacion|instalacion) de pisos\b|\b(?:impermeabilizantes?|pintura y otros trabajos de acabados|trabajos de acabados en edificios|aplicacion de recubrimientos)\b"),
+    ("constructoras", r"\b(?:edificacion|construccion de obras|construccion residencial|obra civil|albanileria)\b"),
+    ("industria", r"\b(?:fabricacion|manufactura|industria manufacturera)\b"),
+)
+DENUE_PATRONES_NOMBRE = (
+    ("mobiliario", r"\b(?:fabricante|fabricacion|fabrica|taller) de (?:muebles?|mesas?)\b|\bfabricantes? de mobiliario\b"),
+    ("restauracion", r"\b(?:tapiceria|tapiceros?|restauracion de muebles|restauradores? de muebles)\b"),
+    ("carpinterias", r"\b(?:carpinteria|carpinteros?|ebanisteria|ebanistas?)\b"),
+    ("manualidades", r"\b(?:manualidades|materiales para manualidades|insumos para artesanos)\b"),
+    ("artesanos", r"\b(?:artesanias|artesanos?|escultura|tallado de madera|arte en resina)\b"),
+    ("distribuidores", r"\b(?:ferreteria|madereria|materiales de construccion|tienda de pinturas|distribuidora de pinturas)\b"),
+    ("arquitectura", r"\b(?:despacho de arquitectura|arquitectos?|arquitectura)\b"),
+    ("decoracion", r"\b(?:decoracion|diseno de interiores|interiorismo)\b"),
+    ("aplicadores", r"\b(?:aplicadores? de pisos|pintores?|pisos epoxicos?|recubrimientos epoxicos?)\b"),
+    ("constructoras", r"\b(?:constructoras?|construccion|obra civil|acabados de construccion)\b"),
+    ("industria", r"\b(?:taller industrial|industria manufacturera|manufactura)\b"),
+)
 # Nominatim público: como máximo 1 petición por segundo en este proceso.
 _GEO_LOCK = threading.Lock()
 _ULTIMA_GEO = 0.0
@@ -119,7 +168,7 @@ COLUMNAS = (
     "Fecha_alta", "Estado", "Notas", "Último_contacto",
     "Zona", "Latitud", "Longitud", "Distancia_km", "WhatsApp", "Redes",
     "Productos_negocio", "Tamaño", "Tipo_clientela", "Última_actividad", "Fuente_perfil",
-    "Próximo_seguimiento",
+    "Próximo_seguimiento", "Actividad_DENUE", "Estrato_Denue",
 )
 # Solo estos campos se editan desde la ficha; se comparan antes de escribir para evitar
 # sobrescribir cambios de otra sesión. El puntaje/razón se recalculan al editar el perfil.
@@ -445,7 +494,8 @@ def preparar_mensaje(nombre_vendedor, ficha, producto_elegido=None):
 
 def _candidato(clave, empresa, sector, ciudad, direccion, telefono, correo, sitio, fuente, enlace, catalogo,
                *, whatsapp="", redes="", zona="", latitud=None, longitud=None, centro=None,
-               productos_negocio="", tamano="", clientela="", actividad="", fuente_perfil=""):
+               productos_negocio="", tamano="", clientela="", actividad="", fuente_perfil="",
+               actividad_denue="", estrato_denue=""):
     nombre = texto(empresa, 160)
     if not nombre:
         return None
@@ -465,6 +515,7 @@ def _candidato(clave, empresa, sector, ciudad, direccion, telefono, correo, siti
         "Tamaño": tamano if tamano in TAMANOS[1:] else "",
         "Tipo_clientela": clientela if clientela in CLIENTELAS[1:] else "",
         "Última_actividad": fecha_valida(actividad), "Fuente_perfil": texto(fuente_perfil, 250),
+        "Actividad_DENUE": texto(actividad_denue, 180), "Estrato_Denue": texto(estrato_denue, 60),
         "Fuente": fuente, "URL_fuente": url_publica(enlace),
         "Estado": "Nuevo" if telefono or correo or whatsapp or sitio or redes else "Por investigar",
     })
@@ -872,6 +923,167 @@ def buscar_osm(ciudad, radio_km, sectores, catalogo):
     return fichas
 
 
+def crear_consulta_denue(lat, lon, radio_km, sectores, token):
+    """Construye una consulta cerrada a la API oficial Buscar del DENUE.
+
+    DENUE limita este método a 5,000 m. Los términos vienen exclusivamente del
+    catálogo local de giros y el token se codifica como componente de ruta; nunca
+    se agrega a la ficha ni a mensajes de diagnóstico.
+    """
+    if not sectores or any(sector not in SECTORES for sector in sectores):
+        raise ValueError("Selecciona al menos un giro válido.")
+    if (not isinstance(radio_km, (int, float)) or not math.isfinite(float(radio_km))
+            or not 1 <= radio_km <= DENUE_RADIO_MAX_KM):
+        raise ValueError("El radio de DENUE debe estar entre 1 y 5 km.")
+    centro = coordenadas(lat, lon)
+    if not centro:
+        raise ValueError("Las coordenadas de búsqueda deben estar dentro de México.")
+    token = str(token or "").strip()
+    if not token:
+        raise ErrorBusqueda("DENUE requiere un token del INEGI. Configúralo en los Secrets privados como "
+                            "[inegi].denue_token o en NEMET_INEGI_DENUE_TOKEN.")
+    if len(token) > 256:
+        raise ErrorBusqueda("El token configurado para DENUE no tiene un formato válido.")
+
+    terminos, incluidos = [], set()
+    for sector in sectores:
+        for termino in DENUE_TERMINOS[sector]:
+            clave = normalizar(termino)
+            if clave not in incluidos:
+                incluidos.add(clave)
+                terminos.append(termino)
+    condicion = ",".join(terminos)
+    condicion_segura = quote(condicion, safe=",")
+    latitud, longitud = centro
+    metros = int(round(float(radio_km) * 1000))
+    return (f"{DENUE_API_URL}/Buscar/{condicion_segura}/"
+            f"{latitud:.5f},{longitud:.5f}/{metros}/{quote(token, safe='')}")
+
+
+def _sector_denue(registro):
+    """Clasifica por clase de actividad oficial; solo usa el nombre como segundo respaldo."""
+    actividad = normalizar(registro.get("Clase_actividad"))
+    for sector, patron in DENUE_PATRONES_ACTIVIDAD:
+        if actividad and re.search(patron, actividad):
+            return sector
+    nombre = normalizar(" ".join((str(registro.get("Nombre") or ""),
+                                  str(registro.get("Razon_social") or ""))))
+    for sector, patron in DENUE_PATRONES_NOMBRE:
+        if nombre and re.search(patron, nombre):
+            return sector
+    return None
+
+
+def _registro_denue_a_candidato(registro, ciudad, sectores, catalogo, centro=None):
+    """Adapta un registro oficial sin atribuirle datos que el DENUE no publica."""
+    if not isinstance(registro, dict):
+        return None
+    sector = _sector_denue(registro)
+    if sector not in sectores:
+        return None
+    identificador = texto(registro.get("Id"), 24)
+    if not re.fullmatch(r"[0-9]{1,24}", identificador) or int(identificador) < 1:
+        return None
+    empresa = texto(registro.get("Nombre") or registro.get("Razon_social"), 160)
+    if not empresa:
+        return None
+
+    partes_calle = [texto(registro.get(campo), 100) for campo in ("Tipo_vialidad", "Calle")]
+    calle = " ".join(parte for parte in partes_calle if parte)
+    exterior = texto(registro.get("Num_Exterior"), 30)
+    interior = texto(registro.get("Num_Interior"), 30)
+    direccion = " ".join(parte for parte in (calle, exterior) if parte)
+    if interior:
+        direccion += (" " if direccion else "") + "Int. " + interior
+    colonia = texto(registro.get("Colonia"), 100)
+    codigo_postal = texto(registro.get("CP"), 12)
+    if colonia:
+        direccion += (", " if direccion else "") + colonia
+    if codigo_postal:
+        direccion += (", C.P. " if direccion else "C.P. ") + codigo_postal
+
+    ubicacion = texto(registro.get("Ubicacion"), 120) or texto(ciudad, 120)
+    return _candidato(
+        f"denue/{identificador}", empresa, sector, ubicacion, direccion,
+        registro.get("Telefono", ""), registro.get("Correo_e", ""), registro.get("Sitio_internet", ""),
+        FUENTE_DENUE, URL_DENUE, catalogo,
+        zona=colonia, latitud=registro.get("Latitud"), longitud=registro.get("Longitud"),
+        centro=centro, actividad_denue=registro.get("Clase_actividad", ""),
+        estrato_denue=registro.get("Estrato", ""),
+    )
+
+
+def buscar_denue_detallada(ciudad, radio_km, sectores, catalogo, token):
+    """Busca establecimientos DENUE en línea con respaldo oficial de INEGI.
+
+    La API permite un radio de hasta 5 km. Si la persona pidió un radio mayor, se
+    consulta el máximo permitido y se informa el recorte. Devuelve (fichas, detalle)
+    con el radio realmente usado; nunca persiste los resultados ni incluye el token.
+    """
+    if not sectores or any(sector not in SECTORES for sector in sectores):
+        raise ValueError("Selecciona al menos un giro válido.")
+    if (not isinstance(radio_km, (int, float)) or not math.isfinite(float(radio_km))
+            or not 1 <= radio_km <= 30):
+        raise ValueError("El radio debe estar entre 1 y 30 km.")
+    if not str(token or "").strip():
+        raise ErrorBusqueda("DENUE requiere un token del INEGI. Configúralo en los Secrets privados como "
+                            "[inegi].denue_token o en NEMET_INEGI_DENUE_TOKEN.")
+    radio_usado = min(float(radio_km), float(DENUE_RADIO_MAX_KM))
+    latitud, longitud, nombre_ciudad = ubicar_ciudad(ciudad)
+    url = crear_consulta_denue(latitud, longitud, radio_usado, sectores, token)
+    try:
+        respuesta = requests.get(url, headers=CABECERAS, timeout=TIEMPO_DENUE, allow_redirects=False)
+    except requests.RequestException:
+        raise ErrorBusqueda("No se pudo conectar con DENUE (INEGI). Reintenta en unos minutos.",
+                            (("api.inegi.org.mx", "fallo de conexión o tiempo de espera"),)) from None
+
+    estado = getattr(respuesta, "status_code", 0)
+    if estado != 200:
+        if estado in (401, 403):
+            motivo = "token no válido o sin autorización"
+            mensaje = ("DENUE (INEGI) rechazó el token. Verifica el valor de "
+                       "[inegi].denue_token en los Secrets privados.")
+        elif estado == 429:
+            motivo = "límite temporal de consultas (HTTP 429)"
+            mensaje = "DENUE (INEGI) limitó temporalmente las consultas. Espera unos minutos y reintenta."
+        elif estado in (301, 302, 303, 307, 308):
+            motivo = "redirección inesperada"
+            mensaje = "DENUE (INEGI) devolvió una respuesta inesperada. Reintenta más tarde."
+        else:
+            motivo = f"respuesta HTTP {estado}"
+            mensaje = f"DENUE (INEGI) no está disponible en este momento (HTTP {estado}). Reintenta más tarde."
+        raise ErrorBusqueda(mensaje, (("api.inegi.org.mx", motivo),))
+    try:
+        registros = respuesta.json()
+    except (TypeError, ValueError):
+        raise ErrorBusqueda("La respuesta de DENUE (INEGI) no tiene un formato válido.",
+                            (("api.inegi.org.mx", "respuesta JSON inválida"),)) from None
+    if not isinstance(registros, list):
+        raise ErrorBusqueda("DENUE (INEGI) devolvió datos inesperados; verifica el token y reintenta.",
+                            (("api.inegi.org.mx", "formato de respuesta no reconocido"),))
+
+    resultados = []
+    for registro in registros:
+        ficha = _registro_denue_a_candidato(registro, nombre_ciudad, sectores, catalogo,
+                                            centro=(latitud, longitud))
+        if ficha and (not ficha["Distancia_km"] or ficha["Distancia_km"] <= radio_usado):
+            resultados.append(ficha)
+    resultados.sort(key=lambda prospecto: (-prospecto["Puntaje"], prospecto["Empresa"].casefold()))
+    avisos = []
+    if radio_usado < float(radio_km):
+        avisos.append(f"DENUE permite un máximo de {DENUE_RADIO_MAX_KM} km por consulta; "
+                      f"se buscaron {radio_usado:g} km alrededor del centro.")
+    if len(resultados) > MAX_RESULTADOS:
+        avisos.append(f"Se muestran los primeros {MAX_RESULTADOS} resultados; reduce el radio o elige menos giros.")
+    detalle = {
+        "servidor": "api.inegi.org.mx",
+        "radio_pedido": float(radio_km),
+        "radio_usado": radio_usado,
+        "avisos": avisos,
+    }
+    return resultados[:MAX_RESULTADOS], detalle
+
+
 def candidato_de_archivo(fila, catalogo, ciudad_default=""):
     """Construye una ficha desde CSV con Empresa + Giro/Segmento; sin giro no se clasifica."""
     empresa = texto(fila.get("Empresa"), 160)
@@ -895,6 +1107,7 @@ def candidato_de_archivo(fila, catalogo, ciudad_default=""):
         latitud=fila.get("Latitud"), longitud=fila.get("Longitud"),
         productos_negocio=fila.get("Productos_negocio", ""), tamano=tamano, clientela=clientela,
         actividad=fila.get("Última_actividad", ""), fuente_perfil=fila.get("Fuente_perfil", ""),
+        actividad_denue=fila.get("Actividad_DENUE", ""), estrato_denue=fila.get("Estrato_Denue", ""),
     )
 
 

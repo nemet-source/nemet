@@ -180,3 +180,14 @@ Baterías completas: `tests_prospeccion.py` 35/35 · `tests_flujo_app.py` 17/17 
 4. Para diagnosticar sin tocar Secrets: en la app desplegada no hace falta ningún token; si se
    quiere ver el estado del servicio, `https://overpass-api.de/api/status` es público y se puede
    consultar desde el navegador.
+
+---
+
+## Actualización posterior: alternativa DENUE (INEGI)
+
+La recomendación de este diagnóstico de importar CSV o dar de alta manualmente describe la versión
+anterior. Ahora, si Overpass falla (o no encuentra fichas), la prospección puede consultar el DENUE
+del INEGI como respaldo o fuente directa. La API oficial requiere un token en Secrets privados
+(`[inegi].denue_token`) o `NEMET_INEGI_DENUE_TOKEN`; no lo registres en este documento ni lo
+compartas en el chat. El método geográfico de DENUE admite como máximo 5 km; la interfaz informa
+cuando el radio original debe limitarse. Ninguna ficha se inventa si ambas fuentes fallan.

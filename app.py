@@ -1602,33 +1602,55 @@ def buscar_prospectos_osm(ciudad, radio, sectores, catalogo):
     return pros.buscar_osm_detallada(ciudad, radio, sectores, catalogo)
 
 
-def alternativas_sin_osm():
-    """Si OpenStreetMap no responde, ofrece salidas que NO dependen de la red.
+def token_denue_configurado():
+    """Token privado opcional: nunca se muestra, se persiste ni se manda al navegador."""
+    token = obtener_secret("inegi", "denue_token") or variable_entorno("NEMET_INEGI_DENUE_TOKEN")
+    return str(token).strip() if token else ""
 
-    Nunca se inventan negocios ni contactos: reintentar (ahora contra varios servidores),
-    importar un CSV propio o dar de alta el prospecto a mano.
-    """
+
+def buscar_prospectos_denue(ciudad, radio, sectores, catalogo, token):
+    """Consulta el DENUE bajo demanda; no cachear ni exponer el token de la API."""
+    return pros.buscar_denue_detallada(ciudad, radio, sectores, catalogo, token)
+
+
+def alternativas_sin_osm():
+    """Ofrece una segunda fuente en línea y opciones manuales si Overpass no responde."""
     if not st.session_state.get("pros_fallo_osm"):
         return
+    token = token_denue_configurado()
+    fuente_fallo = st.session_state.get("pros_fallo_fuente", "OpenStreetMap/Overpass")
     with st.container(border=True):
-        st.markdown("#### 🛟 OpenStreetMap no respondió: alternativas sin red")
-        st.caption("Ninguna ficha se inventó ni se guardó. Estas rutas funcionan sin Internet:")
+        st.markdown(f"#### 🛟 {fuente_fallo} no respondió: usa otra fuente")
+        st.caption("Ninguna ficha se inventó ni se guardó. DENUE es una búsqueda en línea independiente; "
+                   "CSV y alta manual siguen disponibles como opciones adicionales.")
         st.markdown(
-            "- **Reintentar**: la búsqueda ya prueba varios servidores públicos de Overpass, "
-            "así que un segundo intento suele bastar.\n"
-            "- **Importar un CSV** de negocios públicos (el bloque se abre solo al final).\n"
-            "- **Agregar el prospecto manualmente** con los datos que ya tengas.")
+            "- **Reintentar**: vuelve a probar la fuente seleccionada; la opción automática recorre "
+            "varios servidores públicos de Overpass.\n"
+            "- **DENUE (INEGI)**: consulta establecimientos registrados a un máximo de 5 km; "
+            "necesita un token configurado en los Secrets privados.\n"
+            "- **Importar un CSV** de negocios públicos o **agregar el prospecto manualmente**.")
+        if token and st.button("🏛️ Buscar directamente en DENUE (INEGI)",
+                               key="pros_buscar_denue", width="stretch"):
+            st.session_state.pop("pros_fallo_osm", None)
+            st.session_state.pop("pros_fallo_detalle", None)
+            st.session_state["pros_forzar_denue"] = True
+            st.rerun()
+        elif not token:
+            st.info("DENUE requiere un token de API del INEGI. Registra uno desde la página oficial "
+                    "de la API y configúralo en Secrets como `[inegi].denue_token` o en la variable "
+                    "`NEMET_INEGI_DENUE_TOKEN`; no lo pegues aquí ni lo subas al repositorio.")
         detalle = st.session_state.get("pros_fallo_detalle") or []
         if detalle:
-            # Solo host y motivo: nunca rutas, parámetros ni texto de excepciones de red.
-            with st.expander("🔎 Qué contestó cada servidor"):
+            # Solo host y motivo redactado por la app: nunca rutas, parámetros ni excepciones crudas.
+            with st.expander("🔎 Qué contestó cada fuente"):
                 st.markdown("\n".join(f"- **{servidor}**: {motivo}" for servidor, motivo in detalle))
-                st.caption("«Límite de peticiones (HTTP 429)» significa que ese servidor "
-                           "reservó su turno para otra IP, no que la consulta esté mal.")
+                st.caption("Un HTTP 429 de Overpass indica un límite temporal por IP; un HTTP 401/403 "
+                           "de DENUE suele indicar que hay que revisar el token privado.")
         if st.button("🔁 Reintentar la búsqueda", key="pros_reintentar", type="primary",
                      width="stretch"):
             st.session_state.pop("pros_fallo_osm", None)
             st.session_state.pop("pros_fallo_detalle", None)
+            st.session_state.pop("pros_fallo_denue", None)
             st.session_state["pros_reintentar"] = True
             st.rerun()
 
@@ -1734,8 +1756,9 @@ def _contenido_prospeccion(inventario):
     st.caption("Buscar → Detectar → Calificar → Contactar → Dar seguimiento → Vender")
     st.write("Busca negocios públicos por ciudad y giro, revisa el mapa y arma tu lista comercial. "
              "**Potencial no significa intención de compra:** comprueba los datos antes de contactar.")
-    st.caption("Fuente: © OpenStreetMap contributors (ODbL). Se consulta solo al pulsar Buscar, sin extraer "
-               "teléfonos privados ni enviar mensajes automáticamente. Un CSV propio también es opcional.")
+    st.caption("Fuentes: © OpenStreetMap contributors (ODbL) y DENUE (INEGI). Si Overpass falla o no hay "
+               "coincidencias, la app puede usar DENUE con un token configurado; la API permite hasta 5 km. "
+               "Solo se consulta al pulsar Buscar; no se extraen teléfonos privados ni se envían mensajes automáticamente.")
     st.caption("🔒 Las notas y contactos SOLO se respaldan en GitHub cuando se confirma que el destino es PRIVADO. "
                "Sin respaldo, los datos del servidor de Streamlit Cloud pueden perderse al reiniciar: exporta el CSV.")
     with st.expander("¿Cómo se califica el potencial?"):
@@ -1746,6 +1769,7 @@ def _contenido_prospeccion(inventario):
                  "Un dato desconocido **no** se inventa ni penaliza. Las recomendaciones usan el inventario real.")
     catalogo = tuple(inventario["Descripcion"].dropna().astype(str).unique()) if "Descripcion" in inventario else ()
 
+    token_denue = token_denue_configurado()
     with st.form("form_busqueda_prospectos"):
         c1, c2 = st.columns([2, 1])
         with c1:
@@ -1757,40 +1781,119 @@ def _contenido_prospeccion(inventario):
         sectores = st.multiselect(
             "Giros a buscar", list(pros.SECTORES), default=list(pros.SECTORES),
             format_func=lambda s: pros.SECTORES[s]["nombre"], key="pros_sectores")
+        if token_denue:
+            fuente_busqueda = st.radio(
+                "Fuente de búsqueda", ("Automática (OSM; DENUE si no responde)", "DENUE (INEGI)"),
+                key="pros_fuente_busqueda", horizontal=True,
+                help="La consulta DENUE requiere token y está limitada a 5 km por la API del INEGI.")
+        else:
+            fuente_busqueda = "Automática (OSM; DENUE si no responde)"
         buscar = st.form_submit_button("🔎 Buscar negocios", key="pros_buscar")
-    # El botón «Reintentar» de las alternativas vuelve a lanzar la misma búsqueda.
+    # Los botones fuera del formulario reusan los valores de búsqueda guardados en sesión.
     reintentar = st.session_state.pop("pros_reintentar", False)
-    if buscar or reintentar:
+    forzar_denue = st.session_state.pop("pros_forzar_denue", False)
+    if buscar or reintentar or forzar_denue:
         st.session_state.pop("pros_resultados", None)  # nunca confundir fichas anteriores con un intento fallido
         st.session_state.pop("pros_fallo_osm", None)
         st.session_state.pop("pros_fallo_detalle", None)
+        st.session_state.pop("pros_fallo_denue", None)
+        st.session_state.pop("pros_fallo_fuente", None)
+        fuente_resultado = pros.FUENTE_OSM
+        aviso_fallback = ""
+        usar_denue = forzar_denue or fuente_busqueda == "DENUE (INEGI)"
+        denue_intentado = False
         try:
-            with st.spinner("Buscando negocios y contrastando con clientes existentes..."):
-                encontrados, detalle = buscar_prospectos_osm(ciudad, radio, tuple(sectores), catalogo)
+            with st.spinner("Consultando fuentes públicas y contrastando con clientes existentes..."):
+                if usar_denue:
+                    denue_intentado = True
+                    encontrados, detalle = buscar_prospectos_denue(
+                        ciudad, radio, tuple(sectores), catalogo, token_denue)
+                    fuente_resultado = pros.FUENTE_DENUE
+                else:
+                    try:
+                        encontrados, detalle = buscar_prospectos_osm(
+                            ciudad, radio, tuple(sectores), catalogo)
+                    except pros.ErrorBusqueda as error_osm:
+                        if not token_denue:
+                            raise
+                        denue_intentado = True
+                        try:
+                            encontrados, detalle = buscar_prospectos_denue(
+                                ciudad, radio, tuple(sectores), catalogo, token_denue)
+                        except pros.ErrorBusqueda as error_denue:
+                            intentos = (tuple(getattr(error_osm, "intentos", ()))
+                                        + tuple(getattr(error_denue, "intentos", ())))
+                            st.session_state["pros_fallo_denue"] = str(error_denue)
+                            raise pros.ErrorBusqueda(
+                                f"{error_osm} DENUE tampoco pudo consultarse: {error_denue}", intentos
+                            ) from None
+                        fuente_resultado = pros.FUENTE_DENUE
+                        aviso_fallback = ("OpenStreetMap/Overpass no respondió; se usó el "
+                                           "Directorio Estadístico Nacional de Unidades Económicas del INEGI.")
+                    else:
+                        if not encontrados and token_denue:
+                            denue_intentado = True
+                            try:
+                                encontrados, detalle = buscar_prospectos_denue(
+                                    ciudad, radio, tuple(sectores), catalogo, token_denue)
+                                fuente_resultado = pros.FUENTE_DENUE
+                                aviso_fallback = ("OpenStreetMap no encontró fichas para estos filtros; "
+                                                   "se consultó el DENUE del INEGI como respaldo.")
+                            except pros.ErrorBusqueda as error_denue:
+                                detalle.setdefault("avisos", []).append(
+                                    f"DENUE no se pudo consultar: {error_denue}")
                 nuevos, repetidos, clientes = nuevos_prospectos(encontrados)
             st.session_state["pros_resultados"] = nuevos
-            st.session_state["pros_origen"] = f"OpenStreetMap · {ciudad.strip()} · {detalle['radio_usado']:g} km"
+            st.session_state["pros_origen"] = (
+                f"{fuente_resultado} · {ciudad.strip()} · {detalle['radio_usado']:g} km")
             st.session_state["pros_version"] = st.session_state.get("pros_version", 0) + 1
             st.info(f"Encontrados: {len(encontrados)} · Nuevos: {len(nuevos)} · "
                     f"Ya guardados: {repetidos} · Ya clientes: {clientes}.")
-            st.caption(f"Servidor consultado: {detalle['servidor']} · fuente: {pros.FUENTE_OSM}")
+            if aviso_fallback:
+                st.warning(aviso_fallback)
+            if fuente_resultado == pros.FUENTE_DENUE:
+                st.caption(f"Fuente: {pros.FUENTE_DENUE} · API oficial del INEGI · "
+                           f"radio usado: {detalle['radio_usado']:g} km · "
+                           f"servidor: {detalle['servidor']}.")
+            else:
+                st.caption(f"Servidor consultado: {detalle['servidor']} · fuente: {pros.FUENTE_OSM}")
             for aviso in detalle.get("avisos", []):
                 st.warning(aviso)
             if not encontrados:
-                st.warning("No hay negocios etiquetados para esos giros en esta zona de OpenStreetMap. "
-                           "Prueba otro radio o importa un CSV de negocios públicos.")
+                if fuente_resultado == pros.FUENTE_DENUE:
+                    st.warning("El DENUE del INEGI no reportó establecimientos que coincidan con esos giros "
+                               "en el radio consultado. Prueba con otro radio o giros.")
+                else:
+                    st.warning("No hay negocios etiquetados para esos giros en esta zona de OpenStreetMap. "
+                               "Prueba otro radio o importa un CSV de negocios públicos.")
             elif len(encontrados) >= pros.MAX_RESULTADOS:
                 st.warning("Se alcanzó el límite de fichas de esta búsqueda. Reduce el radio o elige menos giros "
                            "para descubrir negocios que pudieron quedar fuera.")
-        except (pros.ErrorBusqueda, ValueError) as error:
+        except ValueError as error:
+            st.error(str(error))
+        except pros.ErrorBusqueda as error:
             st.session_state["pros_fallo_osm"] = str(error)
-            # Detalle servidor por servidor para saber si fue límite por IP o falta de red.
+            if usar_denue:
+                st.session_state["pros_fallo_fuente"] = pros.FUENTE_DENUE
+            elif denue_intentado:
+                st.session_state["pros_fallo_fuente"] = "OpenStreetMap/Overpass y DENUE (INEGI)"
+            else:
+                st.session_state["pros_fallo_fuente"] = "OpenStreetMap/Overpass"
+            # Solo se muestra host + motivo redactado; nunca URL ni token de la API.
             st.session_state["pros_fallo_detalle"] = list(getattr(error, "intentos", ()))
             st.error(str(error))
         except Exception as error:
-            st.session_state["pros_fallo_osm"] = f"No se pudo realizar la búsqueda: {error}"
+            if denue_intentado:
+                # Evitar que un error inesperado de requests pueda incluir la URL con token.
+                mensaje = "No se pudo completar la consulta de DENUE (INEGI). Revisa la configuración "
+                mensaje += "privada del token y reintenta; el detalle técnico se oculta por seguridad."
+                st.session_state["pros_fallo_fuente"] = pros.FUENTE_DENUE
+            else:
+                mensaje = f"No se pudo realizar la búsqueda: {error}"
+                st.session_state["pros_fallo_fuente"] = "OpenStreetMap/Overpass"
+            st.session_state["pros_fallo_osm"] = mensaje
             st.session_state["pros_fallo_detalle"] = []
-            st.error(st.session_state["pros_fallo_osm"])
+            st.error(mensaje)
 
     alternativas_sin_osm()
     formulario_prospecto_manual(catalogo, expandido=bool(st.session_state.get("pros_fallo_osm")))
@@ -1862,6 +1965,9 @@ def _contenido_prospeccion(inventario):
                 st.write(f"**Teléfono comercial:** {elegido['Teléfono'] or 'No publicado'} · "
                          f"**Producto recomendado:** {elegido['Productos'] or 'Sin coincidencia en Inventario'}")
                 st.caption(elegido["Motivo"])
+                if elegido.get("Actividad_DENUE") or elegido.get("Estrato_Denue"):
+                    st.caption(f"Actividad oficial DENUE: {elegido.get('Actividad_DENUE') or 'Sin dato'} · "
+                               f"Personal ocupado: {elegido.get('Estrato_Denue') or 'Sin dato'}")
                 destino = pros.enlace_google_maps(elegido)
                 if destino:
                     st.link_button("📍 Abrir ubicación en Google Maps", destino, width="stretch",
@@ -1876,8 +1982,8 @@ def _contenido_prospeccion(inventario):
             elegidos = candidatos if todos else [candidatos[i] for i in elegidos_ids]
         else:
             columnas_vista = ("Empresa", "Segmento", "Prioridad", "Puntaje", "Motivo", "Productos",
-                              "Ciudad", "Zona", "Distancia_km", "Dirección", "Teléfono", "WhatsApp", "Correo",
-                              "Sitio_web", "Redes", "URL_fuente")
+                              "Actividad_DENUE", "Estrato_Denue", "Ciudad", "Zona", "Distancia_km",
+                              "Dirección", "Teléfono", "WhatsApp", "Correo", "Sitio_web", "Redes", "URL_fuente")
             vista = pd.DataFrame([{col: p[col] for col in columnas_vista} for p in candidatos])
             vista["Google_Maps"] = [pros.enlace_google_maps(p) for p in candidatos]
             vista.insert(0, "Guardar", True)
@@ -1985,9 +2091,10 @@ def _contenido_prospeccion(inventario):
                      .groupby(["Ciudad", "Zona"], as_index=False).size().rename(columns={"size": "Negocios"}))
     with st.expander("Ver negocios por ciudad y zona"):
         st.dataframe(resumen_zonas, hide_index=True, width="stretch")
-    visibles = ("Empresa", "Segmento", "Prioridad", "Puntaje", "Productos", "Ciudad", "Zona",
-                "Distancia_km", "Dirección", "Teléfono", "WhatsApp", "Correo", "Sitio_web", "Redes",
-                "URL_fuente", "Fecha_alta", "Estado", "Próximo_seguimiento", "Notas")
+    visibles = ("Empresa", "Segmento", "Prioridad", "Puntaje", "Productos", "Actividad_DENUE",
+                "Estrato_Denue", "Ciudad", "Zona", "Distancia_km", "Dirección", "Teléfono", "WhatsApp",
+                "Correo", "Sitio_web", "Redes", "URL_fuente", "Fecha_alta", "Estado",
+                "Próximo_seguimiento", "Notas")
     with st.expander("Ver tabla detallada (desliza horizontalmente en celular)"):
         tabla = filtrados[list(visibles)].copy()
         tabla["Google_Maps"] = [pros.enlace_google_maps(p) for p in filtrados.to_dict("records")]
@@ -2027,6 +2134,9 @@ def _contenido_prospeccion(inventario):
         st.write(f"**Correo:** {ficha['Correo'] or 'No publicado'} · "
                  f"**Productos NEMET sugeridos:** {ficha['Productos'] or 'Sin coincidencia en inventario'}")
         st.write(f"**Productos/actividad del negocio:** {ficha['Productos_negocio'] or 'Sin dato público'}")
+        if ficha.get("Actividad_DENUE") or ficha.get("Estrato_Denue"):
+            st.write(f"**Actividad oficial DENUE:** {ficha.get('Actividad_DENUE') or 'Sin dato'} · "
+                     f"**Personal ocupado (estrato):** {ficha.get('Estrato_Denue') or 'Sin dato'}")
         st.caption(f"{ficha['Motivo']} · Fuente: {ficha['Fuente']} · "
                    f"Tamaño: {ficha['Tamaño'] or 'Sin dato'} · "
                    f"Clientela: {ficha['Tipo_clientela'] or 'Sin dato'} · "
