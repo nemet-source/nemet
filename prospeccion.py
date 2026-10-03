@@ -58,6 +58,31 @@ URL_DENUE = "https://www.inegi.org.mx/app/mapa/denue/default.aspx"
 DENUE_API_URL = "https://www.inegi.org.mx/app/api/denue/v1/consulta"
 DENUE_RADIO_MAX_KM = 5  # límite oficial del método Buscar del DENUE
 TIEMPO_DENUE = 18
+# El borde del DENUE (Microsoft-IIS/F5) corta las URLs largas: medido en 2026-10, una
+# condición de más de ~280 caracteres responde «Hubo un problema con su solicitud…» o
+# «400 Bad Request - Invalid URL» en vez de atender la consulta. Por eso la búsqueda
+# reparte los giros en varias consultas cortas y nunca arma una URL mayor que este
+# presupuesto (con margen sobre lo medido).
+DENUE_URL_MAX = 250
+# Los tokens del DENUE son códigos cortos (el INEGI los envía por correo; suelen medir
+# 36 caracteres). Un valor mucho más largo o con espacios y comillas delata un copiado
+# defectuoso del secreto: es mejor explicarlo que mandar una URL condenada al rechazo.
+DENUE_TOKEN_MAX = 128
+# Tope de consultas por búsqueda: cada consulta es una petición al servicio del INEGI.
+DENUE_CONSULTAS_MAX = 10
+DENUE_VERIFICACION_METROS = 250
+# Punto denso y conocido (Zócalo de la Ciudad de México) para comprobar la credencial.
+# Solo se usa para verificar que el INEGI acepta la clave; no se muestran sus fichas.
+DENUE_VERIFICACION_CENTRO = (19.43261, -99.13321)
+# Avisos del DENUE que llegan con HTTP 200 y sin JSON:
+#   * «No Autorizado, utilice una clave valida.»  → credencial rechazada (texto plano)
+#   * «Hubo un problema con su solicitud…»        → fallo del servicio (página HTML)
+#   * «Bad Request - Invalid URL»                 → consulta rechazada por su longitud
+_DENUE_AUTORIZACION = re.compile(r"no\s+autorizado|clave\s+v[aá]lida|sin\s+autorizaci[oó]n", re.IGNORECASE)
+_DENUE_ERROR_URL = re.compile(r"bad\s+request|invalid\s+url|request\s+url", re.IGNORECASE)
+_DENUE_ERROR_SERVICIO = re.compile(r"hubo\s+un\s+problema|lamentamos\s+el\s+inconveniente|c[oó]digo\s+de\s+soporte",
+                                   re.IGNORECASE)
+_DENUE_SIN_JSON = object()  # centinela: el cuerpo no se pudo leer como JSON
 # Términos estáticos y acotados: nunca se inserta texto libre del formulario en la URL.
 # La API Buscar acepta condiciones separadas por comas y un radio de hasta 5,000 m.
 DENUE_TERMINOS = {
@@ -280,11 +305,14 @@ class ErrorBusqueda(Exception):
     `intentos` es una lista opcional de (servidor, motivo) para que la pantalla pueda
     mostrar el detalle servidor por servidor. Solo contiene hosts públicos y motivos
     redactados por la app: nunca rutas, parámetros ni texto de excepciones de red.
+    `diagnostico` es un resumen igualmente seguro de la respuesta recibida (estado,
+    tipo de contenido, bytes y forma); nunca incluye el cuerpo, la URL ni el token.
     """
 
-    def __init__(self, mensaje, intentos=()):
+    def __init__(self, mensaje, intentos=(), diagnostico=None):
         super().__init__(mensaje)
         self.intentos = tuple(intentos)
+        self.diagnostico = dict(diagnostico) if diagnostico else {}
 
 
 def normalizar(valor):
@@ -923,12 +951,93 @@ def buscar_osm(ciudad, radio_km, sectores, catalogo):
     return fichas
 
 
+def limpiar_token_denue(token):
+    """Devuelve el token como se pegó, sin comillas ni caracteres invisibles.
+
+    Copiar y pegar desde el correo del INEGI puede arrastrar comillas, espacios o
+    marcas de orden de bytes; se normalizan antes de usarlo en la URL. El valor nunca
+    se registra, ni se muestra, ni viaja al navegador.
+    """
+    valor = unicodedata.normalize("NFKC", str(token if token is not None else ""))
+    valor = "".join(c for c in valor if c not in "\u200b\u200c\u200d\ufeff")
+    valor = valor.strip().strip('"').strip("'").strip()
+    return valor
+
+
+def huella_token_denue(token):
+    """Identificador corto del token configurado: permite compararlo sin exponerlo.
+
+    Sirve para comprobar que el secreto del despliegue es el token que el INEGI envió
+    por correo (misma huella) sin publicar su valor en pantalla, en el chat ni en Git.
+    """
+    valor = limpiar_token_denue(token)
+    if not valor:
+        return "sin token configurado"
+    return f"{hashlib.sha256(valor.encode('utf-8')).hexdigest()[:8]} · {len(valor)} caracteres"
+
+
+def _token_denue_valido(token):
+    """Valida el token privado sin revelar su valor y devuelve la forma ya limpia."""
+    valor = limpiar_token_denue(token)
+    if not valor:
+        raise ErrorBusqueda("DENUE requiere un token del INEGI. Configúralo en los Secrets privados como "
+                            "[inegi].denue_token o en NEMET_INEGI_DENUE_TOKEN.")
+    if (len(valor) > DENUE_TOKEN_MAX
+            or not valor.isascii()
+            or any(ord(caracter) < 33 or ord(caracter) > 126 or caracter in "\"'" for caracter in valor)):
+        raise ErrorBusqueda("El token configurado para DENUE no tiene un formato válido: debe ser una "
+                            "cadena corta y sin espacios (el INEGI lo envía por correo como un código "
+                            "único). Revisa [inegi].denue_token o NEMET_INEGI_DENUE_TOKEN; no lo pegues "
+                            "en el chat ni en el repositorio.")
+    return valor
+
+
+def _terminos_denue(sectores):
+    """Términos estáticos del catálogo local, sin repetir y en orden de aparición."""
+    terminos, incluidos = [], set()
+    for sector in sectores:
+        for termino in DENUE_TERMINOS[sector]:
+            clave = normalizar(termino)
+            if clave not in incluidos:
+                incluidos.add(clave)
+                terminos.append(termino)
+    return terminos
+
+
+def _url_consulta_denue(lat, lon, metros, terminos, token):
+    """URL del método Buscar: la condición va codificada como un solo segmento."""
+    condicion = quote(",".join(terminos), safe=",")
+    return (f"{DENUE_API_URL}/Buscar/{condicion}/"
+            f"{lat:.5f},{lon:.5f}/{int(metros)}/{quote(token, safe='')}")
+
+
+def _lotes_denue(lat, lon, metros, terminos, token):
+    """Reparte los términos en consultas cuya URL quepa en el presupuesto del servicio.
+
+    El DENUE corta las URLs largas antes de atender la consulta (ver DENUE_URL_MAX), así
+    que en vez de una sola consulta gigante —que el servicio rechaza con HTTP 400 o con
+    su página de error— se hacen varias consultas cortas cuya unión se deduplica por Id.
+    """
+    lotes, lote = [], []
+    for termino in terminos:
+        candidato = lote + [termino]
+        if lote and len(_url_consulta_denue(lat, lon, metros, candidato, token)) > DENUE_URL_MAX:
+            lotes.append(lote)
+            lote = [termino]
+        else:
+            lote = candidato
+    if lote:
+        lotes.append(lote)
+    return lotes
+
+
 def crear_consulta_denue(lat, lon, radio_km, sectores, token):
     """Construye una consulta cerrada a la API oficial Buscar del DENUE.
 
-    DENUE limita este método a 5,000 m. Los términos vienen exclusivamente del
-    catálogo local de giros y el token se codifica como componente de ruta; nunca
-    se agrega a la ficha ni a mensajes de diagnóstico.
+    DENUE limita este método a 5,000 m y su borde corta las URLs largas; la búsqueda
+    real reparte los giros en varias consultas con `_lotes_denue`. Los términos vienen
+    exclusivamente del catálogo local de giros y el token se codifica como componente
+    de ruta; nunca se agrega a la ficha ni a mensajes de diagnóstico.
     """
     if not sectores or any(sector not in SECTORES for sector in sectores):
         raise ValueError("Selecciona al menos un giro válido.")
@@ -938,26 +1047,210 @@ def crear_consulta_denue(lat, lon, radio_km, sectores, token):
     centro = coordenadas(lat, lon)
     if not centro:
         raise ValueError("Las coordenadas de búsqueda deben estar dentro de México.")
-    token = str(token or "").strip()
-    if not token:
-        raise ErrorBusqueda("DENUE requiere un token del INEGI. Configúralo en los Secrets privados como "
-                            "[inegi].denue_token o en NEMET_INEGI_DENUE_TOKEN.")
-    if len(token) > 256:
-        raise ErrorBusqueda("El token configurado para DENUE no tiene un formato válido.")
-
-    terminos, incluidos = [], set()
-    for sector in sectores:
-        for termino in DENUE_TERMINOS[sector]:
-            clave = normalizar(termino)
-            if clave not in incluidos:
-                incluidos.add(clave)
-                terminos.append(termino)
-    condicion = ",".join(terminos)
-    condicion_segura = quote(condicion, safe=",")
+    token = _token_denue_valido(token)
     latitud, longitud = centro
     metros = int(round(float(radio_km) * 1000))
-    return (f"{DENUE_API_URL}/Buscar/{condicion_segura}/"
-            f"{latitud:.5f},{longitud:.5f}/{metros}/{quote(token, safe='')}")
+    return _url_consulta_denue(latitud, longitud, metros, _terminos_denue(sectores), token)
+
+
+def _denue_aviso_autorizacion(datos):
+    """¿El cuerpo (objeto JSON) repite el aviso de credencial rechazada del DENUE?"""
+    pendientes = [datos]
+    while pendientes:
+        actual = pendientes.pop()
+        if isinstance(actual, str):
+            if _DENUE_AUTORIZACION.search(actual):
+                return True
+        elif isinstance(actual, dict):
+            pendientes.extend(actual.values())
+        elif isinstance(actual, (list, tuple)):
+            pendientes.extend(actual)
+    return False
+
+
+def _clasificar_respuesta_denue(respuesta):
+    """Traduce la respuesta del DENUE a (registros, problema, diagnóstico).
+
+    `problema` llega vacío cuando hay fichas y, si no, es uno de: `sin_resultados`,
+    `ambiguo`, `autorizacion`, `limite`, `redireccion`, `url`, `servicio` o `formato`.
+    El INEGI responde **HTTP 200** incluso cuando rechaza la credencial: el cuerpo es
+    entonces «No Autorizado, utilice una clave valida.» y no una lista JSON, así que el
+    código de estado no basta para distinguir una autorización fallida. El diagnóstico
+    solo resume estado, tipo de contenido, bytes y forma; nunca el cuerpo ni la URL.
+    """
+    estado = int(getattr(respuesta, "status_code", 0) or 0)
+    cabeceras = getattr(respuesta, "headers", None) or {}
+    try:
+        tipo = str(cabeceras.get("Content-Type", "") or "")
+    except (AttributeError, TypeError):
+        tipo = ""
+    tipo = tipo.split(";")[0].strip().lower() or "desconocido"
+    cuerpo = getattr(respuesta, "text", "")
+    if not isinstance(cuerpo, str):
+        cuerpo = ""
+    contenido = getattr(respuesta, "content", b"")
+    if not isinstance(contenido, (bytes, bytearray)):
+        contenido = cuerpo.encode("utf-8", "replace")
+    diagnostico = {"estado": estado, "tipo_contenido": tipo, "bytes": len(contenido)}
+
+    if estado in (301, 302, 303, 307, 308):
+        diagnostico["forma"] = "redirección"
+        return [], "redireccion", diagnostico
+    if estado in (401, 403):
+        diagnostico["forma"] = "autorización HTTP"
+        return [], "autorizacion", diagnostico
+    if estado == 429:
+        diagnostico["forma"] = "límite de consultas"
+        return [], "limite", diagnostico
+    if estado != 200:
+        if _DENUE_ERROR_URL.search(cuerpo):
+            diagnostico["forma"] = "consulta rechazada por su longitud"
+            return [], "url", diagnostico
+        diagnostico["forma"] = f"HTTP {estado}"
+        return [], "servicio", diagnostico
+
+    try:
+        datos = respuesta.json()
+    except (TypeError, ValueError):
+        datos = _DENUE_SIN_JSON
+    if datos is not _DENUE_SIN_JSON:
+        if isinstance(datos, list):
+            registros = [registro for registro in datos if isinstance(registro, dict)]
+            diagnostico["forma"] = "lista"
+            if len(registros) != len(datos):
+                diagnostico["forma"] = "lista con elementos no reconocidos"
+                return [], "formato", diagnostico
+            if not registros:
+                diagnostico["forma"] = "lista vacía"
+                return [], "sin_resultados", diagnostico
+            return registros, "", diagnostico
+        if isinstance(datos, dict):
+            if _denue_aviso_autorizacion(datos):
+                diagnostico["forma"] = "objeto con aviso de autorización"
+                return [], "autorizacion", diagnostico
+            if not datos:
+                diagnostico["forma"] = "objeto vacío"
+                return [], "ambiguo", diagnostico
+            diagnostico["forma"] = "objeto"
+            diagnostico["claves"] = sorted(str(clave) for clave in datos)[:4]
+            return [], "formato", diagnostico
+        if isinstance(datos, (int, float, bool)) or datos is None:
+            # Un `null` o un valor suelto no distingue «sin coincidencias» de una
+            # credencial rechazada: se resuelve con la consulta de verificación.
+            diagnostico["forma"] = "nulo" if datos is None else "valor simple"
+            return [], "ambiguo", diagnostico
+        if _DENUE_AUTORIZACION.search(str(datos)):
+            diagnostico["forma"] = "texto JSON con aviso de autorización"
+            return [], "autorizacion", diagnostico
+        diagnostico["forma"] = "texto JSON"
+        return [], "formato", diagnostico
+
+    # El cuerpo no es JSON: el DENUE usa texto plano y páginas HTML para sus avisos.
+    if not cuerpo.strip():
+        diagnostico["forma"] = "vacío"
+        return [], "ambiguo", diagnostico
+    if _DENUE_AUTORIZACION.search(cuerpo):
+        diagnostico["forma"] = "texto sin JSON"
+        return [], "autorizacion", diagnostico
+    if _DENUE_ERROR_URL.search(cuerpo):
+        diagnostico["forma"] = "consulta rechazada por su longitud"
+        return [], "url", diagnostico
+    if (_DENUE_ERROR_SERVICIO.search(cuerpo) or tipo == "text/html"
+            or cuerpo.lstrip().startswith("<")):
+        diagnostico["forma"] = "página de error sin JSON"
+        return [], "servicio", diagnostico
+    diagnostico["forma"] = "texto sin JSON"
+    return [], "formato", diagnostico
+
+
+def _error_denue(problema, diagnostico, token):
+    """Mensaje y motivo (host + causa) para cada problema del DENUE, sin datos sensibles."""
+    motivo = {
+        "autorizacion": "token no válido o sin autorización",
+        "limite": "límite temporal de consultas (HTTP 429)",
+        "redireccion": "redirección inesperada",
+        "url": "consulta rechazada por su longitud",
+        "servicio": "error del servicio del INEGI",
+        "formato": "formato de respuesta no reconocido",
+    }.get(problema, f"respuesta HTTP {diagnostico.get('estado', 0)}")
+    if problema == "autorizacion":
+        huella = huella_token_denue(token)
+        if diagnostico.get("estado") in (401, 403):
+            mensaje = (f"DENUE (INEGI) rechazó el token (HTTP {diagnostico.get('estado')}). Comprueba que "
+                       "[inegi].denue_token o NEMET_INEGI_DENUE_TOKEN sea el token que el INEGI envió por "
+                       f"correo (huella configurada: {huella}); no lo pegues en el chat ni en el repositorio.")
+        else:
+            # El DENUE contesta HTTP 200 con «No Autorizado, utilice una clave valida.»: el
+            # código de estado no delata el rechazo, lo delata el cuerpo.
+            mensaje = ("DENUE (INEGI) rechazó el token: el servicio respondió que la clave no es válida "
+                       "con HTTP 200 y texto plano, no con un error HTTP. Comprueba que [inegi].denue_token "
+                       "o NEMET_INEGI_DENUE_TOKEN sea el token que el INEGI envió por correo "
+                       f"(huella configurada: {huella}); no lo pegues en el chat ni en el repositorio.")
+    elif problema == "limite":
+        mensaje = "DENUE (INEGI) limitó temporalmente las consultas. Espera unos minutos y reintenta."
+    elif problema == "redireccion":
+        mensaje = ("DENUE (INEGI) intentó redirigir la consulta y no se reenvía el token a otra "
+                   "dirección. Reintenta más tarde.")
+    elif problema == "url":
+        mensaje = ("DENUE (INEGI) rechazó la dirección de la consulta (HTTP 400): el servicio corta las "
+                   "consultas muy largas. Reintenta con menos giros si vuelve a ocurrir.")
+    elif problema == "formato":
+        mensaje = ("DENUE (INEGI) devolvió una respuesta con un formato que no se reconoce "
+                   f"(HTTP {diagnostico.get('estado', 0)} · "
+                   f"{diagnostico.get('tipo_contenido', 'desconocido')} · "
+                   f"{diagnostico.get('forma', 'sin forma')}). No se inventó ninguna ficha; reintenta "
+                   "más tarde o usa otra fuente.")
+    else:
+        mensaje = (f"DENUE (INEGI) no está disponible en este momento "
+                   f"(HTTP {diagnostico.get('estado', 0)}). Reintenta más tarde.")
+    return ErrorBusqueda(mensaje, (("api.inegi.org.mx", motivo),), diagnostico)
+
+
+def _consulta_denue(lat, lon, metros, terminos, token):
+    """Hace una consulta corta del método Buscar y traduce su respuesta."""
+    url = _url_consulta_denue(lat, lon, metros, terminos, token)
+    try:
+        respuesta = requests.get(url, headers=CABECERAS, timeout=TIEMPO_DENUE, allow_redirects=False)
+    except requests.RequestException:
+        raise ErrorBusqueda("No se pudo conectar con DENUE (INEGI). Reintenta en unos minutos.",
+                            (("api.inegi.org.mx", "fallo de conexión o tiempo de espera"),)) from None
+    return _clasificar_respuesta_denue(respuesta)
+
+
+def verificar_credencial_denue(token, lat=None, lon=None):
+    """Comprueba con una consulta mínima si el INEGI acepta la credencial configurada.
+
+    Consulta «todos» en un punto denso (Zócalo de la Ciudad de México, o las coordenadas
+    recibidas) para distinguir «el token no está autorizado» de «no hay coincidencias»,
+    porque el DENUE responde HTTP 200 en ambos casos. Devuelve
+    (estado, mensaje, diagnóstico) con estado `aceptado`, `rechazado`, `indeterminado`,
+    `limite`, `servicio` o `red`. Nunca devuelve el token ni la URL.
+    """
+    token = _token_denue_valido(token)
+    centro = coordenadas(lat, lon) if lat is not None and lon is not None else None
+    latitud, longitud = centro if centro else DENUE_VERIFICACION_CENTRO
+    registros, problema, diagnostico = _consulta_denue(
+        float(latitud), float(longitud), DENUE_VERIFICACION_METROS, ("todos",), token)
+    if problema in ("", "sin_resultados"):
+        return "aceptado", ("El INEGI aceptó la credencial configurada: respondió con datos del DENUE "
+                            f"(huella: {huella_token_denue(token)})."), diagnostico
+    if problema == "autorizacion":
+        return "rechazado", ("El INEGI rechazó la credencial: respondió que la clave no es válida "
+                             f"(HTTP {diagnostico.get('estado', 200)}, sin datos). La huella configurada "
+                             f"es {huella_token_denue(token)}; compárala con el token del correo del INEGI "
+                             "y, si el valor estuvo expuesto, solicita uno nuevo."), diagnostico
+    if problema == "limite":
+        return "limite", "El INEGI limitó temporalmente las consultas; reintenta la verificación después.", diagnostico
+    if problema == "ambiguo":
+        estado = int(diagnostico.get("estado", 0) or 0)
+        if estado == 200:
+            mensaje = ("El INEGI respondió sin datos y sin el aviso de credencial rechazada: no se pudo "
+                       f"confirmar la credencial (huella: {huella_token_denue(token)}).")
+        else:
+            mensaje = "El INEGI no respondió como se esperaba al verificar la credencial."
+        return "indeterminado", mensaje, diagnostico
+    return "servicio", ("El INEGI no pudo atender la verificación de la credencial en este momento. "
+                        "Reintenta más tarde."), diagnostico
 
 
 def _sector_denue(registro):
@@ -1016,71 +1309,78 @@ def _registro_denue_a_candidato(registro, ciudad, sectores, catalogo, centro=Non
 def buscar_denue_detallada(ciudad, radio_km, sectores, catalogo, token):
     """Busca establecimientos DENUE en línea con respaldo oficial de INEGI.
 
-    La API permite un radio de hasta 5 km. Si la persona pidió un radio mayor, se
-    consulta el máximo permitido y se informa el recorte. Devuelve (fichas, detalle)
-    con el radio realmente usado; nunca persiste los resultados ni incluye el token.
+    La API permite un radio de hasta 5 km y su borde corta las URLs largas (ver
+    DENUE_URL_MAX), así que los giros se reparten en varias consultas cortas cuya unión
+    se deduplica por Id. Si una consulta combinada no devuelve fichas, se reintenta giro
+    por giro (por si el servicio exige que coincidan todas las palabras). Devuelve
+    (fichas, detalle) con el radio realmente usado; nunca persiste los resultados ni
+    incluye el token en mensajes, fichas o diagnóstico.
     """
     if not sectores or any(sector not in SECTORES for sector in sectores):
         raise ValueError("Selecciona al menos un giro válido.")
     if (not isinstance(radio_km, (int, float)) or not math.isfinite(float(radio_km))
             or not 1 <= radio_km <= 30):
         raise ValueError("El radio debe estar entre 1 y 30 km.")
-    if not str(token or "").strip():
-        raise ErrorBusqueda("DENUE requiere un token del INEGI. Configúralo en los Secrets privados como "
-                            "[inegi].denue_token o en NEMET_INEGI_DENUE_TOKEN.")
+    token = _token_denue_valido(token)
     radio_usado = min(float(radio_km), float(DENUE_RADIO_MAX_KM))
     latitud, longitud, nombre_ciudad = ubicar_ciudad(ciudad)
-    url = crear_consulta_denue(latitud, longitud, radio_usado, sectores, token)
-    try:
-        respuesta = requests.get(url, headers=CABECERAS, timeout=TIEMPO_DENUE, allow_redirects=False)
-    except requests.RequestException:
-        raise ErrorBusqueda("No se pudo conectar con DENUE (INEGI). Reintenta en unos minutos.",
-                            (("api.inegi.org.mx", "fallo de conexión o tiempo de espera"),)) from None
+    metros = int(round(radio_usado * 1000))
+    pendientes = _lotes_denue(latitud, longitud, metros, _terminos_denue(sectores), token)
 
-    estado = getattr(respuesta, "status_code", 0)
-    if estado != 200:
-        if estado in (401, 403):
-            motivo = "token no válido o sin autorización"
-            mensaje = ("DENUE (INEGI) rechazó el token. Verifica el valor de "
-                       "[inegi].denue_token en los Secrets privados.")
-        elif estado == 429:
-            motivo = "límite temporal de consultas (HTTP 429)"
-            mensaje = "DENUE (INEGI) limitó temporalmente las consultas. Espera unos minutos y reintenta."
-        elif estado in (301, 302, 303, 307, 308):
-            motivo = "redirección inesperada"
-            mensaje = "DENUE (INEGI) devolvió una respuesta inesperada. Reintenta más tarde."
-        else:
-            motivo = f"respuesta HTTP {estado}"
-            mensaje = f"DENUE (INEGI) no está disponible en este momento (HTTP {estado}). Reintenta más tarde."
-        raise ErrorBusqueda(mensaje, (("api.inegi.org.mx", motivo),))
-    try:
-        registros = respuesta.json()
-    except (TypeError, ValueError):
-        raise ErrorBusqueda("La respuesta de DENUE (INEGI) no tiene un formato válido.",
-                            (("api.inegi.org.mx", "respuesta JSON inválida"),)) from None
-    if not isinstance(registros, list):
-        raise ErrorBusqueda("DENUE (INEGI) devolvió datos inesperados; verifica el token y reintenta.",
-                            (("api.inegi.org.mx", "formato de respuesta no reconocido"),))
+    fichas_por_id, avisos, consultas, verificacion = {}, [], 0, ""
+    diagnostico = {}
+    while pendientes and consultas < DENUE_CONSULTAS_MAX:
+        lote = pendientes.pop(0)
+        consultas += 1
+        registros, problema, diagnostico = _consulta_denue(latitud, longitud, metros, lote, token)
+        for registro in registros:
+            ficha = _registro_denue_a_candidato(registro, nombre_ciudad, sectores, catalogo,
+                                                centro=(latitud, longitud))
+            if ficha and (not ficha["Distancia_km"] or ficha["Distancia_km"] <= radio_usado):
+                fichas_por_id[ficha["Clave"]] = ficha
+        if not problema:
+            continue
+        if problema == "ambiguo" and not verificacion:
+            estado, verificacion, diagnostico_verificacion = verificar_credencial_denue(
+                token, latitud, longitud)
+            consultas += 1
+            diagnostico = dict(diagnostico_verificacion)
+            diagnostico["verificacion"] = verificacion
+            problema = {"aceptado": "sin_resultados", "rechazado": "autorizacion", "limite": "limite",
+                        "servicio": "servicio"}.get(estado, "formato")
+        if problema == "sin_resultados":
+            # El servicio puede exigir que coincidan todas las palabras de la condición;
+            # si la combinación no devolvió nada, se pregunta giro por giro (con tope).
+            if len(lote) > 1 and consultas + len(lote) <= DENUE_CONSULTAS_MAX:
+                pendientes[:0] = [[termino] for termino in lote]
+                avisos.append("La consulta combinada de giros no devolvió fichas; se repitió giro por giro "
+                              "para no descartar coincidencias.")
+            continue
+        if problema == "red":
+            raise ErrorBusqueda("No se pudo conectar con DENUE (INEGI). Reintenta en unos minutos.",
+                                (("api.inegi.org.mx", "fallo de conexión o tiempo de espera"),), diagnostico)
+        raise _error_denue(problema, diagnostico, token)
 
-    resultados = []
-    for registro in registros:
-        ficha = _registro_denue_a_candidato(registro, nombre_ciudad, sectores, catalogo,
-                                            centro=(latitud, longitud))
-        if ficha and (not ficha["Distancia_km"] or ficha["Distancia_km"] <= radio_usado):
-            resultados.append(ficha)
-    resultados.sort(key=lambda prospecto: (-prospecto["Puntaje"], prospecto["Empresa"].casefold()))
-    avisos = []
+    resultados = sorted(fichas_por_id.values(),
+                        key=lambda prospecto: (-prospecto["Puntaje"], prospecto["Empresa"].casefold()))
     if radio_usado < float(radio_km):
         avisos.append(f"DENUE permite un máximo de {DENUE_RADIO_MAX_KM} km por consulta; "
                       f"se buscaron {radio_usado:g} km alrededor del centro.")
+    if pendientes:
+        avisos.append(f"Se alcanzó el tope de {DENUE_CONSULTAS_MAX} consultas al DENUE; "
+                      "reduce los giros para cubrirlos todos.")
     if len(resultados) > MAX_RESULTADOS:
         avisos.append(f"Se muestran los primeros {MAX_RESULTADOS} resultados; reduce el radio o elige menos giros.")
     detalle = {
         "servidor": "api.inegi.org.mx",
         "radio_pedido": float(radio_km),
         "radio_usado": radio_usado,
+        "consultas": consultas,
         "avisos": avisos,
+        "huella_token": huella_token_denue(token),
     }
+    if diagnostico:
+        detalle["diagnostico"] = diagnostico
     return resultados[:MAX_RESULTADOS], detalle
 
 

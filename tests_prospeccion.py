@@ -5,6 +5,7 @@ Uso: python tests_prospeccion.py
 """
 import ast
 import csv
+import json
 import time
 from email.utils import formatdate
 from io import StringIO
@@ -715,6 +716,293 @@ class TestDENUE(unittest.TestCase):
             "Nombre": "Carpintería del Sol", "Clase_actividad": "Servicios de reparación y mantenimiento",
         }), "carpinterias")
         self.assertIsNone(pros._sector_denue({"Nombre": "Panadería", "Clase_actividad": "Panificación tradicional"}))
+
+
+def respuesta_denue(cuerpo, status=200, tipo="application/json"):
+    """Respuesta HTTP simulada del DENUE con cuerpo real (texto o JSON) y cabeceras.
+
+    Reproduce lo observado en el servicio: el rechazo de la credencial llega con
+    HTTP 200 y `text/plain`, y los fallos de borde con `text/html`.
+    """
+    r = Mock()
+    r.status_code = status
+    r.headers = {"Content-Type": tipo}
+    if isinstance(cuerpo, (bytes, bytearray)):
+        contenido = bytes(cuerpo)
+    elif isinstance(cuerpo, str):
+        contenido = cuerpo.encode("utf-8")
+    else:  # dict/list: se serializa como JSON, no con la representación de Python
+        contenido = json.dumps(cuerpo).encode("utf-8")
+    r.content = contenido
+    r.text = contenido.decode("utf-8", "replace")
+    r.json.side_effect = lambda: json.loads(r.text)
+    return r
+
+
+class TestDENUERespuestasReales(unittest.TestCase):
+    """Manejo de las respuestas que el DENUE del INEGI devuelve de verdad.
+
+    El servicio contesta HTTP 200 aunque rechace la credencial («No Autorizado, utilice
+    una clave valida.»), y además corta las URLs largas con `400 Bad Request - Invalid
+    URL` o con su página «Hubo un problema con su solicitud». Ninguna de esas
+    respuestas es una lista JSON, así que el manejo debe explicarlas sin culpar al
+    token cuando el problema es otro.
+    """
+
+    REGISTRO = {
+        "Id": "555001", "Nombre": "Pisos y Recubrimientos del Yaqui", "Razon_social": "",
+        "Clase_actividad": "Comercio al por menor de pisos y recubrimientos",
+        "Estrato": "6 a 10 personas", "Calle": "MIGUEL ALEMAN", "Num_Exterior": "120",
+        "Colonia": "CENTRO", "CP": "85000", "Ubicacion": "CIUDAD OBREGÓN, Cajeme, SONORA",
+        "Latitud": "27.48800", "Longitud": "-109.93900",
+    }
+    CIUDAD = "Ciudad Obregón, Sonora"
+    TOKEN = "token-de-prueba-no-publicar"
+
+    def setUp(self):
+        pros.ubicar_ciudad.cache_clear()
+
+    def tearDown(self):
+        pros.ubicar_ciudad.cache_clear()
+
+    def _buscar(self, get, sectores=("aplicadores",), radio=5, token=None):
+        return pros.buscar_denue_detallada(self.CIUDAD, radio, sectores, CATALOGO,
+                                           self.TOKEN if token is None else token)
+
+    @patch("prospeccion.requests.get")
+    @patch("prospeccion.ubicar_ciudad", return_value=(27.48642, -109.94079, "Ciudad Obregón, Sonora"))
+    def test_aviso_no_autorizado_con_http_200_se_explica_como_credencial_rechazada(self, ubicar, get):
+        get.return_value = respuesta_denue("No Autorizado, utilice una clave valida. ", tipo="text/plain")
+        with self.assertRaises(pros.ErrorBusqueda) as fallo:
+            self._buscar(get)
+        mensaje = str(fallo.exception)
+        self.assertIn("rechazó el token", mensaje)
+        self.assertIn("HTTP 200", mensaje, "debe decir que el rechazo llegó sin error HTTP")
+        self.assertIn(pros.huella_token_denue(self.TOKEN), mensaje,
+                      "la huella permite comparar el secreto sin publicarlo")
+        self.assertNotIn(self.TOKEN, mensaje)
+        self.assertNotIn("api.inegi.org.mx/app/api", mensaje, "nunca la URL completa")
+        self.assertNotIn("datos inesperados", mensaje)
+        self.assertEqual(fallo.exception.intentos,
+                         (("api.inegi.org.mx", "token no válido o sin autorización"),))
+        self.assertEqual(fallo.exception.diagnostico.get("estado"), 200)
+        self.assertEqual(fallo.exception.diagnostico.get("tipo_contenido"), "text/plain")
+        self.assertEqual(fallo.exception.diagnostico.get("forma"), "texto sin JSON")
+        self.assertGreater(fallo.exception.diagnostico.get("bytes", 0), 0)
+
+    @patch("prospeccion.requests.get")
+    @patch("prospeccion.ubicar_ciudad", return_value=(27.48642, -109.94079, "Ciudad Obregón, Sonora"))
+    def test_el_mismo_aviso_llega_a_veces_como_json_cadena_o_como_objeto(self, ubicar, get):
+        for cuerpo in ('"No Autorizado, utilice una clave valida."',
+                       '{"message": "No Autorizado, utilice una clave valida."}',
+                       '{"Mensaje": ["No autorizado, utilice una clave valida."]}'):
+            with self.subTest(cuerpo=cuerpo):
+                get.return_value = respuesta_denue(cuerpo)
+                with self.assertRaises(pros.ErrorBusqueda) as fallo:
+                    self._buscar(get)
+                self.assertIn("rechazó el token", str(fallo.exception))
+                self.assertNotIn(self.TOKEN, str(fallo.exception))
+
+    @patch("prospeccion.requests.get")
+    @patch("prospeccion.ubicar_ciudad", return_value=(27.48642, -109.94079, "Ciudad Obregón, Sonora"))
+    def test_la_pagina_de_error_del_inegi_no_culpa_al_token(self, ubicar, get):
+        get.return_value = respuesta_denue(
+            "<html><body><h3>Hubo un problema con su solicitud, lamentamos el inconveniente.</h3>"
+            "<p>Código de soporte: 123456789 - N/A</p></body></html>", tipo="text/html; charset=UTF-8")
+        with self.assertRaises(pros.ErrorBusqueda) as fallo:
+            self._buscar(get)
+        mensaje = str(fallo.exception)
+        self.assertNotIn("rechazó el token", mensaje)
+        self.assertIn("no está disponible", mensaje)
+        self.assertIn("HTTP 200", mensaje)
+        self.assertNotIn("datos inesperados", mensaje)
+        self.assertEqual(fallo.exception.diagnostico.get("forma"), "página de error sin JSON")
+        self.assertIn("error del servicio del INEGI",
+                      dict(fallo.exception.intentos)["api.inegi.org.mx"])
+
+    @patch("prospeccion.requests.get")
+    @patch("prospeccion.ubicar_ciudad", return_value=(27.48642, -109.94079, "Ciudad Obregón, Sonora"))
+    def test_el_400_por_url_larga_se_explica_como_consulta_rechazada(self, ubicar, get):
+        get.return_value = respuesta_denue("HTTP Error 400. The request URL is invalid.",
+                                           status=400, tipo="text/html")
+        with self.assertRaises(pros.ErrorBusqueda) as fallo:
+            self._buscar(get)
+        mensaje = str(fallo.exception)
+        self.assertIn("rechazó la dirección de la consulta", mensaje)
+        self.assertIn("largas", mensaje)
+        self.assertNotIn("rechazó el token", mensaje)
+        self.assertEqual(fallo.exception.diagnostico.get("forma"), "consulta rechazada por su longitud")
+
+    @patch("prospeccion.requests.get")
+    @patch("prospeccion.ubicar_ciudad", return_value=(27.48642, -109.94079, "Ciudad Obregón, Sonora"))
+    def test_un_objeto_json_desconocido_se_reporta_como_formato_sin_culpar_al_token(self, ubicar, get):
+        get.return_value = respuesta_denue('{"resultado": "sin datos", "codigo": "X1"}')
+        with self.assertRaises(pros.ErrorBusqueda) as fallo:
+            self._buscar(get)
+        mensaje = str(fallo.exception)
+        self.assertIn("formato que no se reconoce", mensaje)
+        self.assertNotIn("rechazó el token", mensaje)
+        self.assertIn("HTTP 200", mensaje)
+        self.assertEqual(fallo.exception.diagnostico.get("forma"), "objeto")
+        self.assertEqual(sorted(fallo.exception.diagnostico.get("claves", []))[:2],
+                         ["codigo", "resultado"])
+        self.assertNotIn(self.TOKEN, mensaje)
+
+    @patch("prospeccion.requests.get")
+    @patch("prospeccion.ubicar_ciudad", return_value=(27.48642, -109.94079, "Ciudad Obregón, Sonora"))
+    def test_el_null_de_200_se_aclara_con_la_consulta_de_verificacion(self, ubicar, get):
+        """Un `null` no distingue «sin coincidencias» de «credencial rechazada»: se verifica."""
+        llamadas = []
+
+        def responder(url, **kwargs):
+            llamadas.append(url)
+            if "/Buscar/todos/" in url:
+                return respuesta_denue("No Autorizado, utilice una clave valida. ", tipo="text/plain")
+            return respuesta_denue("null")
+
+        get.side_effect = responder
+        with self.assertRaises(pros.ErrorBusqueda) as fallo:
+            self._buscar(get)
+        self.assertEqual(len(llamadas), 2, "una consulta y una verificación, sin cascada")
+        self.assertIn("/Buscar/todos/", llamadas[1])
+        self.assertEqual(llamadas[1].split("/")[-2], "250", "la verificación pide un radio mínimo")
+        self.assertNotIn(self.TOKEN, str(fallo.exception))
+        self.assertIn("rechazó el token", str(fallo.exception))
+        self.assertEqual(fallo.exception.diagnostico.get("verificacion"),
+                         fallo.exception.diagnostico.get("verificacion"))
+        self.assertTrue(fallo.exception.diagnostico.get("verificacion"))
+
+    @patch("prospeccion.requests.get")
+    @patch("prospeccion.ubicar_ciudad", return_value=(27.48642, -109.94079, "Ciudad Obregón, Sonora"))
+    def test_sin_coincidencias_no_es_error_y_reintenta_giro_por_giro(self, ubicar, get):
+        """Si la combinación de palabras no devuelve nada, se pregunta término por término."""
+        llamadas = []
+
+        def responder(url, **kwargs):
+            llamadas.append(url)
+            if "/Buscar/todos/" in url:  # verificación de credencial: aceptada
+                return respuesta_denue("[]")
+            if "," not in url.split("/Buscar/")[1].split("/")[0]:
+                return respuesta_denue([self.REGISTRO])  # una sola palabra sí encuentra fichas
+            return respuesta_denue("[]")
+
+        get.side_effect = responder
+        fichas, detalle = self._buscar(get, sectores=("distribuidores",))
+        self.assertEqual([ficha["Empresa"] for ficha in fichas],
+                         ["Pisos y Recubrimientos del Yaqui"])
+        self.assertTrue(any("giro por giro" in aviso for aviso in detalle["avisos"]),
+                        detalle["avisos"])
+        self.assertGreater(detalle["consultas"], 1)
+        self.assertGreater(len(llamadas), 1)
+        for url in llamadas:
+            self.assertTrue(url.endswith(pros.limpiar_token_denue(self.TOKEN)),
+                            "el token viaja solo como último segmento de la consulta")
+        self.assertEqual(detalle["servidor"], "api.inegi.org.mx")
+        self.assertNotIn(self.TOKEN, str(detalle), "el detalle nunca publica el token")
+
+    @patch("prospeccion.requests.get")
+    @patch("prospeccion.ubicar_ciudad", return_value=(27.48642, -109.94079, "Ciudad Obregón, Sonora"))
+    def test_todos_los_giros_se_reparte_en_consultas_cortas_y_une_sin_repetir(self, ubicar, get):
+        """Regresión del HTTP 400 reportado: la condición completa mide 770 caracteres."""
+        urls = []
+
+        def responder(url, **kwargs):
+            urls.append(url)
+            return respuesta_denue([self.REGISTRO])
+
+        get.side_effect = responder
+        fichas, detalle = self._buscar(get, sectores=tuple(pros.SECTORES), radio=30)
+        self.assertGreater(len(urls), 1, "una consulta con los 11 giros no cabe en la URL")
+        for url in urls:
+            self.assertLessEqual(len(url), pros.DENUE_URL_MAX,
+                                 "la URL debe quedar dentro del presupuesto del servicio")
+            self.assertIn("/5000/", url, "el radio no puede exceder el máximo oficial")
+        self.assertEqual(len(fichas), 1, "la misma ficha no se repite entre consultas")
+        self.assertEqual(detalle["consultas"], len(urls))
+        self.assertEqual(detalle["radio_usado"], 5.0)
+        self.assertIn("máximo de 5 km", " ".join(detalle["avisos"]))
+        self.assertNotIn(self.TOKEN, str(detalle), "el detalle nunca publica el token")
+
+    def test_la_consulta_completa_de_los_11_giros_habria_sido_rechazada(self):
+        """Deja constancia del motivo del 400: la consulta única sí excede el límite medido."""
+        url_unica = pros.crear_consulta_denue(27.48642, -109.94079, 5, tuple(pros.SECTORES), self.TOKEN)
+        self.assertGreater(len(url_unica), pros.DENUE_URL_MAX)
+        self.assertGreater(len(url_unica), 280, "el borde del INEGI corta las URLs largas")
+        lotes = pros._lotes_denue(27.48642, -109.94079, 5000, pros._terminos_denue(tuple(pros.SECTORES)),
+                                  self.TOKEN)
+        self.assertGreater(len(lotes), 1)
+        self.assertEqual(sorted(termino for lote in lotes for termino in lote),
+                         sorted(pros._terminos_denue(tuple(pros.SECTORES))),
+                         "ningún giro se queda fuera al repartir las consultas")
+
+    @patch("prospeccion.requests.get")
+    @patch("prospeccion.ubicar_ciudad", return_value=(27.48642, -109.94079, "Ciudad Obregón, Sonora"))
+    def test_los_errores_http_conocidos_conservan_su_explicacion(self, ubicar, get):
+        get.return_value = respuesta_denue("", status=429, tipo="text/plain")
+        with self.assertRaises(pros.ErrorBusqueda) as limite:
+            self._buscar(get)
+        self.assertIn("limitó temporalmente", str(limite.exception))
+        self.assertEqual(limite.exception.diagnostico.get("forma"), "límite de consultas")
+
+        get.return_value = respuesta_denue("", status=403)
+        with self.assertRaises(pros.ErrorBusqueda) as rechazo:
+            self._buscar(get)
+        self.assertIn("rechazó el token", str(rechazo.exception))
+        self.assertEqual(rechazo.exception.diagnostico.get("forma"), "autorización HTTP")
+
+    def test_el_token_se_limpia_sin_registrar_su_valor(self):
+        limpio = "0f0e0d0c-1b2a-4938-8776-655443322110"
+        for pegado in (f'"{limpio}"', f"  {limpio}\n", f"\ufeff{limpio}", f"\u200b{limpio}\u200b",
+                       f"'{limpio}'"):
+            with self.subTest(pegado=pegado):
+                self.assertEqual(pros.limpiar_token_denue(pegado), limpio)
+                self.assertEqual(pros.huella_token_denue(pegado), pros.huella_token_denue(limpio))
+        huella = pros.huella_token_denue(limpio)
+        self.assertNotIn(limpio, huella)
+        self.assertIn("36 caracteres", huella)
+        self.assertNotEqual(huella, pros.huella_token_denue(limpio + "x"))
+        self.assertEqual(pros.huella_token_denue(""), "sin token configurado")
+
+    def test_un_token_con_espacios_o_comillas_interiores_no_se_manda_al_servicio(self):
+        for roto in ("token con espacios", "token=\"abc\"", "línea\nsiguiente", "x" * 200):
+            with self.subTest(roto=roto[:20]):
+                with patch("prospeccion.requests.get") as get:
+                    with self.assertRaises(pros.ErrorBusqueda) as fallo:
+                        pros.buscar_denue_detallada(self.CIUDAD, 5, ("aplicadores",), CATALOGO, roto)
+                get.assert_not_called()
+                self.assertIn("no tiene un formato válido", str(fallo.exception))
+                self.assertNotIn(roto.strip()[:20], str(fallo.exception))
+
+    @patch("prospeccion.requests.get")
+    def test_verificar_credencial_distingue_aceptada_rechazada_e_indeterminada(self, get):
+        get.return_value = respuesta_denue([self.REGISTRO])
+        estado, mensaje, diagnostico = pros.verificar_credencial_denue(self.TOKEN)
+        self.assertEqual(estado, "aceptado")
+        self.assertIn("aceptó la credencial", mensaje)
+        self.assertNotIn(self.TOKEN, mensaje)
+        url = get.call_args.args[0]
+        self.assertIn("/Buscar/todos/", url)
+        self.assertIn("19.43261,-99.13321", url, "usa un punto denso conocido para la verificación")
+        self.assertTrue(url.endswith(pros.limpiar_token_denue(self.TOKEN)) or "%" in url)
+
+        get.return_value = respuesta_denue("No Autorizado, utilice una clave valida. ", tipo="text/plain")
+        estado, mensaje, diagnostico = pros.verificar_credencial_denue(self.TOKEN)
+        self.assertEqual(estado, "rechazado")
+        self.assertIn("rechazó la credencial", mensaje)
+        self.assertNotIn(self.TOKEN, mensaje)
+        self.assertEqual(diagnostico.get("estado"), 200)
+
+        get.return_value = respuesta_denue("null")
+        estado, mensaje, diagnostico = pros.verificar_credencial_denue(self.TOKEN)
+        self.assertEqual(estado, "indeterminado")
+        self.assertNotIn(self.TOKEN, mensaje)
+
+    def test_la_verificacion_tambien_valida_el_formato_del_token(self):
+        with patch("prospeccion.requests.get") as get:
+            with self.assertRaises(pros.ErrorBusqueda) as fallo:
+                pros.verificar_credencial_denue("")
+        get.assert_not_called()
+        self.assertIn("[inegi].denue_token", str(fallo.exception))
 
 
 if __name__ == "__main__":
