@@ -168,7 +168,7 @@ Y sin red, en `tests_prospeccion.py::TestVariosServidoresOverpass`:
 | búsqueda tras un fallo | se empieza por el servidor que respondió; el que limitó queda al final |
 | todos fallaron antes | la siguiente búsqueda los intenta igual: la memoria solo reordena |
 
-Baterías completas: `tests_prospeccion.py` 35/35 · `tests_flujo_app.py` 17/17 ·
+Baterías completas: `tests_prospeccion.py` 55/55 · `tests_flujo_app.py` 19/19 ·
 `tests_autenticacion.py` 55/55 · `tests_bateria.py` 24/24.
 
 ### Verlo en el despliegue real (sin exponer secretos)
@@ -191,3 +191,39 @@ del INEGI como respaldo o fuente directa. La API oficial requiere un token en Se
 (`[inegi].denue_token`) o `NEMET_INEGI_DENUE_TOKEN`; no lo registres en este documento ni lo
 compartas en el chat. El método geográfico de DENUE admite como máximo 5 km; la interfaz informa
 cuando el radio original debe limitarse. Ninguna ficha se inventa si ambas fuentes fallan.
+
+### Diagnóstico del error de DENUE en el despliegue (2026-10)
+
+Síntoma: con **todos los giros** la búsqueda DENUE devolvía **HTTP 400**; con un solo giro mostraba
+«devolvió datos inesperados; verifica el token y reintenta». Comprobado contra el servicio real
+(siempre con un token de prueba inválido, nunca con el token del despliegue):
+
+| Prueba | Respuesta real del INEGI |
+|---|---|
+| Consulta corta (`Buscar/carpinteria/…/5000/…`) con clave no válida | **HTTP 200**, `text/plain`, cuerpo `No Autorizado, utilice una clave valida.` |
+| Consulta con acentos (`carpinter%C3%ADa`) o espacios (`pintura%20epoxica`) | Igual: el aviso de autorización, sin error |
+| Condición con 25 términos (URL de 460 caracteres) | **HTTP 400** `Bad Request - Invalid URL` |
+| Condición de 200–250 caracteres | HTTP 200, página HTML `Hubo un problema con su solicitud…` |
+| Condición de ~180 caracteres | HTTP 200, aviso de autorización (la URL sí se atiende) |
+
+Conclusiones:
+
+1. **El 400 no era del token ni de los acentos**: el borde del servicio corta las URLs largas (el límite
+   medido está entre ~250 y ~290 caracteres). La consulta de los 11 giros mide **770 caracteres**, así que
+   el servicio la rechaza antes de mirar la credencial. Ahora la búsqueda reparte la condición en varias
+   consultas cortas (`DENUE_URL_MAX = 250`) y une los resultados sin repetir fichas por `Id`.
+2. **Un rechazo de credencial llega con HTTP 200**, no con 401/403: el cuerpo es texto plano
+   («No Autorizado, utilice una clave valida.»). Mirar solo `status_code` y `respuesta.json()` hacía que
+   cualquier aviso del servicio cayera en «datos inesperados» y culpaba al token. Ahora la app clasifica la
+   respuesta por estado, tipo de contenido y forma (lista, lista vacía, objeto, texto, nulo, HTML), explica
+   cada caso en pantalla y **nunca** dice «datos inesperados» sin diagnóstico.
+3. Una lista vacía o un `null` ya no son un error: si la respuesta es ambigua (`null`, cuerpo vacío u
+   objeto vacío), la app hace **una** consulta de verificación (`Buscar/todos/…/250/…`) para distinguir
+   «sin coincidencias» de «credencial rechazada», y lo informa.
+4. **Diagnóstico seguro**: la interfaz muestra estado HTTP, tipo de contenido, bytes y forma de la
+   respuesta, más la **huella del token** (8 caracteres del SHA-256 y su longitud). Nunca el token, ni la
+   URL completa, ni el cuerpo crudo. El botón **🔐 Verificar credencial de DENUE** comprueba si el INEGI
+   acepta la clave sin exponerla.
+
+Si el token del despliegue aparece en una captura, un chat o un commit, **rótalo**: se solicita otro en
+<https://www.inegi.org.mx/app/api/denue/v1/tokenVerify.aspx> y se actualiza `[inegi].denue_token`.

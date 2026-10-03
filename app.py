@@ -1613,6 +1613,28 @@ def buscar_prospectos_denue(ciudad, radio, sectores, catalogo, token):
     return pros.buscar_denue_detallada(ciudad, radio, sectores, catalogo, token)
 
 
+def resumen_diagnostico_denue(diagnostico):
+    """Frase segura sobre la respuesta del DENUE: sin token, sin URL y sin cuerpo crudo.
+
+    El INEGI contesta HTTP 200 aunque rechace la credencial, así que este resumen —y no
+    el código de estado— es lo que permite distinguir un token no autorizado de un fallo
+    del servicio o de una lista vacía.
+    """
+    if not diagnostico:
+        return ""
+    partes = [f"HTTP {diagnostico.get('estado', '?')}",
+              str(diagnostico.get("tipo_contenido", "tipo desconocido")),
+              f"{diagnostico.get('bytes', 0)} bytes",
+              f"forma: {diagnostico.get('forma', 'sin clasificar')}"]
+    resumen = "Respuesta del DENUE: " + " · ".join(partes)
+    claves = diagnostico.get("claves") or []
+    if claves:
+        resumen += " · claves del objeto: " + ", ".join(str(clave)[:24] for clave in claves)
+    if diagnostico.get("verificacion"):
+        resumen += f" · verificación de la credencial: {diagnostico['verificacion']}"
+    return resumen
+
+
 def alternativas_sin_osm():
     """Ofrece una segunda fuente en línea y opciones manuales si Overpass no responde."""
     if not st.session_state.get("pros_fallo_osm"):
@@ -1633,6 +1655,7 @@ def alternativas_sin_osm():
                                key="pros_buscar_denue", width="stretch"):
             st.session_state.pop("pros_fallo_osm", None)
             st.session_state.pop("pros_fallo_detalle", None)
+            st.session_state.pop("pros_fallo_diagnostico", None)
             st.session_state["pros_forzar_denue"] = True
             st.rerun()
         elif not token:
@@ -1640,16 +1663,42 @@ def alternativas_sin_osm():
                     "de la API y configúralo en Secrets como `[inegi].denue_token` o en la variable "
                     "`NEMET_INEGI_DENUE_TOKEN`; no lo pegues aquí ni lo subas al repositorio.")
         detalle = st.session_state.get("pros_fallo_detalle") or []
-        if detalle:
-            # Solo host y motivo redactado por la app: nunca rutas, parámetros ni excepciones crudas.
+        diagnostico = st.session_state.get("pros_fallo_diagnostico") or {}
+        if detalle or diagnostico:
+            # Solo host, motivo redactado y forma de la respuesta: nunca rutas, cuerpos ni el token.
             with st.expander("🔎 Qué contestó cada fuente"):
-                st.markdown("\n".join(f"- **{servidor}**: {motivo}" for servidor, motivo in detalle))
-                st.caption("Un HTTP 429 de Overpass indica un límite temporal por IP; un HTTP 401/403 "
-                           "de DENUE suele indicar que hay que revisar el token privado.")
+                if detalle:
+                    st.markdown("\n".join(f"- **{servidor}**: {motivo}" for servidor, motivo in detalle))
+                resumen = resumen_diagnostico_denue(diagnostico)
+                if resumen:
+                    st.caption(resumen)
+                st.caption("Un HTTP 429 de Overpass indica un límite temporal por IP. El DENUE del INEGI "
+                           "rechaza la credencial con **HTTP 200 y un aviso de texto** (no con 401/403): la "
+                           "huella del token permite comparar el secreto configurado con el correo del INEGI "
+                           "sin exponerlo. Si el valor apareció en una captura o un chat, solicita uno nuevo.")
+        if token:
+            # Diagnóstico a petición: distingue «token rechazado» de «sin coincidencias».
+            if st.button("🔐 Verificar credencial de DENUE", key="pros_verificar_denue", width="stretch"):
+                with st.spinner("Comprobando la credencial con el INEGI..."):
+                    estado, mensaje, diagnostico_verificacion = pros.verificar_credencial_denue(token)
+                st.session_state["pros_verificacion_denue"] = (estado, mensaje, diagnostico_verificacion)
+            verificacion = st.session_state.pop("pros_verificacion_denue", None)
+            if verificacion:
+                estado, mensaje, diagnostico_verificacion = verificacion
+                if estado == "aceptado":
+                    st.success(mensaje)
+                elif estado == "indeterminado":
+                    st.warning(mensaje)
+                else:
+                    st.error(mensaje)
+                resumen = resumen_diagnostico_denue(diagnostico_verificacion)
+                if resumen:
+                    st.caption(resumen)
         if st.button("🔁 Reintentar la búsqueda", key="pros_reintentar", type="primary",
                      width="stretch"):
             st.session_state.pop("pros_fallo_osm", None)
             st.session_state.pop("pros_fallo_detalle", None)
+            st.session_state.pop("pros_fallo_diagnostico", None)
             st.session_state.pop("pros_fallo_denue", None)
             st.session_state["pros_reintentar"] = True
             st.rerun()
@@ -1796,6 +1845,7 @@ def _contenido_prospeccion(inventario):
         st.session_state.pop("pros_resultados", None)  # nunca confundir fichas anteriores con un intento fallido
         st.session_state.pop("pros_fallo_osm", None)
         st.session_state.pop("pros_fallo_detalle", None)
+        st.session_state.pop("pros_fallo_diagnostico", None)
         st.session_state.pop("pros_fallo_denue", None)
         st.session_state.pop("pros_fallo_fuente", None)
         fuente_resultado = pros.FUENTE_OSM
@@ -1825,7 +1875,8 @@ def _contenido_prospeccion(inventario):
                                         + tuple(getattr(error_denue, "intentos", ())))
                             st.session_state["pros_fallo_denue"] = str(error_denue)
                             raise pros.ErrorBusqueda(
-                                f"{error_osm} DENUE tampoco pudo consultarse: {error_denue}", intentos
+                                f"{error_osm} DENUE tampoco pudo consultarse: {error_denue}", intentos,
+                                getattr(error_denue, "diagnostico", None),
                             ) from None
                         fuente_resultado = pros.FUENTE_DENUE
                         aviso_fallback = ("OpenStreetMap/Overpass no respondió; se usó el "
@@ -1852,9 +1903,11 @@ def _contenido_prospeccion(inventario):
             if aviso_fallback:
                 st.warning(aviso_fallback)
             if fuente_resultado == pros.FUENTE_DENUE:
+                consultas = detalle.get("consultas") or 0
+                extra = f" · {consultas} consultas" if consultas > 1 else ""
                 st.caption(f"Fuente: {pros.FUENTE_DENUE} · API oficial del INEGI · "
                            f"radio usado: {detalle['radio_usado']:g} km · "
-                           f"servidor: {detalle['servidor']}.")
+                           f"servidor: {detalle['servidor']}{extra}.")
             else:
                 st.caption(f"Servidor consultado: {detalle['servidor']} · fuente: {pros.FUENTE_OSM}")
             for aviso in detalle.get("avisos", []):
@@ -1879,8 +1932,9 @@ def _contenido_prospeccion(inventario):
                 st.session_state["pros_fallo_fuente"] = "OpenStreetMap/Overpass y DENUE (INEGI)"
             else:
                 st.session_state["pros_fallo_fuente"] = "OpenStreetMap/Overpass"
-            # Solo se muestra host + motivo redactado; nunca URL ni token de la API.
+            # Solo se muestra host, motivo redactado y forma de la respuesta; nunca URL ni token.
             st.session_state["pros_fallo_detalle"] = list(getattr(error, "intentos", ()))
+            st.session_state["pros_fallo_diagnostico"] = dict(getattr(error, "diagnostico", {}))
             st.error(str(error))
         except Exception as error:
             if denue_intentado:
@@ -1893,6 +1947,7 @@ def _contenido_prospeccion(inventario):
                 st.session_state["pros_fallo_fuente"] = "OpenStreetMap/Overpass"
             st.session_state["pros_fallo_osm"] = mensaje
             st.session_state["pros_fallo_detalle"] = []
+            st.session_state["pros_fallo_diagnostico"] = {}
             st.error(mensaje)
 
     alternativas_sin_osm()
