@@ -992,6 +992,21 @@ def dibujar_cabecera_pdf(pdf):
     return max(y_inicio + alto_logo, pdf.get_y()) + 5
 
 
+def descripcion_para_cliente(fila):
+    """Renglón «Descripcion / Sistema» de la cotización: producto y, si aplica, el área.
+
+    Se arma con una lista blanca y jamás lee la columna «Detalle» del carrito: ahí se
+    guardan el costo de compra y el margen para el desglose interno, y ese dato no debe
+    salir de la empresa en el PDF que se descarga y se manda por correo.
+    """
+    texto = str(valor_celda(fila, "Descripcion", "") or "")
+    area = valor_celda(fila, "Area_m2", None)
+    espesor = valor_celda(fila, "Espesor_mm", None)
+    if area is not None and espesor is not None and float(area) > 0 and float(espesor) > 0:
+        texto += f" [{float(area):.2f} m² x {float(espesor):g} mm]"
+    return texto
+
+
 def generar_pdf_cotizacion(folio, cliente, items, titulo_detalle):
     """Genera el PDF de la cotización y devuelve sus bytes."""
     total = float(items["Subtotal"].sum()) if not items.empty else 0.0
@@ -1021,7 +1036,7 @@ def generar_pdf_cotizacion(folio, cliente, items, titulo_detalle):
         for _, fila in items.iterrows():
             renglon = tabla.row()
             renglon.cell(texto_pdf(valor_celda(fila, "SKU")))
-            renglon.cell(texto_pdf(valor_celda(fila, "Detalle", None) or valor_celda(fila, "Descripcion")))
+            renglon.cell(texto_pdf(descripcion_para_cliente(fila)))
             renglon.cell(texto_pdf(valor_celda(fila, "Presentacion")))
             renglon.cell(formato_cantidad(valor_celda(fila, "Cantidad", 1)))
             renglon.cell(f"${float(valor_celda(fila, 'Subtotal', 0)):,.2f}")

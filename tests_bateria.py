@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Batería de pruebas del sistema de marca NEMET (24 pruebas).
+"""Batería de pruebas del sistema de marca NEMET (29 pruebas).
 
 Cubre la herramienta de procesado (herramientas/procesar_logo.py), los 3 assets
 generados, la integración de marca en app.py y la configuración del repo.
@@ -227,6 +227,13 @@ class TestApp(unittest.TestCase):
         self.assertIn("nemet-lema", self.src)
         self.assertIn("st.caption(f\"© {ahora_local().year} NEMET", self.src)
 
+    def test_27_el_pdf_no_lee_la_columna_detalle(self):
+        # «Detalle» guarda costo de compra y margen para el desglose interno: si el PDF
+        # volviera a leer esa columna, el cliente vería de cuánto le sale al vendedor.
+        fn = self.src[self.src.index("def generar_pdf_cotizacion"):self.src.index("def enviar_cotizacion_por_correo")]
+        self.assertNotIn('"Detalle"', fn, "el PDF no debe leer la columna Detalle del carrito")
+        self.assertIn("descripcion_para_cliente(fila)", fn)
+
     def test_26_el_pdf_lleva_el_logo_de_marca(self):
         self.assertIn("logo_claro_400.png", self.src, "el PDF debe usar la versión de 400 px")
         self.assertIn("def dibujar_cabecera_pdf", self.src)
@@ -236,6 +243,82 @@ class TestApp(unittest.TestCase):
         pdf_fn = self.src.index("def generar_pdf_cotizacion")
         self.assertIn("dibujar_cabecera_pdf(pdf)", self.src[pdf_fn:])
         self.assertLess(cabecera, pdf_fn)
+
+
+# ============================================================ PDF para el cliente
+def modulo_app_sin_interfaz():
+    """Carga app.py solo hasta la sección de ACCESO: deja las funciones disponibles sin
+    arrancar Streamlit ni tocar la base de usuarios ni el Excel."""
+    import types
+
+    with open(os.path.join(BASE, "app.py"), encoding="utf-8") as fh:
+        lineas = fh.read().splitlines(keepends=True)
+    corte = next(i for i, l in enumerate(lineas) if l.startswith("# ACCESO (se ejecuta antes"))
+    modulo = types.ModuleType("app_sin_interfaz")
+    modulo.__file__ = os.path.join(BASE, "app.py")
+    exec(compile("".join(lineas[:corte]), modulo.__file__, "exec"), modulo.__dict__)
+    return modulo
+
+
+def texto_de_pdf(pdf_bytes):
+    """Texto legible de un PDF: descomprime sus flujos con zlib (solo stdlib)."""
+    import re
+    import zlib
+
+    partes = [pdf_bytes]
+    for flujo in re.findall(rb"stream\r?\n(.*?)\r?\nendstream", pdf_bytes, re.S):
+        try:
+            partes.append(zlib.decompress(flujo))
+        except zlib.error:  # flujo sin comprimir o con otro filtro: se busca en crudo
+            partes.append(flujo)
+    return b"".join(partes)
+
+
+class TestPDFParaCliente(unittest.TestCase):
+    """El PDF que ve el cliente no debe revelar el costo de compra ni el margen."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = modulo_app_sin_interfaz()
+
+    @staticmethod
+    def _item_con_datos_internos():
+        # Renglón tal cual lo arma la app: «Detalle» trae costo de compra y margen.
+        return {
+            "SKU": "EM-001",
+            "Descripcion": "Epoxy-Mica Gris",
+            "Presentacion": "Cubeta 20 L",
+            "Area_m2": 120.0,
+            "Espesor_mm": 3,
+            "Kg_Necesarios": 36.0,
+            "Cantidad": 2,
+            "Subtotal": 8450.0,
+            "Detalle": ("Epoxy-Mica Gris\n120.00 m² x 3 mm (36.000 kg)\n"
+                        "Modalidad: CUBETAS - 2x Cubeta 20 L = 40.000 kg\n"
+                        "Precio: $8,450.00 | Costo compra: $6,120.00\n"
+                        "Margen: $2,330.00 (27.6% venta / 38.1% markup)"),
+        }
+
+    def test_28_descripcion_para_cliente_ignora_el_detalle_interno(self):
+        pd = self.app.pd
+        fila = pd.Series(self._item_con_datos_internos())
+        texto = self.app.descripcion_para_cliente(fila)
+        self.assertEqual(texto, "Epoxy-Mica Gris [120.00 m² x 3 mm]")
+        for interno in ("Costo compra", "Margen", "markup", "6,120", "2,330"):
+            self.assertNotIn(interno, texto)
+
+    def test_29_el_pdf_no_revela_costo_ni_margen(self):
+        pd = self.app.pd
+        items = pd.DataFrame([self._item_con_datos_internos()])
+        pdf = self.app.generar_pdf_cotizacion(
+            "COT-2026-014", "Constructora del Norte S.A.", items,
+            "Cotización por Área y Sistemas Epóxicos")
+        texto = texto_de_pdf(pdf)
+        for interno in (b"Costo compra", b"Margen", b"markup", b"6,120", b"2,330", b"27.6", b"38.1"):
+            self.assertNotIn(interno, texto, f"el PDF filtra el dato interno {interno!r}")
+        # lo que sí debe verse: el producto, el área cotizada y el precio al cliente
+        for visible in (b"Epoxy-Mica Gris", b"8,450.00"):
+            self.assertIn(visible, texto, f"el PDF perdió el dato del cliente {visible!r}")
 
 
 # ============================================================ config repo
@@ -262,8 +345,8 @@ class TestConfig(unittest.TestCase):
 if __name__ == "__main__":
     resultado = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__]))
     n = resultado.testsRun
-    if resultado.wasSuccessful() and n == 26:
+    if resultado.wasSuccessful() and n == 29:
         print(f"\n{ n }/{n} OK — sistema de marca NEMET verificado")
         sys.exit(0)
-    print(f"\n{ n - len(resultado.failures) - len(resultado.errors) }/{n} (esperadas 26/26)")
+    print(f"\n{ n - len(resultado.failures) - len(resultado.errors) }/{n} (esperadas 29/29)")
     sys.exit(1)
