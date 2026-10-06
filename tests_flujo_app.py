@@ -483,7 +483,13 @@ class TestFlujoAcceso(unittest.TestCase):
         self.assertIn("Sitio comercial", manual["Fuente"])
         self.assertTrue(pros.enlace_google_maps(manual.to_dict()).startswith(
             "https://www.google.com/maps/search/?api=1&query=Calle%20Sinaloa%2012"))
-        self.assertTrue(any("pros_descargar_todos" == b.key for b in at.get("download_button")),
+        # El AppTest de Streamlit 1.49 todavía no conoce `download_button`: lo expone como
+        # UnknownElement sin `key`. Se acepta la clave o la etiqueta visible para que la
+        # batería sirva igual con la versión mínima declarada en requirements.txt.
+        exportaciones = at.get("download_button")
+        self.assertTrue(any(getattr(b, "key", None) == "pros_descargar_todos"
+                            or "Exportar todos" in (getattr(b, "label", "") or "")
+                            for b in exportaciones),
                         "debe poder exportarse la lista completa en CSV")
 
         at.selectbox(key="pros_elegido").select(clave)
@@ -555,7 +561,7 @@ class TestFlujoAcceso(unittest.TestCase):
             with patch.object(pros, "OVERPASS_URLS", (prueba.url,)):
                 at.text_input(key="pros_ciudad").set_value("Ciudad Obregón")
                 at.slider(key="pros_radio").set_value(5)
-                at.run()
+                # Sin at.run() intermedio: los valores del formulario se aplican al enviarlo.
                 at.button(key="pros_buscar").click()
                 at.run()
                 self.assertFalse(at.exception, [e.value for e in at.exception])
@@ -599,8 +605,7 @@ class TestFlujoAcceso(unittest.TestCase):
         try:
             with patch.object(pros, "OVERPASS_URLS", (prueba.url,)):
                 at.slider(key="pros_radio").set_value(12)
-                at.run()
-                at.button(key="pros_buscar").click()
+                at.button(key="pros_buscar").click()  # el envío va en la misma tanda
                 at.run()
                 self.assertFalse(at.exception, [e.value for e in at.exception])
         finally:
@@ -675,8 +680,7 @@ class TestFlujoAcceso(unittest.TestCase):
 
                     # La fuente DENUE también se puede elegir directamente sin pasar por Overpass.
                     at.radio(key="pros_fuente_busqueda").set_value("DENUE (INEGI)")
-                    at.run()
-                    at.button(key="pros_buscar").click()
+                    at.button(key="pros_buscar").click()  # el envío va en la misma tanda
                     at.run()
                     self.assertFalse(at.exception, [e.value for e in at.exception])
                     self.assertEqual(osm.call_count, 1, "la fuente directa no debe llamar a Overpass")
@@ -689,6 +693,46 @@ class TestFlujoAcceso(unittest.TestCase):
         render = " ".join([*(c.value for c in at.caption), *(m.value for m in at.markdown),
                            *(e.value for e in at.error), *(w.value for w in at.warning)])
         self.assertNotIn(token, render)
+
+    def test_19_el_fallo_de_credencial_del_denue_se_explica_sin_exponer_el_token(self):
+        """El INEGI rechaza la credencial con HTTP 200: la pantalla debe decirlo y ofrecer verificarla."""
+        token = "token-falso-de-verificacion"
+        diagnostico = {"estado": 200, "tipo_contenido": "text/plain", "bytes": 39,
+                       "forma": "texto sin JSON", "huella_token": pros.huella_token_denue(token)}
+        fallo = pros.ErrorBusqueda(
+            "DENUE (INEGI) rechazó el token: el servicio respondió que la clave no es válida con HTTP 200 "
+            "y texto plano, no con un error HTTP (huella configurada: 36 caracteres).",
+            (("api.inegi.org.mx", "token no válido o sin autorización"),), diagnostico)
+        with patch.dict(os.environ, {"NEMET_INEGI_DENUE_TOKEN": token}):
+            with patch("prospeccion.buscar_denue_detallada", side_effect=fallo) as denue:
+                with patch("prospeccion.verificar_credencial_denue", return_value=(
+                        "rechazado", "El INEGI rechazó la credencial: respondió que la clave no es válida.",
+                        diagnostico)) as verificar:
+                    at = self.abrir(token=TestFlujoAcceso.token_admin, paso="credencial DENUE")
+                    self.ir_a(at, "🎯 Prospección Comercial")
+                    at.radio(key="pros_fuente_busqueda").set_value("DENUE (INEGI)")
+                    at.button(key="pros_buscar").click()  # el envío del formulario va en la misma tanda
+                    at.run()
+                    self.assertFalse(at.exception, [e.value for e in at.exception])
+                    denue.assert_called_once()
+                    self.assertTrue(any("rechazó el token" in e.value for e in at.error),
+                                    [e.value for e in at.error])
+                    render = " ".join([*(c.value for c in at.caption), *(m.value for m in at.markdown),
+                                       *(e.value for e in at.error), *(w.value for w in at.warning)])
+                    self.assertIn("HTTP 200", render, "el diagnóstico debe decir que el rechazo llegó con 200")
+                    self.assertIn("texto sin JSON", render)
+                    self.assertIn("huella", render.lower())
+                    self.assertNotIn(token, render, "el token jamás se muestra")
+
+                    # El botón de verificación distingue «token rechazado» de «sin coincidencias».
+                    at.button(key="pros_verificar_denue").click()
+                    at.run()
+                    verificar.assert_called_once_with(token)
+                    self.assertFalse(at.exception, [e.value for e in at.exception])
+                    render = " ".join([*(c.value for c in at.caption), *(m.value for m in at.markdown),
+                                       *(e.value for e in at.error), *(w.value for w in at.warning)])
+                    self.assertIn("rechazó la credencial", render)
+                    self.assertNotIn(token, render)
 
 
 class _ManejadorOverpass(BaseHTTPRequestHandler):
