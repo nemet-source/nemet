@@ -29,6 +29,7 @@ BASE_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIR_ASSETS = os.path.join(BASE_REPO, "assets")
 
 LADO_MAXIMO = 1400      # px máximos del lado largo de los logos
+LOGO_PDF_ANCHO = 400    # px del logo que se incrusta en las cotizaciones PDF
 DENS_MIN = 52           # densidad mínima de distancia al fondo (contenido "sólido")
 SOFT_MIN = 42           # densidad mínima para las filas de texto fino (lema)
 CON_SOFT_MIN = 14       # contraste local mínimo complementario para el lema
@@ -286,6 +287,19 @@ def generar_hero(logo_claro: Image.Image, ancho=1600, alto=900) -> Image.Image:
 # ---------------------------------------------------------------- CLI
 
 
+def generar_logo_pdf(logo_claro: Image.Image, ancho: int = LOGO_PDF_ANCHO) -> Image.Image:
+    """Logo reducido para el PDF de cotizaciones (400 px de ancho, paleta con alfa).
+
+    La versión de la app pesa ~900 KB; incrustarla en cada PDF que se descarga y se
+    manda por correo es inviable, así que se guarda aparte una copia ligera que conserva
+    el borde difuminado del recorte (tRNS con alfa por entrada de paleta).
+    """
+    ancho = min(ancho, logo_claro.width)  # nunca se escala hacia arriba
+    escala = ancho / logo_claro.width
+    reducido = logo_claro.resize((ancho, max(1, round(logo_claro.height * escala))), Image.LANCZOS)
+    return reducido.quantize(colors=255, method=Image.FASTOCTREE)
+
+
 def procesar_archivo(ruta: str, salida: str, max_side=LADO_MAXIMO) -> list[str]:
     im = Image.open(ruta)
     arr = np.array(im.convert("RGBA"))
@@ -293,6 +307,7 @@ def procesar_archivo(ruta: str, salida: str, max_side=LADO_MAXIMO) -> list[str]:
     os.makedirs(salida, exist_ok=True)
     escritos = []
     for imagen, nombre in ((logo, "logo_claro.png"),
+                           (generar_logo_pdf(logo), "logo_claro_400.png"),
                            (generar_favicon(logo), "favicon.png"),
                            (generar_hero(logo), "hero_claro.png")):
         ruta_out = os.path.join(salida, nombre)

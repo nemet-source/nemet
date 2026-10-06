@@ -115,14 +115,15 @@ class TestHerramienta(unittest.TestCase):
         self.assertLess(float(ha[225, 400].mean()), 80)      # el logo sí va compuesto al centro
         self.assertGreater(float(ha.mean()), 150)            # lienzo claro, no letterpress
 
-    def test_11_cli_genera_el_trio_claro_y_rechaza_el_oscuro(self):
+    def test_11_cli_genera_los_assets_claros_y_rechaza_el_oscuro(self):
         with tempfile.TemporaryDirectory() as tdir:
             claro_in = os.path.join(tdir, "claro.png")
             Image.fromarray(img_claro_sintetica(), "RGB").save(claro_in)
             sal = os.path.join(tdir, "assets")
             rc = pl.main([claro_in, "--salida", sal])
             self.assertEqual(rc, 0)
-            self.assertEqual(sorted(os.listdir(sal)), ["favicon.png", "hero_claro.png", "logo_claro.png"])
+            self.assertEqual(sorted(os.listdir(sal)),
+                             ["favicon.png", "hero_claro.png", "logo_claro.png", "logo_claro_400.png"])
             # la marca ya no genera letterpress: una entrada con fondo negro se rechaza
             osc_in = os.path.join(tdir, "oscuro.png")
             arr = np.dstack([np.full((100, 140, 3), (4, 4, 5), np.uint8),
@@ -182,6 +183,20 @@ class TestAssets(unittest.TestCase):
         for n in ("Logo NEMET.png", "Logo NEMET 3.png"):
             self.assertFalse(os.path.exists(os.path.join(BASE, n)), f"{n} ya no debe estar en la raíz")
 
+    def test_25_logo_para_pdf_de_400px_y_ligero(self):
+        # el PDF se descarga y se manda por correo: no puede cargar el logo original (~900 KB)
+        ruta_400 = os.path.join(self.ASSETS, "logo_claro_400.png")
+        ruta_full = os.path.join(self.ASSETS, "logo_claro.png")
+        self.assertTrue(os.path.exists(ruta_400), "falta assets/logo_claro_400.png")
+        im = Image.open(ruta_400)
+        self.assertEqual(im.width, 400)
+        orig = Image.open(ruta_full)
+        self.assertEqual(round(im.height / im.width * orig.width), orig.height)  # misma proporción
+        self.assertLess(os.path.getsize(ruta_400), os.path.getsize(ruta_full) / 5)
+        a = np.array(im.convert("RGBA"))
+        self.assertEqual(int(a[0, 0, 3]), 0)                        # conserva la transparencia
+        self.assertGreater(float((a[..., 3] > 200).mean()), 0.15)   # y el contenido del logo
+
 
 # ============================================================ app.py
 class TestApp(unittest.TestCase):
@@ -212,6 +227,16 @@ class TestApp(unittest.TestCase):
         self.assertIn("nemet-lema", self.src)
         self.assertIn("st.caption(f\"© {ahora_local().year} NEMET", self.src)
 
+    def test_26_el_pdf_lleva_el_logo_de_marca(self):
+        self.assertIn("logo_claro_400.png", self.src, "el PDF debe usar la versión de 400 px")
+        self.assertIn("def dibujar_cabecera_pdf", self.src)
+        self.assertIn("def ruta_logo_pdf", self.src)
+        # la cabecera del PDF se dibuja antes del folio y la tabla de artículos
+        cabecera = self.src.index("def dibujar_cabecera_pdf")
+        pdf_fn = self.src.index("def generar_pdf_cotizacion")
+        self.assertIn("dibujar_cabecera_pdf(pdf)", self.src[pdf_fn:])
+        self.assertLess(cabecera, pdf_fn)
+
 
 # ============================================================ config repo
 class TestConfig(unittest.TestCase):
@@ -237,8 +262,8 @@ class TestConfig(unittest.TestCase):
 if __name__ == "__main__":
     resultado = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__]))
     n = resultado.testsRun
-    if resultado.wasSuccessful() and n == 24:
+    if resultado.wasSuccessful() and n == 26:
         print(f"\n{ n }/{n} OK — sistema de marca NEMET verificado")
         sys.exit(0)
-    print(f"\n{ n - len(resultado.failures) - len(resultado.errors) }/{n} (esperadas 24/24)")
+    print(f"\n{ n - len(resultado.failures) - len(resultado.errors) }/{n} (esperadas 26/26)")
     sys.exit(1)

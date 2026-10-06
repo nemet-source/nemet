@@ -936,6 +936,62 @@ def registrar_cotizacion_en_excel(folio, cliente, items_carrito, total_general):
         return False, str(e), folio
 
 
+# Logo de la cabecera del PDF: se incrusta la versión de 400 px (~26 KB) en lugar de la
+# original de 828 px (~900 KB), porque cada cotización se descarga y se manda por correo.
+LOGO_PDF = "logo_claro_400.png"
+ANCHO_LOGO_PDF = 40.0   # mm del logo en la cabecera (A4 vertical, 190 mm útiles)
+SEPARACION_LOGO_PDF = 5.0   # mm entre el logo y el bloque de texto
+
+
+def tamanio_png(ruta):
+    """(ancho, alto) en px de un PNG leyendo solo su encabezado IHDR (sin depender de Pillow)."""
+    try:
+        with open(ruta, "rb") as archivo:
+            cabecera = archivo.read(24)
+    except OSError:
+        return None
+    if len(cabecera) < 24 or cabecera[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    return int.from_bytes(cabecera[16:20], "big"), int.from_bytes(cabecera[20:24], "big")
+
+
+def ruta_logo_pdf():
+    """PNG de marca para el PDF: la versión de 400 px y, si faltara, la original."""
+    return _asset(LOGO_PDF) or _asset("logo_claro.png")
+
+
+def dibujar_cabecera_pdf(pdf):
+    """Membrete: logo a la izquierda y, a su derecha y centrado con él, el título y el eslogan.
+
+    Devuelve la coordenada Y donde debe seguir el resto del documento. Si no hay logo,
+    traza solo el texto conservando el membrete anterior.
+    """
+    y_inicio = pdf.get_y()
+    ruta = ruta_logo_pdf()
+    tamano = tamanio_png(ruta) if ruta else None
+
+    alto_logo = 0.0
+    x_texto = pdf.l_margin
+    if tamano and tamano[0]:
+        ancho_logo = min(ANCHO_LOGO_PDF, pdf.epw * 0.45)
+        alto_logo = ancho_logo * tamano[1] / tamano[0]
+        pdf.image(ruta, x=pdf.l_margin, y=y_inicio, w=ancho_logo)
+        x_texto = pdf.l_margin + ancho_logo + SEPARACION_LOGO_PDF
+
+    # Título (10 mm) + eslogan (5 mm): se centra respecto al alto del logo.
+    alto_texto = 15.0
+    pdf.set_xy(x_texto, y_inicio + max(0.0, (alto_logo - alto_texto) / 2))
+    pdf.set_font("helvetica", "B", 15)
+    pdf.set_text_color(30, 58, 138)
+    pdf.cell(0, 10, "SISTEMA MAESTRO NEMET")
+    pdf.set_xy(x_texto, y_inicio + max(0.0, (alto_logo - alto_texto) / 2) + 10)
+    pdf.set_font("helvetica", "", 10)
+    pdf.set_text_color(100, 100, 100)
+    pdf.cell(0, 5, texto_pdf("Productos Químicos y Especialidades Epóxicas"))
+
+    return max(y_inicio + alto_logo, pdf.get_y()) + 5
+
+
 def generar_pdf_cotizacion(folio, cliente, items, titulo_detalle):
     """Genera el PDF de la cotización y devuelve sus bytes."""
     total = float(items["Subtotal"].sum()) if not items.empty else 0.0
@@ -946,13 +1002,7 @@ def generar_pdf_cotizacion(folio, cliente, items, titulo_detalle):
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
 
-    pdf.set_font("helvetica", "B", 15)
-    pdf.set_text_color(30, 58, 138)
-    pdf.cell(0, 10, "SISTEMA MAESTRO NEMET", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.set_font("helvetica", "", 10)
-    pdf.set_text_color(100, 100, 100)
-    pdf.cell(0, 5, texto_pdf("Productos Químicos y Especialidades Epóxicas"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.ln(5)
+    pdf.set_y(dibujar_cabecera_pdf(pdf))
 
     pdf.set_font("helvetica", "", 11)
     pdf.set_text_color(0, 0, 0)
