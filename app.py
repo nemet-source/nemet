@@ -1415,8 +1415,18 @@ def avisos_base_de_usuarios():
     if auth.fallos_escritura():
         st.info(f"ℹ️ {auth.fallos_escritura()} escritura(s) rechazada(s) en la base de usuarios "
                 f"(último error: `{auth.ultimo_error_escritura() or '—'}`). "
-                f"Esto es normal en Streamlit Cloud cuando el servidor se reinicia; "
-                f"la app sigue funcionando correctamente.")
+                f"Esto es normal en Streamlit Cloud cuando el servidor se reinicia.")
+        
+        # Botón para reintentar la conexión a la base de datos
+        if st.button("🔄 Reparar base de datos", key="reparar_db"):
+            try:
+                # Forzar reconexión
+                auth.conectar.cache_clear()
+                st.session_state.pop("_aviso_base_visto", None)
+                st.success("✅ Base de datos reparada. Recargando...")
+                st.rerun()
+            except Exception as e:
+                st.error(f"❌ No se pudo reparar: {e}")
 
 
 def pantalla_login(conn, secreto, ttl, aviso_semilla=None):
