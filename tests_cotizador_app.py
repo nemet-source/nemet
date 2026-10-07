@@ -9,9 +9,10 @@ Así se comprueba lo mismo que ve el usuario, no solo la aritmética:
   son 160 g (dos bolsas de 100 g = $224) y la tinta cabe en 1 L ($550). Antes el sistema
   cotizaba 16 kg y 16 L ($22,240).
 * Las **resinas** siguen por espesor: PRIMER 5.33 kg y PISOS 19.2 kg (una cubeta de 20 kg).
+* Las medidas inician en cero; con área cero o espesor cero para resinas no aparece una cotización.
 
 Corre sobre una **copia temporal** del proyecto (Excel y base de usuarios propios), así que
-nunca toca los datos reales.  Uso:  python tests_cotizador_app.py  →  "7/7 OK".
+nunca toca los datos reales.  Uso:  python tests_cotizador_app.py  →  "9/9 OK".
 """
 import os
 import shutil
@@ -111,7 +112,34 @@ class TestCotizadorPorArea(unittest.TestCase):
         self.assertEqual(len(campo), 1, "debe haber un solo campo de dosificación")
         return campo[0]
 
+    def assert_sin_cotizacion(self):
+        """No hay cálculo, comparativa, recomendación ni botones de agregar al faltar medidas."""
+        textos_info = " ".join(str(i.value) for i in self.at.info)
+        self.assertNotIn("Material necesario", textos_info)
+        self.assertEqual(len(self.at.metric), 0, "no deben mostrarse métricas de la cotización")
+        markdown = " ".join(str(m.value) for m in self.at.markdown)
+        self.assertNotIn("Comparativa:", markdown)
+        self.assertFalse(any("Recomendación" in str(s.value) for s in self.at.success))
+        botones_agregar = [b for b in self.at.button
+                           if b.key in {"add_kilo", "add_cubeta", "add_pz"} or "Agregar" in str(b.label)]
+        self.assertEqual(botones_agregar, [], "no debe haber botones para agregar al carrito")
+
     # ------------------------------------------------------------------ flujo
+    def test_00_las_medidas_inician_en_cero_y_el_pigmento_conserva_su_dosis(self):
+        self.ir_al_cotizador()
+        self.at.selectbox(key="area_prod").select(PASTA)
+        self.at.run()
+
+        self.assertEqual(self.at.number_input(key="area_ancho").value, 0.0)
+        self.assertEqual(self.at.number_input(key="area_largo").value, 0.0)
+        self.assertEqual(self.at.number_input(key="area_espesor").value, 0.0)
+        self.assertEqual(self.widget_dosis().value, 10.0,
+                         "la dosis debe seguir precargada desde el catálogo")
+        self.assertTrue(self.at.number_input(key="area_espesor").disabled,
+                        "el espesor no aplica a un pigmento")
+        self.assertIn("Captura", " ".join(str(w.value) for w in self.at.warning))
+        self.assert_sin_cotizacion()
+
     def test_01_la_pasta_de_16m2_son_160_gramos_sin_espesor(self):
         self.ir_al_cotizador()
         self.cotizar(PASTA)
@@ -179,12 +207,21 @@ class TestCotizadorPorArea(unittest.TestCase):
         self.assertIn("5.33 kg", info)
         self.assertIn("0.3333", info)
 
+    def test_08_resinas_sin_espesor_no_muestran_cotizacion(self):
+        self.ir_al_cotizador()
+        self.cotizar(PISOS, ancho=4.0, largo=4.0)
+        self.at.number_input(key="area_espesor").set_value(0.0)
+        self.at.run()
+
+        self.assertIn("espesor mayor que 0 mm", " ".join(str(w.value) for w in self.at.warning))
+        self.assert_sin_cotizacion()
+
 
 if __name__ == "__main__":
     resultado = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__]))
     n = resultado.testsRun
-    if resultado.wasSuccessful() and n == 7:
+    if resultado.wasSuccessful() and n == 9:
         print(f"\n{n}/{n} OK — cotizador por área verificado en la interfaz")
         sys.exit(0)
-    print(f"\n{n - len(resultado.failures) - len(resultado.errors)}/{n} (esperadas 7/7)")
+    print(f"\n{n - len(resultado.failures) - len(resultado.errors)}/{n} (esperadas 9/9)")
     sys.exit(1)
