@@ -134,7 +134,6 @@ HOJA_ESCALAS_KG = "Escalas_Precios_KG"
 TITULO_INVENTARIO = "CONTROL DE INVENTARIO Y FACTURACIÓN - NEMET"
 TASA_IVA = 0.16
 RENDIMIENTO_DEFAULT = cocalc.RENDIMIENTO_DEFAULT_KG_M2_MM  # kg por m² por mm, si el producto no está en Cat_Productos
-DOSIS_PIGMENTO_DEFAULT_G_M2 = cocalc.DOSIS_PIGMENTO_DEFAULT_G_M2  # g/m², si un pigmento no trae Dosis_g_m2
 
 # Sonora (MX) usa UTC-7 todo el año; el servidor de Streamlit Community Cloud vive en UTC.
 try:
@@ -512,7 +511,7 @@ def cargar_catalogo_rendimientos():
             # «Rendimiento» heredado (kg/m²·mm) se ignora por completo.
             rendimiento = float("nan")
             if pd.isna(dosis) or dosis <= 0:
-                dosis = DOSIS_PIGMENTO_DEFAULT_G_M2
+                dosis = cocalc.dosis_por_defecto(nombre)
         tiene_rendimiento = pd.notna(rendimiento) and rendimiento > 0
         tiene_dosis = pd.notna(dosis) and dosis > 0
         if not tiene_rendimiento and not tiene_dosis:
@@ -2789,7 +2788,7 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
 
         dosis_manual = None
         if es_dosificado:
-            dosis_sugerida = float(info_producto.get("dosis_g_m2") or DOSIS_PIGMENTO_DEFAULT_G_M2)
+            dosis_sugerida = float(info_producto.get("dosis_g_m2") or cocalc.dosis_por_defecto(prod_familia))
             dosis_manual = st.number_input("Dosificación del pigmento (g/m²)", min_value=0.1, value=dosis_sugerida,
                                            step=1.0, key=clave_widget_dosis(prod_familia),
                                            help="Gramos de pigmento por cada m² (manual NEMET). No depende del espesor.")
@@ -2798,7 +2797,8 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
                 st.caption(f"Dosificación de `{HOJA_CATALOGO}`: {dosis_sugerida:g} g/m²" + (f" · {fuente}" if fuente else ""))
             else:
                 st.caption(f"⚠️ `{prod_familia}` no trae `Dosis_g_m2` en `{HOJA_CATALOGO}`; se propone "
-                           f"{DOSIS_PIGMENTO_DEFAULT_G_M2:g} g/m². Ajústala aquí o captúrala en la hoja.")
+                           f"{dosis_sugerida:g} g/m² ({cocalc.dosis_por_defecto(prod_familia):g} g/m² es la referencia "
+                           f"de su familia). Ajústala aquí o captúrala en la hoja.")
 
         material = cocalc.calcular_material(area_total, espesor_mm, info_producto, prod_familia, dosis_manual)
         kg_necesarios = material["kg_necesarios"]

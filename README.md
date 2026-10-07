@@ -38,7 +38,7 @@ su fuente antes de agregar al carrito).
 Reglas de seguridad que evitan repetir el error de COT-2026-003 (pasta vendida como 16 kg
 para 16 m²): un producto cuyo nombre es de familia pigmentada **nunca** se calcula con
 `Rendimiento`, aunque la hoja traiga un valor heredado; si llega sin `Dosis_g_m2` se usa
-`DOSIS_PIGMENTO_DEFAULT_G_M2` (10 g/m²) avisando en pantalla; y en modo cantidad directa
+la dosis de respaldo de su familia (pasta 10, metal 8, tinta 60 g/m²) avisando en pantalla; y en modo cantidad directa
 los pigmentos no ofrecen «kilo exacto» a granel porque su venta es por presentación (g/L).
 La aritmética vive en `cotizador_calculo.py` y se prueba con `tests_cotizador.py` y
 `tests_cotizador_app.py`; el detalle del caso está en `correccion_pigmentos_cotizador.md`.

@@ -123,7 +123,8 @@ class TestDatosCatalogo(unittest.TestCase):
         info_vieja["rendimiento"] = 1.0      # el valor que provocó el error
         resultado = cc.calcular_material(AREA, ESPESOR, info_vieja, TINTA)
         self.assertTrue(resultado["es_dosificacion"])
-        self.assertAlmostEqual(resultado["gramos"], cc.DOSIS_PIGMENTO_DEFAULT_G_M2 * AREA, places=6)
+        self.assertAlmostEqual(resultado["gramos"], cc.dosis_por_defecto(TINTA) * AREA, places=6)
+        self.assertAlmostEqual(resultado["gramos"], 960.0, places=6)   # 60 g/m², no 16 kg
         self.assertIsNone(resultado["rendimiento"])
 
 
@@ -161,11 +162,18 @@ class TestCalculoMaterial(unittest.TestCase):
         self.assertFalse(primer["es_dosificacion"])
         self.assertFalse(pisos["es_dosificacion"])
 
-    def test_11_un_pigmento_sin_dosis_usa_el_respaldo_y_no_una_resina(self):
-        resultado = cc.calcular_material(AREA, ESPESOR, {"rendimiento": 1.0}, "EPOXY PASTA NUEVA")
-        self.assertTrue(resultado["es_dosificacion"])
-        self.assertTrue(resultado["dosis_por_defecto"])
-        self.assertAlmostEqual(resultado["gramos"], 160.0, places=6)
+    def test_11_un_pigmento_sin_dosis_usa_el_respaldo_de_su_familia(self):
+        """Con un Excel viejo (sin `Dosis_g_m2`) cada familia conserva su dosis del manual."""
+        casos = {
+            "EPOXY PASTA NUEVA": 160.0,                          # 10 g/m²
+            TINTA: 960.0,                                        # 60 g/m² (≈1 L por 16 m²)
+            "EPOXY METAL PERLADO Y METÁLICOS EN POLVO": 128.0,   # 8 g/m²
+        }
+        for nombre, gramos in casos.items():
+            resultado = cc.calcular_material(AREA, ESPESOR, {"rendimiento": 1.0}, nombre)
+            self.assertTrue(resultado["es_dosificacion"], nombre)
+            self.assertTrue(resultado["dosis_por_defecto"], nombre)
+            self.assertAlmostEqual(resultado["gramos"], gramos, places=6, msg=nombre)
 
     def test_12_la_dosis_capturada_en_pantalla_gana(self):
         info = {"dosis_g_m2": 10.0}

@@ -55,7 +55,7 @@ económica y deja ver todas las presentaciones con su margen.
 3. **Reglas de seguridad:**
    * Un nombre de familia pigmentada **nunca** se calcula con `Rendimiento`, aunque la hoja
      lo traiga (así una hoja vieja tampoco infla).
-   * Sin `Dosis_g_m2` se usa `DOSIS_PIGMENTO_DEFAULT_G_M2 = 10 g/m²` y se avisa en pantalla.
+   * Sin `Dosis_g_m2` se usa la dosis de respaldo de su familia (`dosis_por_defecto`: pasta 10, metal 8, tinta 60 g/m²) y se avisa en pantalla.
    * El cotizador muestra la dosificación con su fuente y **permite ajustarla** antes de
      agregar al carrito (y al cambiar de pigmento se reinicia a la del catálogo).
    * El espesor se deshabilita para pigmentos; el renglón del PDF queda como `[16.00 m²]`

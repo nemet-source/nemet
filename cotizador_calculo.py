@@ -30,6 +30,14 @@ RENDIMIENTO_DEFAULT_KG_M2_MM = 1.2
 #: pigmento nunca vuelva a calcularse con un rendimiento de resina (1 kg/m²).
 DOSIS_PIGMENTO_DEFAULT_G_M2 = 10.0
 
+#: Dosis de respaldo por familia (manual NEMET) cuando el catálogo no trae `Dosis_g_m2`.
+#: Sin esto, una tinta cotizada con la dosis de pasta saldría a 10 g/m² en vez de 60.
+_DOSIS_POR_FAMILIA_G_M2 = (
+    ("TINTA", 60.0),   # ≈1 L por cada 16 m²
+    ("METAL", 8.0),    # manual NEMET
+    ("MICA", 8.0),
+)
+
 #: Familias que se dosifican por área (g/m²) y **nunca** por espesor.
 #: Se evalúa sobre el nombre normalizado (sin acentos y en mayúsculas).
 _RX_FAMILIA_DOSIFICADA = re.compile(
@@ -48,6 +56,20 @@ def normalizar_clave(texto):
 def es_familia_dosificada(nombre):
     """True si el producto se dosifica en g/m² (pigmento), sin importar el espesor."""
     return bool(_RX_FAMILIA_DOSIFICADA.search(normalizar_clave(nombre)))
+
+
+def dosis_por_defecto(nombre):
+    """Dosis de respaldo (g/m²) de un pigmento que llegó sin `Dosis_g_m2` en el catálogo.
+
+    Usa la dosis del manual según la familia (tinta 60, metal y mica 8) y 10 g/m² para
+    el resto (pastas, fotoluminiscentes). Así, aun con un Excel viejo, una tinta no se
+    cotiza con la dosis de una pasta.
+    """
+    clave = normalizar_clave(nombre)
+    for fragmento, dosis in _DOSIS_POR_FAMILIA_G_M2:
+        if fragmento in clave:
+            return dosis
+    return DOSIS_PIGMENTO_DEFAULT_G_M2
 
 
 # ==========================================
@@ -128,7 +150,7 @@ def calcular_material(area_m2, espesor_mm=1.0, info_producto=None, nombre="", do
         except (TypeError, ValueError):
             dosis = 0.0
         if dosis <= 0:
-            dosis = DOSIS_PIGMENTO_DEFAULT_G_M2
+            dosis = dosis_por_defecto(nombre)
             por_defecto = True
         gramos = area * dosis
         return {
