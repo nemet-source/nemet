@@ -79,6 +79,15 @@ _RE_PRESENTACION = re.compile(
     r"^\s*(\d+(?:[.,]\d+)?|\d+\s*/\s*\d+)\s*(kg|kgs|kilo|kilos|g|gr|grs|gramos|l|lt|lts|litro|litros|ml)\.?\s*$",
     re.IGNORECASE,
 )
+# Rangos de precio: "0 a 59.999 kg", "+ 60 kg", "1 a 20 kg"
+_RE_RANGO_PRESENTACION = re.compile(
+    r"^\s*(\d+(?:[.,]\d+)?)\s+(?:a|al)\s+(\d+(?:[.,]\d+)?)\s*(kg|kgs|kilo|kilos)\s*$",
+    re.IGNORECASE,
+)
+_RE_MAS_PRESENTACION = re.compile(
+    r"^\s*\+\s*(\d+(?:[.,]\d+)?)\s*(kg|kgs|kilo|kilos)\s*$",
+    re.IGNORECASE,
+)
 _FACTOR_A_KG = {"kg": 1, "kgs": 1, "kilo": 1, "kilos": 1, "g": 0.001, "gr": 0.001, "grs": 0.001,
                 "gramos": 0.001, "l": 1, "lt": 1, "lts": 1, "litro": 1, "litros": 1, "ml": 0.001}
 FACTOR_A_KG = _FACTOR_A_KG
@@ -87,20 +96,35 @@ FACTOR_A_KG = _FACTOR_A_KG
 def parsear_presentacion_kg(presentacion):
     """'1.420 kg' -> 1.42 | '500 g' -> 0.5 | '1/2 kg' -> 0.5 | '1 L' -> 1.0 (1 L ~ 1 kg).
 
-    Piezas ('1 Pz') y rangos de precio ('10 a 20 kg', '< 10 kg') no son presentaciones
-    cotizables -> None.
+    Piezas ('1 Pz') -> None.
+    Rangos de precio ('0 a 59.999 kg', '+ 60 kg', '1 a 20 kg') -> valor mínimo del rango (kg).
     """
-    coincidencia = _RE_PRESENTACION.match(str(presentacion))
-    if not coincidencia:
-        return None
-    numero, unidad = coincidencia.group(1), coincidencia.group(2).lower()
-    if "/" in numero:
-        numerador, denominador = numero.split("/")
-        valor = float(numerador) / float(denominador)
-    else:
-        valor = float(numero.replace(",", "."))
-    kg = valor * _FACTOR_A_KG[unidad]
-    return kg if kg > 0 else None
+    texto = str(presentacion).strip()
+    
+    # Presentación estándar: "1.420 kg", "500 g", "1/2 kg"
+    coincidencia = _RE_PRESENTACION.match(texto)
+    if coincidencia:
+        numero, unidad = coincidencia.group(1), coincidencia.group(2).lower()
+        if "/" in numero:
+            numerador, denominador = numero.split("/")
+            valor = float(numerador) / float(denominador)
+        else:
+            valor = float(numero.replace(",", "."))
+        kg = valor * _FACTOR_A_KG[unidad]
+        return kg if kg > 0 else None
+    
+    # Rango de precio: "1 a 20 kg" -> 1 kg (mínimo del rango)
+    match_rango = _RE_RANGO_PRESENTACION.match(texto)
+    if match_rango:
+        valor_min = float(match_rango.group(1).replace(",", "."))
+        return valor_min if valor_min > 0 else 1.0  # Si es 0, usar 1 kg como base
+    
+    # "+ X kg" -> X kg
+    match_mas = _RE_MAS_PRESENTACION.match(texto)
+    if match_mas:
+        return float(match_mas.group(1).replace(",", "."))
+    
+    return None
 
 
 def unidades_para_cubrir(kg_necesarios, kg_por_unidad):
