@@ -49,7 +49,8 @@ class TestFlujoAcceso(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory()
         cls.app_dir = os.path.join(cls.tmp.name, "nemet")
         os.makedirs(os.path.join(cls.app_dir, "assets"), exist_ok=True)
-        for nombre in ("app.py", "auth_nemet.py", "prospeccion.py", "Sistema_Inventario_NEMET_Final.xlsx"):
+        for nombre in ("app.py", "auth_nemet.py", "prospeccion.py", "cotizador_calculo.py",
+                       "Sistema_Inventario_NEMET_Final.xlsx"):
             shutil.copy(os.path.join(BASE, nombre), os.path.join(cls.app_dir, nombre))
         for nombre in os.listdir(os.path.join(BASE, "assets")):
             shutil.copy(os.path.join(BASE, "assets", nombre), os.path.join(cls.app_dir, "assets", nombre))

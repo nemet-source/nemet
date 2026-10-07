@@ -13,13 +13,35 @@ las cuentas y el acceso.
 | 📦 Control de Inventario y Edición | Edición directa de la hoja `Inventario`. `StockActual`, `AlertaStock`, `PrecioBaseSinIVA`, `IVA 16%` y `ValorInventario` se calculan automáticamente al guardar. | Admin · Editor |
 | 👥 Gestión de Clientes | Alta/edición de clientes en la hoja `Clientes`. | Admin · Editor |
 | 🎯 Prospección Comercial | **NEMET PROSPECTOR:** búsqueda OSM con respaldo DENUE (INEGI), mapa, puntuación explicable, borrador de WhatsApp y agenda comercial en la hoja `Prospectos`; también admite CSV. | Admin · Editor |
-| 📏 Cotizador por Área y Milimétrico | Calcula el material necesario (`m² × mm × rendimiento`, con el rendimiento y la proporción A:B de la hoja `Cat_Productos`) y recomienda la presentación más económica. | Admin · Editor · Usuario |
+| 📏 Cotizador por Área y Milimétrico | Calcula el material necesario —resinas por espesor (`m² × mm × rendimiento`) y **pigmentos por dosificación** (`m² × Dosis_g_m2`), ambas de `Cat_Productos`, con la proporción A:B— y recomienda la presentación más económica. | Admin · Editor · Usuario |
 | 📝 Cotizador Comercial Profesional | Carrito manual por SKU. | Admin · Editor · Usuario |
 | 📋 Historial de Cotizaciones | Consulta, búsqueda y borrado (con confirmación) de folios `COT-AAAA-NNN`. El borrado total es solo para administradores. | Admin · Editor · Usuario |
 | 🛡️ Administración de Usuarios | Alta, edición, roles, desactivación, restablecimiento de contraseñas y bitácora de actividad. | Solo Admin |
 
 Ambos cotizadores generan el PDF, lo envían por correo y registran el folio en la hoja
 `Historial_Cotizaciones` (una sola vez por carrito, aunque se descargue o envíe varias veces).
+
+### Dosificación de pigmentos (`Dosis_g_m2`)
+
+El manual NEMET maneja dos fórmulas distintas y el cotizador las respeta por separado:
+
+| Tipo de producto | Columna en `Cat_Productos` | Fórmula | Depende del espesor |
+|---|---|---|---|
+| Resinas y sistemas (EPOXY PISOS, PRIMER, EPO-DEEP…) | `Rendimiento` (kg/m²·mm) | `m² × mm × rendimiento` | Sí |
+| Pigmentos (pastas, tintas, metal, fotoluminiscentes, micas) | `Dosis_g_m2` (g/m²) | `m² × dosis ÷ 1000` | **No** |
+
+Valores de partida: pasta `10` g/m² y metalizados `8` g/m² (manual); tinta `60` g/m² (≈1 L
+por cada 16 m²; ajústala si el manual la especifica) y fotoluminiscentes `10` g/m² (criterio
+NEMET; editable en la hoja o en la pantalla del cotizador, que muestra la dosificación con
+su fuente antes de agregar al carrito).
+
+Reglas de seguridad que evitan repetir el error de COT-2026-003 (pasta vendida como 16 kg
+para 16 m²): un producto cuyo nombre es de familia pigmentada **nunca** se calcula con
+`Rendimiento`, aunque la hoja traiga un valor heredado; si llega sin `Dosis_g_m2` se usa
+la dosis de respaldo de su familia (pasta 10, metal 8, tinta 60 g/m²) avisando en pantalla; y en modo cantidad directa
+los pigmentos no ofrecen «kilo exacto» a granel porque su venta es por presentación (g/L).
+La aritmética vive en `cotizador_calculo.py` y se prueba con `tests_cotizador.py` y
+`tests_cotizador_app.py`; el detalle del caso está en `correccion_pigmentos_cotizador.md`.
 
 ## 🎯 NEMET PROSPECTOR
 
@@ -276,7 +298,12 @@ python tests_bateria.py        #  24/24  identidad de marca (assets, tema)
 python tests_autenticacion.py  #  55/55  hashes, roles, sesiones, bases dañadas o de solo lectura, asistente CLI
 python tests_prospeccion.py    #  22/22 giros, Google Maps, CSV, alta manual y privacidad (sin red)
 python tests_flujo_app.py      #  17/17 acceso + CRM y alta manual (AppTest, copia temporal)
+python tests_cotizador.py      #  20/20 dosificación de pigmentos vs. rendimiento por espesor (sin Streamlit)
+python tests_cotizador_app.py  #    7/7 el cotizador por área manejado como lo hace una persona (AppTest)
 ```
+
+> El cotizador se apoya en `cotizador_calculo.py` (lógica pura, sin Streamlit) para que la
+> misma aritmética se pruebe sola y en la interfaz. Ver `correccion_pigmentos_cotizador.md`.
 
 Sin `[auth]` en los Secrets la app arranca, pero muestra la pantalla de acceso y avisa que no hay
 administrador configurado: nadie puede entrar hasta definir `admin_usuario` y `admin_password`.
