@@ -1,0 +1,1564 @@
+diff --git a/README.md b/README.md
+index 7397eb7..36e9264 100644
+--- a/README.md
++++ b/README.md
+@@ -13,7 +13,7 @@ las cuentas y el acceso.
+ | 📦 Control de Inventario y Edición | Edición directa de la hoja `Inventario`. `StockActual`, `AlertaStock`, `PrecioBaseSinIVA`, `IVA 16%` y `ValorInventario` se calculan automáticamente al guardar. | Admin · Editor |
+ | 👥 Gestión de Clientes | Alta/edición de clientes en la hoja `Clientes`. | Admin · Editor |
+ | 🎯 Prospección Comercial | **NEMET PROSPECTOR:** búsqueda OSM con respaldo DENUE (INEGI), mapa, puntuación explicable, borrador de WhatsApp y agenda comercial en la hoja `Prospectos`; también admite CSV. | Admin · Editor |
+-| 📏 Cotizador por Área y Milimétrico | Calcula el material necesario (`m² × mm × rendimiento`, con el rendimiento y la proporción A:B de la hoja `Cat_Productos`) y recomienda la presentación más económica. | Admin · Editor · Usuario |
++| 📏 Cotizador por Área y Milimétrico | Calcula el material necesario —resinas por espesor (`m² × mm × rendimiento`) y **pigmentos por dosificación** (`m² × Dosis_g_m2`), ambas de `Cat_Productos`, con la proporción A:B— y recomienda la presentación más económica. | Admin · Editor · Usuario |
+ | 📝 Cotizador Comercial Profesional | Carrito manual por SKU. | Admin · Editor · Usuario |
+ | 📋 Historial de Cotizaciones | Consulta, búsqueda y borrado (con confirmación) de folios `COT-AAAA-NNN`. El borrado total es solo para administradores. | Admin · Editor · Usuario |
+ | 🛡️ Administración de Usuarios | Alta, edición, roles, desactivación, restablecimiento de contraseñas y bitácora de actividad. | Solo Admin |
+@@ -21,6 +21,28 @@ las cuentas y el acceso.
+ Ambos cotizadores generan el PDF, lo envían por correo y registran el folio en la hoja
+ `Historial_Cotizaciones` (una sola vez por carrito, aunque se descargue o envíe varias veces).
+ 
++### Dosificación de pigmentos (`Dosis_g_m2`)
++
++El manual NEMET maneja dos fórmulas distintas y el cotizador las respeta por separado:
++
++| Tipo de producto | Columna en `Cat_Productos` | Fórmula | Depende del espesor |
++|---|---|---|---|
++| Resinas y sistemas (EPOXY PISOS, PRIMER, EPO-DEEP…) | `Rendimiento` (kg/m²·mm) | `m² × mm × rendimiento` | Sí |
++| Pigmentos (pastas, tintas, metal, fotoluminiscentes, micas) | `Dosis_g_m2` (g/m²) | `m² × dosis ÷ 1000` | **No** |
++
++Valores de partida: pasta `10` g/m² y metalizados `8` g/m² (manual); tinta `60` g/m² (≈1 L
++por cada 16 m²; ajústala si el manual la especifica) y fotoluminiscentes `10` g/m² (criterio
++NEMET; editable en la hoja o en la pantalla del cotizador, que muestra la dosificación con
++su fuente antes de agregar al carrito).
++
++Reglas de seguridad que evitan repetir el error de COT-2026-003 (pasta vendida como 16 kg
++para 16 m²): un producto cuyo nombre es de familia pigmentada **nunca** se calcula con
++`Rendimiento`, aunque la hoja traiga un valor heredado; si llega sin `Dosis_g_m2` se usa
++la dosis de respaldo de su familia (pasta 10, metal 8, tinta 60 g/m²) avisando en pantalla; y en modo cantidad directa
++los pigmentos no ofrecen «kilo exacto» a granel porque su venta es por presentación (g/L).
++La aritmética vive en `cotizador_calculo.py` y se prueba con `tests_cotizador.py` y
++`tests_cotizador_app.py`; el detalle del caso está en `correccion_pigmentos_cotizador.md`.
++
+ ## 🎯 NEMET PROSPECTOR
+ 
+ **Buscar → Detectar → Calificar → Contactar → Dar seguimiento → Vender.** Disponible para
+@@ -276,8 +298,13 @@ python tests_bateria.py        #  24/24  identidad de marca (assets, tema)
+ python tests_autenticacion.py  #  55/55  hashes, roles, sesiones, bases dañadas o de solo lectura, asistente CLI
+ python tests_prospeccion.py    #  22/22 giros, Google Maps, CSV, alta manual y privacidad (sin red)
+ python tests_flujo_app.py      #  17/17 acceso + CRM y alta manual (AppTest, copia temporal)
++python tests_cotizador.py      #  20/20 dosificación de pigmentos vs. rendimiento por espesor (sin Streamlit)
++python tests_cotizador_app.py  #    8/8 el cotizador por área manejado como lo hace una persona (AppTest)
+ ```
+ 
++> El cotizador se apoya en `cotizador_calculo.py` (lógica pura, sin Streamlit) para que la
++> misma aritmética se pruebe sola y en la interfaz. Ver `correccion_pigmentos_cotizador.md`.
++
+ Sin `[auth]` en los Secrets la app arranca, pero muestra la pantalla de acceso y avisa que no hay
+ administrador configurado: nadie puede entrar hasta definir `admin_usuario` y `admin_password`.
+ 
+diff --git a/Sistema_Inventario_NEMET_Final.xlsx b/Sistema_Inventario_NEMET_Final.xlsx
+index 28426aa..09506b1 100644
+Binary files a/Sistema_Inventario_NEMET_Final.xlsx and b/Sistema_Inventario_NEMET_Final.xlsx differ
+diff --git a/app.py b/app.py
+index ff90622..956b27b 100644
+--- a/app.py
++++ b/app.py
+@@ -22,6 +22,7 @@ from fpdf.enums import XPos, YPos
+ from fpdf.fonts import FontFace
+ 
+ import auth_nemet as auth  # autenticación, roles y administración de usuarios (SQLite + scrypt)
++import cotizador_calculo as cocalc  # rendimiento por mm vs. dosificación g/m² de pigmentos
+ import prospeccion as pros  # búsqueda pública, clasificación y deduplicación de prospectos
+ 
+ try:
+@@ -132,7 +133,7 @@ HOJA_ESCALAS_KG = "Escalas_Precios_KG"
+ 
+ TITULO_INVENTARIO = "CONTROL DE INVENTARIO Y FACTURACIÓN - NEMET"
+ TASA_IVA = 0.16
+-RENDIMIENTO_DEFAULT = 1.2  # kg por m² por mm, si el producto no está en Cat_Productos
++RENDIMIENTO_DEFAULT = cocalc.RENDIMIENTO_DEFAULT_KG_M2_MM  # kg por m² por mm, si el producto no está en Cat_Productos
+ 
+ # Sonora (MX) usa UTC-7 todo el año; el servidor de Streamlit Community Cloud vive en UTC.
+ try:
+@@ -484,7 +485,13 @@ def cargar_historial():
+ 
+ 
+ def cargar_catalogo_rendimientos():
+-    """Lee Cat_Productos -> {producto_normalizado: {rendimiento, prop_a, prop_b}}."""
++    """Lee Cat_Productos -> {producto_normalizado: {rendimiento, prop_a, prop_b, dosis_g_m2, fuente_dosis}}.
++
++    `rendimiento` son kg por m² **por mm** (resinas y sistemas). `dosis_g_m2` son los
++    gramos por m² de los pigmentos, que **no** dependen del espesor (ver cotizador_calculo).
++    Si un pigmento llegara sin dosis capturada se usa la dosis de respaldo, nunca un
++    rendimiento de resina: así ninguna pasta o tinta se vuelve a cotizar a 1 kg/m².
++    """
+     try:
+         df_cat = pd.read_excel(EXCEL_FILE, sheet_name=HOJA_CATALOGO)
+     except Exception:
+@@ -495,15 +502,28 @@ def cargar_catalogo_rendimientos():
+     catalogo = {}
+     for _, fila in df_cat.iterrows():
+         nombre = normalizar_texto(valor_celda(fila, "Producto"))
++        if not nombre or nombre in catalogo:
++            continue
+         rendimiento = pd.to_numeric(fila.get("Rendimiento"), errors="coerce")
+-        if not nombre or pd.isna(rendimiento) or rendimiento <= 0 or nombre in catalogo:
++        dosis = pd.to_numeric(fila.get("Dosis_g_m2"), errors="coerce")
++        if cocalc.es_familia_dosificada(nombre):
++            # Un pigmento siempre se dosifica por área; si el catálogo todavía trae un
++            # «Rendimiento» heredado (kg/m²·mm) se ignora por completo.
++            rendimiento = float("nan")
++            if pd.isna(dosis) or dosis <= 0:
++                dosis = cocalc.dosis_por_defecto(nombre)
++        tiene_rendimiento = pd.notna(rendimiento) and rendimiento > 0
++        tiene_dosis = pd.notna(dosis) and dosis > 0
++        if not tiene_rendimiento and not tiene_dosis:
+             continue
+         prop_a = pd.to_numeric(fila.get("Prop_A"), errors="coerce")
+         prop_b = pd.to_numeric(fila.get("Prop_B"), errors="coerce")
+         catalogo[nombre] = {
+-            "rendimiento": float(rendimiento),
++            "rendimiento": float(rendimiento) if tiene_rendimiento else None,
+             "prop_a": float(prop_a) if pd.notna(prop_a) and prop_a > 0 else 100.0,
+             "prop_b": float(prop_b) if pd.notna(prop_b) and prop_b > 0 else 0.0,
++            "dosis_g_m2": float(dosis) if tiene_dosis else None,
++            "fuente_dosis": str(valor_celda(fila, "Fuente_Dosis", "") or ""),
+         }
+     return catalogo
+ 
+@@ -674,28 +694,16 @@ def calcular_opcion_kilo_exacto(kg_necesarios, escala):
+     }
+ 
+ 
+-_RE_PRESENTACION = re.compile(
+-    r"^\s*(\d+(?:[.,]\d+)?|\d+\s*/\s*\d+)\s*(kg|kgs|kilo|kilos|g|gr|grs|gramos|l|lt|lts|litro|litros|ml)\.?\s*$",
+-    re.IGNORECASE,
+-)
+-_FACTOR_A_KG = {"kg": 1, "kgs": 1, "kilo": 1, "kilos": 1, "g": 0.001, "gr": 0.001, "grs": 0.001, "gramos": 0.001,
+-                "l": 1, "lt": 1, "lts": 1, "litro": 1, "litros": 1, "ml": 0.001}
++_FACTOR_A_KG = cocalc.FACTOR_A_KG  # alias: la tabla vive en cotizador_calculo (probada sin Streamlit)
+ 
+ 
+ def parsear_presentacion_kg(presentacion):
+     """'1.420 kg' -> 1.42 | '500 g' -> 0.5 | '1/2 kg' -> 0.5 | '1 L' -> 1.0 (1 L ~ 1 kg).
+-    Piezas ('1 Pz') y rangos de precio ('10 a 20 kg', '< 10 kg') no son presentaciones cotizables -> None."""
+-    coincidencia = _RE_PRESENTACION.match(str(presentacion))
+-    if not coincidencia:
+-        return None
+-    numero, unidad = coincidencia.group(1), coincidencia.group(2).lower()
+-    if "/" in numero:
+-        numerador, denominador = numero.split("/")
+-        valor = float(numerador) / float(denominador)
+-    else:
+-        valor = float(numero.replace(",", "."))
+-    kg = valor * _FACTOR_A_KG[unidad]
+-    return kg if kg > 0 else None
++
++    Piezas ('1 Pz') y rangos de precio ('10 a 20 kg', '< 10 kg') no son presentaciones
++    cotizables -> None. Implementación en `cotizador_calculo` para poder probarla sola.
++    """
++    return cocalc.parsear_presentacion_kg(presentacion)
+ 
+ 
+ def columnas_inventario(df):
+@@ -705,6 +713,17 @@ def columnas_inventario(df):
+     return col_desc, col_sku, col_pres
+ 
+ 
++def clave_widget_dosis(familia):
++    """Clave estable de widget para la dosificación (g/m²) de cada familia pigmentada.
++
++    Al ser una clave por producto, el widget arranca con la dosis del catálogo y no se
++    queda con el valor del pigmento anterior (p. ej. los 10 g/m² de la pasta aplicados a
++    una tinta de 60 g/m²).
++    """
++    limpia = re.sub(r"[^0-9A-Z]+", "_", cocalc.normalizar_clave(familia)).strip("_")[:60]
++    return f"area_dosis_{limpia.lower() or 'pigmento'}"
++
++
+ # ==========================================
+ # GUARDADO EN EXCEL
+ # ==========================================
+@@ -899,8 +918,12 @@ def describir_item(fila):
+     texto = f"{formato_cantidad(valor_celda(fila, 'Cantidad', 1))}x {valor_celda(fila, 'Descripcion')} ({valor_celda(fila, 'Presentacion')})"
+     area = valor_celda(fila, "Area_m2", None)
+     espesor = valor_celda(fila, "Espesor_mm", None)
+-    if area is not None and espesor is not None:
+-        texto += f" [{float(area):.2f} m² x {float(espesor):g} mm]"
++    if area is not None and float(area) > 0:
++        # Los pigmentos se dosifican por m² (g/m²): su renglón del historial va sin espesor.
++        if espesor is not None and float(espesor) > 0:
++            texto += f" [{float(area):.2f} m² x {float(espesor):g} mm]"
++        else:
++            texto += f" [{float(area):.2f} m²]"
+     return texto
+ 
+ 
+@@ -1002,8 +1025,12 @@ def descripcion_para_cliente(fila):
+     texto = str(valor_celda(fila, "Descripcion", "") or "")
+     area = valor_celda(fila, "Area_m2", None)
+     espesor = valor_celda(fila, "Espesor_mm", None)
+-    if area is not None and espesor is not None and float(area) > 0 and float(espesor) > 0:
+-        texto += f" [{float(area):.2f} m² x {float(espesor):g} mm]"
++    if area is not None and float(area) > 0:
++        # Los pigmentos se dosifican por m² (g/m²): su renglón va sin espesor.
++        if espesor is not None and float(espesor) > 0:
++            texto += f" [{float(area):.2f} m² x {float(espesor):g} mm]"
++        else:
++            texto += f" [{float(area):.2f} m²]"
+     return texto
+ 
+ 
+@@ -2705,6 +2732,9 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
+             familias_piezas.append(descripcion)
+ 
+     familias_directas = sorted(set(familias_peso_vol + familias_piezas))
++    # Familias con peso/volumen que no se pueden cotizar por área por falta de rendimiento
++    # o dosificación en Cat_Productos: se listan para que no desaparezcan en silencio.
++    familias_sin_area = [f for f in familias_peso_vol if f not in familias_area]
+ 
+     if not familias_area and not familias_directas:
+         st.error("No hay productos cotizables.")
+@@ -2719,34 +2749,78 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
+ 
+     # Variables que se llenan según modo
+     area_total = 0.0
+-    espesor_mm = 1.0
++    espesor_mm = 0.0
+     kg_necesarios = 0.0
+     prod_familia = None
+     es_modo_pieza = False
+     cantidad_pieza_solicitada = 0
+     unidad_solicitada = "kg"
+     cantidad_solicitada_original = 0.0
++    es_dosificado = False       # True = pigmento dosificado por área (g/m²)
++    material = None             # resultado de cotizador_calculo.calcular_material
++    espesor_carrito = 0         # 0 = el renglón no muestra espesor (pigmentos por m²)
++
++    if familias_sin_area:
++        with st.expander(f"ℹ️ {len(familias_sin_area)} familias solo se cotizan en modo cantidad directa"):
++            st.caption(f"Por área solo aparecen los productos que tienen rendimiento (kg/m²·mm) o dosificación "
++                       f"(`Dosis_g_m2`, g/m²) en la hoja `{HOJA_CATALOGO}`. Estas familias siguen disponibles en "
++                       f"«⚖️ Por Cantidad directa»:")
++            st.dataframe(pd.DataFrame({"Familia": sorted(familias_sin_area)}), width="stretch", hide_index=True)
+ 
+     if modo_cot.startswith("📐"):
++        # Primero el producto: define si el material se calcula por espesor (resinas) o
++        # por dosificación en g/m² (pigmentos), y con eso se habilita o no el espesor.
+         col_a2, col_a3, col_a4 = st.columns(3)
+-        with col_a2:
+-            ancho = st.number_input("Ancho (metros)", min_value=0.1, value=3.0, step=0.1, key="area_ancho")
+-            largo = st.number_input("Largo (metros)", min_value=0.1, value=4.0, step=0.1, key="area_largo")
+-            area_total = ancho * largo
+-        with col_a3:
+-            espesor_mm = st.number_input("Espesor (mm)", min_value=0.1, value=1.0, step=0.5, key="area_espesor")
+         with col_a4:
+             prod_familia = st.selectbox("Línea de Producto", familias_area if familias_area else familias_directas, key="area_prod")
+-
+         info_producto = buscar_en_catalogo(prod_familia, catalogo) or {}
+-        rendimiento = info_producto.get("rendimiento", RENDIMIENTO_DEFAULT)
+-        kg_necesarios = area_total * espesor_mm * rendimiento
+-
+-        st.info(f"📐 **Área Total:** {area_total:.2f} m² | **Rendimiento:** {rendimiento:g} kg/m² por mm | "
+-                f"**Material necesario:** **{kg_necesarios:.2f} kg**")
+-        if not info_producto:
+-            st.caption(f"Este producto no está en `{HOJA_CATALOGO}`; se usa el rendimiento por defecto ({RENDIMIENTO_DEFAULT}).")
+-        elif info_producto.get("prop_b", 0) > 0:
++        es_dosificado = cocalc.es_familia_dosificada(prod_familia)
++        usa_dosis_catalogo = bool(info_producto.get("dosis_g_m2"))
++        with col_a2:
++            ancho = st.number_input("Ancho (metros)", min_value=0.0, value=0.0, step=0.1, format="%.2f", key="area_ancho")
++            largo = st.number_input("Largo (metros)", min_value=0.0, value=0.0, step=0.1, format="%.2f", key="area_largo")
++            area_total = ancho * largo
++        with col_a3:
++            espesor_mm = st.number_input("Espesor (mm)", min_value=0.0, value=0.0, step=0.5, format="%.1f", key="area_espesor",
++                                         disabled=es_dosificado,
++                                         help=("Los pigmentos se dosifican por área (g/m²): el espesor no cambia el consumo."
++                                               if es_dosificado else None))
++
++        dosis_manual = None
++        if es_dosificado:
++            dosis_sugerida = float(info_producto.get("dosis_g_m2") or cocalc.dosis_por_defecto(prod_familia))
++            dosis_manual = st.number_input("Dosificación del pigmento (g/m²)", min_value=0.1, value=dosis_sugerida,
++                                           step=1.0, key=clave_widget_dosis(prod_familia),
++                                           help="Gramos de pigmento por cada m² (manual NEMET). No depende del espesor.")
++            if usa_dosis_catalogo:
++                fuente = info_producto.get("fuente_dosis")
++                st.caption(f"Dosificación de `{HOJA_CATALOGO}`: {dosis_sugerida:g} g/m²" + (f" · {fuente}" if fuente else ""))
++            else:
++                st.caption(f"⚠️ `{prod_familia}` no trae `Dosis_g_m2` en `{HOJA_CATALOGO}`; se propone "
++                           f"{dosis_sugerida:g} g/m² ({cocalc.dosis_por_defecto(prod_familia):g} g/m² es la referencia "
++                           f"de su familia). Ajústala aquí o captúrala en la hoja.")
++
++        material = cocalc.calcular_material(area_total, espesor_mm, info_producto, prod_familia, dosis_manual)
++        kg_necesarios = material["kg_necesarios"]
++        espesor_carrito = 0 if material["es_dosificacion"] else espesor_mm
++        # Sin medidas capturadas no hay material: se pide el dato en lugar de mostrar 0 kg.
++        falta_dato = area_total <= 0 or (not material["es_dosificacion"] and espesor_mm <= 0)
++
++        if falta_dato:
++            st.info("📐 Captura **ancho** y **largo**"
++                    + ("" if material["es_dosificacion"] else " y el **espesor**")
++                    + " para calcular el material necesario.")
++        elif material["es_dosificacion"]:
++            st.info(f"📐 **Área Total:** {area_total:.2f} m² | **Dosificación:** {material['dosis_g_m2']:g} g/m² "
++                    f"(no depende del espesor) | **Material necesario:** "
++                    f"**{material['gramos']:,.0f} g** ({material['kg_necesarios']:.3f} kg)")
++        else:
++            st.info(f"📐 **Área Total:** {area_total:.2f} m² | **Rendimiento:** {material['rendimiento']:g} kg/m² por mm | "
++                    f"**Material necesario:** **{kg_necesarios:.2f} kg**")
++            if material["rendimiento_por_defecto"]:
++                st.caption(f"Este producto no tiene rendimiento en `{HOJA_CATALOGO}`; se usa el rendimiento por defecto "
++                           f"({RENDIMIENTO_DEFAULT} kg/m² por mm).")
++        if not falta_dato and not material["es_dosificacion"] and info_producto.get("prop_b", 0) > 0:
+             prop_a, prop_b = info_producto["prop_a"], info_producto["prop_b"]
+             kg_a = kg_necesarios * prop_a / (prop_a + prop_b)
+             st.caption(f"🧪 Proporción de mezcla A:B = {prop_a:g}:{prop_b:g} → Parte A (resina): {kg_a:.2f} kg | "
+@@ -2759,6 +2833,7 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
+         c1, c2, c3 = st.columns([2, 1, 1])
+         with c1:
+             prod_familia = st.selectbox("Producto", familias_directas, key="direct_prod")
++        es_dosificado = cocalc.es_familia_dosificada(prod_familia)
+         with c2:
+             cantidad_solicitada_original = st.number_input("Cantidad que pide el cliente", min_value=0.01, value=1.0, step=0.1, format="%.3f", key="direct_cant")
+         with c3:
+@@ -2846,10 +2921,7 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
+             pres_kg = float(fila["Kg_Num"])
+             precio_pub = float(valor_celda(fila, "PrecioPublicoIVA", 0.0))
+             precio_compra_unit = costo_por_sku.get(str(valor_celda(fila, col_sku)).strip(), 0.0)
+-            if kg_necesarios <= 0:
+-                unidades = 0
+-            else:
+-                unidades = max(1, math.ceil(round(kg_necesarios / pres_kg, 6)))
++            unidades = cocalc.unidades_para_cubrir(kg_necesarios, pres_kg)
+             sku_fila = str(valor_celda(fila, col_sku))
+             costo_total_pub = unidades * precio_pub
+             costo_total_compra = unidades * precio_compra_unit
+@@ -2880,12 +2952,8 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
+         escala_aplicable = buscar_escala_kg(prod_familia, kg_necesarios, escalas_dict) if escalas_dict else None
+         opcion_kilo = calcular_opcion_kilo_exacto(kg_necesarios, escala_aplicable) if escala_aplicable else None
+ 
+-    optima = None
+-    optima_pz = None
+-    if resultados:
+-        optima = min(resultados, key=lambda x: (x["Costo Total"], x["Unidades"]))
+-    if resultados_pz:
+-        optima_pz = min(resultados_pz, key=lambda x: (x["Costo Total"], x["Unidades"]))
++    optima = cocalc.elegir_opcion_mas_economica(resultados, "Costo Total", "Unidades")
++    optima_pz = cocalc.elegir_opcion_mas_economica(resultados_pz, "Costo Total", "Unidades")
+ 
+     # --- UI comparativa ---
+     if es_modo_pieza:
+@@ -2905,7 +2973,7 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
+                     "Descripcion": prod_familia,
+                     "Presentacion": optima_pz["Presentación"],
+                     "Area_m2": round(area_total, 2) if modo_cot.startswith("📐") else 0,
+-                    "Espesor_mm": espesor_mm if modo_cot.startswith("📐") else 0,
++                    "Espesor_mm": espesor_carrito if modo_cot.startswith("📐") else 0,
+                     "Kg_Necesarios": 0,
+                     "Cantidad": optima_pz["Unidades"],
+                     "Subtotal": optima_pz["Costo Total"],
+@@ -2917,181 +2985,199 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
+         else:
+             st.info("No hay presentaciones por pieza para este producto.")
+     else:
+-        st.markdown("### ⚖️ Comparativa: Kilo Exacto (Granel) vs Cubetas")
+-
+-        if opcion_kilo is None and not resultados:
+-            st.warning("No se encontraron presentaciones ni escalas por kg para este producto.")
++        # Sin medidas no hay material que cotizar: se pide el dato y no se proponen presentaciones.
++        if kg_necesarios <= 0:
++            st.caption("⬆️ Al capturar las medidas verás aquí la mejor presentación (granel o cubetas) y el total a pagar.")
+         else:
+-            col_kilo, col_cubeta = st.columns(2)
+-
+-            with col_kilo:
+-                st.markdown("#### 🧮 Opción A: Kilo Exacto (Granel)")
+-                if opcion_kilo:
+-                    esc = opcion_kilo["escala"]
+-                    st.metric("Precio por kg (público)", f"${opcion_kilo['precio_kg']:,.2f} MXN",
+-                              help=f"Escala: {esc['rango_texto']} | Costo: ${esc['costo']:.2f}/kg")
+-                    st.write(f"**Kg necesarios:** {opcion_kilo['kg']:.3f} kg ({opcion_kilo['kg']*1000:.0f} g)")
+-                    st.write(f"**Escala aplicada:** `{esc['rango_texto']}` ({esc['producto_proveedor']})")
+-                    st.write(f"**Total cliente:** **${opcion_kilo['total_publico']:,.2f} MXN**")
+-                    st.write(f"**Costo compra:** ${opcion_kilo['total_costo']:,.2f} MXN")
+-                    st.write(f"**Margen:** ${opcion_kilo['margen_total']:,.2f} "
+-                             f"({opcion_kilo['margen_venta_pct']:.1f}% sobre venta / "
+-                             f"{opcion_kilo['margen_costo_pct']:.1f}% markup)")
+-                    st.caption(f"Compra: ${opcion_kilo['costo_kg']:.2f}/kg × {kg_necesarios:.3f} kg = "
+-                               f"${opcion_kilo['total_costo']:,.2f} | "
+-                               f"Venta: ${opcion_kilo['precio_kg']:.2f}/kg × {kg_necesarios:.3f} kg")
+-                    # Mostrar equivalencias
+-                    st.caption(f"Equivalencias: {kg_necesarios:.3f} kg = {kg_necesarios*1000:.0f} g = {kg_necesarios:.3f} L ≈ {kg_necesarios*1000:.0f} ml")
+-                else:
+-                    st.info("Sin escala por kg disponible para este producto/cantidad. "
+-                            f"Revisa la hoja `{HOJA_ESCALAS_KG}` o cotiza por cubetas.")
+-                    if not escalas_dict:
+-                        st.caption(f"La hoja `{HOJA_ESCALAS_KG}` no existe o está vacía.")
+-                    # Si no hay escala, ofrecer precio por kg derivado del inventario como fallback
+-                    if resultados and kg_necesarios > 0:
+-                        # precio por kg más barato de presentaciones
+-                        mejor_por_kg = min((r["Precio Público"]/r["Kg por unidad"] for r in resultados if r["Kg por unidad"]>0), default=None)
+-                        if mejor_por_kg:
+-                            total_estim = kg_necesarios * mejor_por_kg
+-                            st.caption(f"💡 Estimado sin escala (usando mejor $/kg de cubetas ${mejor_por_kg:.2f}/kg): "
+-                                       f"${total_estim:,.2f} por {kg_necesarios:.3f} kg")
+-
+-            with col_cubeta:
+-                st.markdown("#### 🪣 Opción B: Cubetas / Presentaciones")
+-                if optima:
+-                    st.metric("Mejor cubeta", f"{optima['Presentación']} × {optima['Unidades']}",
+-                              help=f"SKU: {optima['SKU']} | Kg por unidad: {optima['Kg por unidad']}")
+-                    st.write(f"**Kg cubiertos:** {optima['Kg cubiertos']:.3f} kg "
+-                             f"(necesarios: {kg_necesarios:.3f} kg, excedente: {optima['Kg cubiertos']-kg_necesarios:.3f} kg)")
+-                    st.write(f"**Total cliente:** **${optima['Costo Total']:,.2f} MXN**")
+-                    st.write(f"**Costo compra:** ${optima['Costo Compra Total']:,.2f} MXN")
+-                    st.write(f"**Margen:** ${optima['Margen Total']:,.2f} "
+-                             f"({optima['Margen % Venta']:.1f}% sobre venta / "
+-                             f"{optima['Margen % Costo']:.1f}% markup)")
+-                    if optima["Unidades"] > optima["Stock"]:
+-                        st.warning(f"⚠️ Stock insuficiente: {formato_cantidad(optima['Stock'])} en almacén, "
+-                                   f"se requieren {formato_cantidad(optima['Unidades'])}.")
+-                else:
+-                    st.info("No hay presentaciones en kg/L para este producto.")
+-
+-            # Recomendación
+-            if opcion_kilo and optima:
+-                if opcion_kilo["total_publico"] < optima["Costo Total"] - 0.01:
+-                    ahorro = optima["Costo Total"] - opcion_kilo["total_publico"]
+-                    st.success(f"💡 **Recomendación: Kilo Exacto conviene más** — "
+-                               f"ahorra **${ahorro:,.2f} MXN** al cliente vs cubetas. "
+-                               f"Cliente paga ${opcion_kilo['total_publico']:,.2f} vs ${optima['Costo Total']:,.2f}.")
+-                elif optima["Costo Total"] < opcion_kilo["total_publico"] - 0.01:
+-                    ahorro = opcion_kilo["total_publico"] - optima["Costo Total"]
+-                    st.success(f"💡 **Recomendación: Cubetas conviene más** — "
+-                               f"ahorra **${ahorro:,.2f} MXN** al cliente vs kilo exacto. "
+-                               f"Cliente paga ${optima['Costo Total']:,.2f} vs ${opcion_kilo['total_publico']:,.2f}.")
+-                else:
+-                    st.info(f"⚖️ Ambas opciones cuestan prácticamente lo mismo "
+-                            f"(${opcion_kilo['total_publico']:,.2f} vs ${optima['Costo Total']:,.2f}). "
+-                            f"Elige según logística (granel sin sobrante vs cubetas cerradas).")
+-            elif opcion_kilo:
+-                st.success(f"💡 **Recomendación: Kilo Exacto** — única opción con escala disponible: "
+-                           f"${opcion_kilo['total_publico']:,.2f} MXN por {kg_necesarios:.3f} kg.")
+-            elif optima:
+-                st.success(f"💡 **Recomendación: Cubetas** — Presentación **{optima['Presentación']}** "
+-                           f"× {optima['Unidades']} por **${optima['Costo Total']:,.2f} MXN**.")
+-
+-            if resultados:
+-                with st.expander("📊 Ver comparativa de todas las presentaciones (cubetas) con margen"):
+-                    st.dataframe(pd.DataFrame(resultados), width="stretch", hide_index=True)
+-
+-            if escalas_dict and prod_familia:
+-                clave_norm = normalizar_texto(prod_familia)
+-                entrada = escalas_dict.get(clave_norm)
+-                if entrada is None:
+-                    candidatos = [k for k in escalas_dict if clave_norm.startswith(k) or k.startswith(clave_norm) or k in clave_norm or clave_norm in k]
+-                    if candidatos:
+-                        entrada = escalas_dict[max(candidatos, key=len)]
+-                if entrada and entrada["escalas"]:
+-                    with st.expander(f"📈 Escalas por kg del proveedor para {prod_familia}"):
+-                        df_esc = pd.DataFrame([{
+-                            "Rango": e["rango_texto"],
+-                            "Desde kg": e["desde"],
+-                            "Hasta kg": e["hasta"] if e["hasta"] is not None else "∞",
+-                            "Costo $/kg": e["costo"],
+-                            "Público $/kg": e["publico"],
+-                            "Margen $/kg": e["margen"],
+-                            "Margen % Venta": f"{e['margen_venta_pct']:.1f}%",
+-                            "Margen % Costo": f"{e['margen_costo_pct']:.1f}%",
+-                        } for e in entrada["escalas"]])
+-                        st.dataframe(df_esc, width="stretch", hide_index=True)
+-
+-            # Botones para agregar al carrito ambas modalidades
+-            st.markdown("#### 🛒 Agregar al carrito")
+-            b1, b2 = st.columns(2)
+-            with b1:
+-                if opcion_kilo:
+-                    label_kilo = f"➕ Agregar Kilo Exacto ({opcion_kilo['kg']:.3f} kg) al Carrito"
+-                    if modo_cot.startswith("⚖️"):
+-                        label_kilo = f"➕ Agregar {cantidad_solicitada_original:g} {unidad_solicitada} (exacto) al Carrito"
+-                    if st.button(label_kilo, key="add_kilo"):
+-                        sku_kilo = f"KG-{optima['SKU'] if optima else df_familia.iloc[0][col_sku] if not df_familia.empty and 'Kg_Num' in df_familia and df_familia['Kg_Num'].notna().any() else 'GRANEL'}"
+-                        sku_kilo = sku_kilo.strip()
+-                        # Detalle según modo
+-                        if modo_cot.startswith("📐"):
+-                            detalle_kilo = (f"{prod_familia} - {area_total:.2f} m² x {espesor_mm:g} mm = {kg_necesarios:.3f} kg\n"
+-                                            f"Modalidad: KILO EXACTO (granel) - Escala {opcion_kilo['escala']['rango_texto']}\n"
+-                                            f"Precio: ${opcion_kilo['precio_kg']:.2f}/kg | Total: ${opcion_kilo['total_publico']:,.2f}\n"
+-                                            f"Costo compra: ${opcion_kilo['costo_kg']:.2f}/kg | Total costo: ${opcion_kilo['total_costo']:,.2f}\n"
+-                                            f"Margen: ${opcion_kilo['margen_total']:,.2f} ({opcion_kilo['margen_venta_pct']:.1f}% venta / {opcion_kilo['margen_costo_pct']:.1f}% markup)")
+-                        else:
+-                            detalle_kilo = (f"{prod_familia} - Solicitado: {cantidad_solicitada_original:g} {unidad_solicitada} = {kg_necesarios:.3f} kg\n"
+-                                            f"Modalidad: KILO EXACTO (granel) - Escala {opcion_kilo['escala']['rango_texto']}\n"
+-                                            f"Precio: ${opcion_kilo['precio_kg']:.2f}/kg | Total: ${opcion_kilo['total_publico']:,.2f}\n"
+-                                            f"Costo compra: ${opcion_kilo['costo_kg']:.2f}/kg | Total costo: ${opcion_kilo['total_costo']:,.2f}\n"
+-                                            f"Margen: ${opcion_kilo['margen_total']:,.2f} ({opcion_kilo['margen_venta_pct']:.1f}% venta)")
+-                        agregar_al_carrito("carrito_area", {
+-                            "SKU": sku_kilo,
+-                            "Descripcion": f"{prod_familia} (Granel por Kilo)",
+-                            "Presentacion": f"{kg_necesarios:.3f} kg granel - {opcion_kilo['escala']['rango_texto']} @ ${opcion_kilo['precio_kg']:.2f}/kg",
+-                            "Area_m2": round(area_total, 2) if modo_cot.startswith("📐") else 0,
+-                            "Espesor_mm": espesor_mm if modo_cot.startswith("📐") else 0,
+-                            "Kg_Necesarios": round(kg_necesarios, 3),
+-                            "Cantidad": round(kg_necesarios, 3),
+-                            "Subtotal": round(opcion_kilo["total_publico"], 2),
+-                            "Detalle": detalle_kilo,
+-                        })
+-                        st.rerun()
+-                else:
+-                    st.button("➕ Agregar Kilo Exacto", disabled=True, help="Sin escala disponible")
+-            with b2:
+-                if optima:
+-                    label_cub = f"➕ Agregar Cubetas ({optima['Presentación']} × {optima['Unidades']}) al Carrito"
+-                    if modo_cot.startswith("⚖️"):
+-                        label_cub = f"➕ Agregar Cubetas para {cantidad_solicitada_original:g} {unidad_solicitada} al Carrito"
+-                    if st.button(label_cub, key="add_cubeta"):
+-                        if modo_cot.startswith("📐"):
+-                            detalle_cub = (f"{prod_familia}\n{area_total:.2f} m² x {espesor_mm:g} mm ({kg_necesarios:.3f} kg)\n"
+-                                           f"Modalidad: CUBETAS - {optima['Unidades']}x {optima['Presentación']} = {optima['Kg cubiertos']:.3f} kg\n"
+-                                           f"Precio: ${optima['Costo Total']:,.2f} | Costo compra: ${optima['Costo Compra Total']:,.2f}\n"
+-                                           f"Margen: ${optima['Margen Total']:,.2f} ({optima['Margen % Venta']:.1f}% venta / {optima['Margen % Costo']:.1f}% markup)"
+-                                           + (f"\n⚠️ Excede stock: {formato_cantidad(optima['Stock'])} en almacén"
+-                                              if optima["Unidades"] > optima["Stock"] else ""))
++            st.markdown("### ⚖️ Comparativa: Kilo Exacto (Granel) vs Cubetas")
++
++            if opcion_kilo is None and not resultados:
++                st.warning("No se encontraron presentaciones ni escalas por kg para este producto.")
++            else:
++                col_kilo, col_cubeta = st.columns(2)
++
++                with col_kilo:
++                    st.markdown("#### 🧮 Opción A: Kilo Exacto (Granel)")
++                    if opcion_kilo:
++                        esc = opcion_kilo["escala"]
++                        st.metric("Precio por kg (público)", f"${opcion_kilo['precio_kg']:,.2f} MXN",
++                                  help=f"Escala: {esc['rango_texto']} | Costo: ${esc['costo']:.2f}/kg")
++                        st.write(f"**Kg necesarios:** {opcion_kilo['kg']:.3f} kg ({opcion_kilo['kg']*1000:.0f} g)")
++                        st.write(f"**Escala aplicada:** `{esc['rango_texto']}` ({esc['producto_proveedor']})")
++                        st.write(f"**Total cliente:** **${opcion_kilo['total_publico']:,.2f} MXN**")
++                        st.write(f"**Costo compra:** ${opcion_kilo['total_costo']:,.2f} MXN")
++                        st.write(f"**Margen:** ${opcion_kilo['margen_total']:,.2f} "
++                                 f"({opcion_kilo['margen_venta_pct']:.1f}% sobre venta / "
++                                 f"{opcion_kilo['margen_costo_pct']:.1f}% markup)")
++                        st.caption(f"Compra: ${opcion_kilo['costo_kg']:.2f}/kg × {kg_necesarios:.3f} kg = "
++                                   f"${opcion_kilo['total_costo']:,.2f} | "
++                                   f"Venta: ${opcion_kilo['precio_kg']:.2f}/kg × {kg_necesarios:.3f} kg")
++                        # Mostrar equivalencias
++                        st.caption(f"Equivalencias: {kg_necesarios:.3f} kg = {kg_necesarios*1000:.0f} g = {kg_necesarios:.3f} L ≈ {kg_necesarios*1000:.0f} ml")
++                    else:
++                        if es_dosificado:
++                            st.info("Los pigmentos se dosifican por área (g/m²) y se venden por presentación "
++                                    "(gramos, mililitros o litros): cotiza con las presentaciones de la derecha.")
+                         else:
+-                            detalle_cub = (f"{prod_familia}\nSolicitado: {cantidad_solicitada_original:g} {unidad_solicitada} = {kg_necesarios:.3f} kg\n"
+-                                           f"Modalidad: CUBETAS - {optima['Unidades']}x {optima['Presentación']} = {optima['Kg cubiertos']:.3f} kg\n"
+-                                           f"Precio: ${optima['Costo Total']:,.2f} | Costo compra: ${optima['Costo Compra Total']:,.2f}\n"
+-                                           f"Margen: ${optima['Margen Total']:,.2f} ({optima['Margen % Venta']:.1f}% venta)")
+-                        agregar_al_carrito("carrito_area", {
+-                            "SKU": optima["SKU"],
+-                            "Descripcion": prod_familia,
+-                            "Presentacion": optima["Presentación"],
+-                            "Area_m2": round(area_total, 2) if modo_cot.startswith("📐") else 0,
+-                            "Espesor_mm": espesor_mm if modo_cot.startswith("📐") else 0,
+-                            "Kg_Necesarios": round(kg_necesarios, 3),
+-                            "Cantidad": optima["Unidades"],
+-                            "Subtotal": optima["Costo Total"],
+-                            "Detalle": detalle_cub,
+-                        })
+-                        st.rerun()
+-                else:
+-                    st.button("➕ Agregar Cubetas", disabled=True, help="Sin presentaciones")
++                            st.info("Sin escala por kg disponible para este producto/cantidad. "
++                                    f"Revisa la hoja `{HOJA_ESCALAS_KG}` o cotiza por cubetas.")
++                        if not escalas_dict:
++                            st.caption(f"La hoja `{HOJA_ESCALAS_KG}` no existe o está vacía.")
++                        # Si no hay escala, ofrecer precio por kg derivado del inventario como fallback
++                        # (no aplica a pigmentos: su precio real es el de las presentaciones en g/L).
++                        if resultados and kg_necesarios > 0 and not es_dosificado:
++                            # precio por kg más barato de presentaciones
++                            mejor_por_kg = min((r["Precio Público"]/r["Kg por unidad"] for r in resultados if r["Kg por unidad"]>0), default=None)
++                            if mejor_por_kg:
++                                total_estim = kg_necesarios * mejor_por_kg
++                                st.caption(f"💡 Estimado sin escala (usando mejor $/kg de cubetas ${mejor_por_kg:.2f}/kg): "
++                                           f"${total_estim:,.2f} por {kg_necesarios:.3f} kg")
++
++                with col_cubeta:
++                    st.markdown("#### 🪣 Opción B: Cubetas / Presentaciones")
++                    if optima:
++                        st.metric("Mejor cubeta", f"{optima['Presentación']} × {optima['Unidades']}",
++                                  help=f"SKU: {optima['SKU']} | Kg por unidad: {optima['Kg por unidad']}")
++                        st.write(f"**Kg cubiertos:** {optima['Kg cubiertos']:.3f} kg "
++                                 f"(necesarios: {kg_necesarios:.3f} kg, excedente: {optima['Kg cubiertos']-kg_necesarios:.3f} kg)")
++                        st.write(f"**Total cliente:** **${optima['Costo Total']:,.2f} MXN**")
++                        st.write(f"**Costo compra:** ${optima['Costo Compra Total']:,.2f} MXN")
++                        st.write(f"**Margen:** ${optima['Margen Total']:,.2f} "
++                                 f"({optima['Margen % Venta']:.1f}% sobre venta / "
++                                 f"{optima['Margen % Costo']:.1f}% markup)")
++                        if optima["Unidades"] > optima["Stock"]:
++                            st.warning(f"⚠️ Stock insuficiente: {formato_cantidad(optima['Stock'])} en almacén, "
++                                       f"se requieren {formato_cantidad(optima['Unidades'])}.")
++                    else:
++                        st.info("No hay presentaciones en kg/L para este producto.")
++
++                # Recomendación
++                if opcion_kilo and optima:
++                    if opcion_kilo["total_publico"] < optima["Costo Total"] - 0.01:
++                        ahorro = optima["Costo Total"] - opcion_kilo["total_publico"]
++                        st.success(f"💡 **Recomendación: Kilo Exacto conviene más** — "
++                                   f"ahorra **${ahorro:,.2f} MXN** al cliente vs cubetas. "
++                                   f"Cliente paga ${opcion_kilo['total_publico']:,.2f} vs ${optima['Costo Total']:,.2f}.")
++                    elif optima["Costo Total"] < opcion_kilo["total_publico"] - 0.01:
++                        ahorro = opcion_kilo["total_publico"] - optima["Costo Total"]
++                        st.success(f"💡 **Recomendación: Cubetas conviene más** — "
++                                   f"ahorra **${ahorro:,.2f} MXN** al cliente vs kilo exacto. "
++                                   f"Cliente paga ${optima['Costo Total']:,.2f} vs ${opcion_kilo['total_publico']:,.2f}.")
++                    else:
++                        st.info(f"⚖️ Ambas opciones cuestan prácticamente lo mismo "
++                                f"(${opcion_kilo['total_publico']:,.2f} vs ${optima['Costo Total']:,.2f}). "
++                                f"Elige según logística (granel sin sobrante vs cubetas cerradas).")
++                elif opcion_kilo:
++                    st.success(f"💡 **Recomendación: Kilo Exacto** — única opción con escala disponible: "
++                               f"${opcion_kilo['total_publico']:,.2f} MXN por {kg_necesarios:.3f} kg.")
++                elif optima:
++                    st.success(f"💡 **Recomendación: Cubetas** — Presentación **{optima['Presentación']}** "
++                               f"× {optima['Unidades']} por **${optima['Costo Total']:,.2f} MXN**.")
++
++                if resultados:
++                    with st.expander("📊 Ver comparativa de todas las presentaciones (cubetas) con margen"):
++                        st.dataframe(pd.DataFrame(resultados), width="stretch", hide_index=True)
++
++                if escalas_dict and prod_familia:
++                    clave_norm = normalizar_texto(prod_familia)
++                    entrada = escalas_dict.get(clave_norm)
++                    if entrada is None:
++                        candidatos = [k for k in escalas_dict if clave_norm.startswith(k) or k.startswith(clave_norm) or k in clave_norm or clave_norm in k]
++                        if candidatos:
++                            entrada = escalas_dict[max(candidatos, key=len)]
++                    if entrada and entrada["escalas"]:
++                        with st.expander(f"📈 Escalas por kg del proveedor para {prod_familia}"):
++                            df_esc = pd.DataFrame([{
++                                "Rango": e["rango_texto"],
++                                "Desde kg": e["desde"],
++                                "Hasta kg": f"{e['hasta']:g}" if e["hasta"] is not None else "∞",
++                                "Costo $/kg": e["costo"],
++                                "Público $/kg": e["publico"],
++                                "Margen $/kg": e["margen"],
++                                "Margen % Venta": f"{e['margen_venta_pct']:.1f}%",
++                                "Margen % Costo": f"{e['margen_costo_pct']:.1f}%",
++                            } for e in entrada["escalas"]])
++                            st.dataframe(df_esc, width="stretch", hide_index=True)
++
++                # Botones para agregar al carrito ambas modalidades
++                st.markdown("#### 🛒 Agregar al carrito")
++                b1, b2 = st.columns(2)
++                with b1:
++                    if opcion_kilo:
++                        label_kilo = f"➕ Agregar Kilo Exacto ({opcion_kilo['kg']:.3f} kg) al Carrito"
++                        if modo_cot.startswith("⚖️"):
++                            label_kilo = f"➕ Agregar {cantidad_solicitada_original:g} {unidad_solicitada} (exacto) al Carrito"
++                        if st.button(label_kilo, key="add_kilo"):
++                            sku_kilo = f"KG-{optima['SKU'] if optima else df_familia.iloc[0][col_sku] if not df_familia.empty and 'Kg_Num' in df_familia and df_familia['Kg_Num'].notna().any() else 'GRANEL'}"
++                            sku_kilo = sku_kilo.strip()
++                            # Detalle según modo
++                            if modo_cot.startswith("📐"):
++                                detalle_kilo = (f"{prod_familia} - {area_total:.2f} m² x {espesor_carrito:g} mm = {kg_necesarios:.3f} kg\n"
++                                                f"Modalidad: KILO EXACTO (granel) - Escala {opcion_kilo['escala']['rango_texto']}\n"
++                                                f"Precio: ${opcion_kilo['precio_kg']:.2f}/kg | Total: ${opcion_kilo['total_publico']:,.2f}\n"
++                                                f"Costo compra: ${opcion_kilo['costo_kg']:.2f}/kg | Total costo: ${opcion_kilo['total_costo']:,.2f}\n"
++                                                f"Margen: ${opcion_kilo['margen_total']:,.2f} ({opcion_kilo['margen_venta_pct']:.1f}% venta / {opcion_kilo['margen_costo_pct']:.1f}% markup)")
++                            else:
++                                detalle_kilo = (f"{prod_familia} - Solicitado: {cantidad_solicitada_original:g} {unidad_solicitada} = {kg_necesarios:.3f} kg\n"
++                                                f"Modalidad: KILO EXACTO (granel) - Escala {opcion_kilo['escala']['rango_texto']}\n"
++                                                f"Precio: ${opcion_kilo['precio_kg']:.2f}/kg | Total: ${opcion_kilo['total_publico']:,.2f}\n"
++                                                f"Costo compra: ${opcion_kilo['costo_kg']:.2f}/kg | Total costo: ${opcion_kilo['total_costo']:,.2f}\n"
++                                                f"Margen: ${opcion_kilo['margen_total']:,.2f} ({opcion_kilo['margen_venta_pct']:.1f}% venta)")
++                            agregar_al_carrito("carrito_area", {
++                                "SKU": sku_kilo,
++                                "Descripcion": f"{prod_familia} (Granel por Kilo)",
++                                "Presentacion": f"{kg_necesarios:.3f} kg granel - {opcion_kilo['escala']['rango_texto']} @ ${opcion_kilo['precio_kg']:.2f}/kg",
++                                "Area_m2": round(area_total, 2) if modo_cot.startswith("📐") else 0,
++                                "Espesor_mm": espesor_carrito if modo_cot.startswith("📐") else 0,
++                                "Kg_Necesarios": round(kg_necesarios, 3),
++                                "Cantidad": round(kg_necesarios, 3),
++                                "Subtotal": round(opcion_kilo["total_publico"], 2),
++                                "Detalle": detalle_kilo,
++                            })
++                            st.rerun()
++                    elif es_dosificado:
++                        st.button("➕ Agregar Kilo Exacto", disabled=True,
++                                  help="Los pigmentos no se cotizan a granel por kg: se venden por presentación (g/L).")
++                    else:
++                        st.button("➕ Agregar Kilo Exacto", disabled=True, help="Sin escala disponible")
++                with b2:
++                    if optima:
++                        label_cub = f"➕ Agregar Cubetas ({optima['Presentación']} × {optima['Unidades']}) al Carrito"
++                        if modo_cot.startswith("⚖️"):
++                            label_cub = f"➕ Agregar Cubetas para {cantidad_solicitada_original:g} {unidad_solicitada} al Carrito"
++                        if st.button(label_cub, key="add_cubeta"):
++                            if modo_cot.startswith("📐"):
++                                if material and material["es_dosificacion"]:
++                                    renglon_area = (f"{prod_familia}\n{area_total:.2f} m² · dosificación "
++                                                    f"{material['dosis_g_m2']:g} g/m² = {material['gramos']:,.0f} g "
++                                                    f"({kg_necesarios:.3f} kg) — el espesor no aplica\n")
++                                else:
++                                    renglon_area = f"{prod_familia}\n{area_total:.2f} m² x {espesor_mm:g} mm ({kg_necesarios:.3f} kg)\n"
++                                detalle_cub = (renglon_area +
++                                               f"Modalidad: CUBETAS - {optima['Unidades']}x {optima['Presentación']} = {optima['Kg cubiertos']:.3f} kg\n"
++                                               f"Precio: ${optima['Costo Total']:,.2f} | Costo compra: ${optima['Costo Compra Total']:,.2f}\n"
++                                               f"Margen: ${optima['Margen Total']:,.2f} ({optima['Margen % Venta']:.1f}% venta / {optima['Margen % Costo']:.1f}% markup)"
++                                               + (f"\n⚠️ Excede stock: {formato_cantidad(optima['Stock'])} en almacén"
++                                                  if optima["Unidades"] > optima["Stock"] else ""))
++                            else:
++                                detalle_cub = (f"{prod_familia}\nSolicitado: {cantidad_solicitada_original:g} {unidad_solicitada} = {kg_necesarios:.3f} kg\n"
++                                               f"Modalidad: CUBETAS - {optima['Unidades']}x {optima['Presentación']} = {optima['Kg cubiertos']:.3f} kg\n"
++                                               f"Precio: ${optima['Costo Total']:,.2f} | Costo compra: ${optima['Costo Compra Total']:,.2f}\n"
++                                               f"Margen: ${optima['Margen Total']:,.2f} ({optima['Margen % Venta']:.1f}% venta)")
++                            agregar_al_carrito("carrito_area", {
++                                "SKU": optima["SKU"],
++                                "Descripcion": prod_familia,
++                                "Presentacion": optima["Presentación"],
++                                "Area_m2": round(area_total, 2) if modo_cot.startswith("📐") else 0,
++                                "Espesor_mm": espesor_carrito if modo_cot.startswith("📐") else 0,
++                                "Kg_Necesarios": round(kg_necesarios, 3),
++                                "Cantidad": optima["Unidades"],
++                                "Subtotal": optima["Costo Total"],
++                                "Detalle": detalle_cub,
++                            })
++                            st.rerun()
++                    else:
++                        st.button("➕ Agregar Cubetas", disabled=True, help="Sin presentaciones")
+ 
+     carrito_area = st.session_state["carrito_area"]
+     if not carrito_area.empty:
+diff --git a/correccion_pigmentos_cotizador.md b/correccion_pigmentos_cotizador.md
+new file mode 100644
+index 0000000..af0f424
+--- /dev/null
++++ b/correccion_pigmentos_cotizador.md
+@@ -0,0 +1,86 @@
++# Corrección: los pigmentos se cotizaban como resinas (COT-2026-003)
++
++**Alcance:** `cotizador_calculo.py` (nuevo), `app.py`, la hoja `Cat_Productos` del Excel y
++las pruebas `tests_cotizador.py` / `tests_cotizador_app.py`.
++
++## Qué pasaba
++
++La hoja `Cat_Productos` traía, en las filas de **EPOXY PASTA**, **EPOXY TINTA**,
++**PIGMENTOS FOTOLUMINISCENTES** y **EPOXY METAL PERLADO**, un `Rendimiento = 1`
++(kg/m²·mm). El cotizador aplicaba la fórmula de las resinas —`m² × mm × rendimiento`—,
++así que 16 m² de pasta pedían **16 kg** (100 veces los 160 g de la receta: 10 g/m²) y la
++tinta **16 L**. Los productos base sí estaban bien: EPOXY PRIMER `0.3333` kg/m²·mm
++(247 g de A + 86 g de B por m²) y EPOXY PISOS `1.2` kg/m²·mm (800 g + 400 g).
++
++### Reconstrucción de COT-2026-003 (16 m², 1 mm)
++
++| Renglón | Cantidad | Precio | Total |
++|---|---|---|---|
++| EPOXY PRIMER (kilo exacto, escala 0–9.999 kg) | 5.3328 kg | $400.00/kg | $2,133.12 |
++| EPOXY PISOS (cubeta) | 1 × 20 kg | $8,000.00 | $8,000.00 |
++| **EPOXY PASTA** ← error | 16 × 1 kg | $840.00 | $13,440.00 |
++| **EPOXY TINTA** ← error | 16 × 1 L | $550.00 | $8,800.00 |
++| **Total (IVA incl.)** | | | **$32,373.12** |
++| Subtotal sin IVA que imprimía el PDF | | | **$27,907.86** |
++
++El subtotal del documento ($27,907.86 = $32,373.12 ÷ 1.16) coincide centavo a centavo, así
++que esos cuatro renglones explican la cotización completa: **$22,240 de los $32,373 eran
++pigmento inflado**.
++
++## Cómo queda el mismo trabajo
++
++| Renglón | Cantidad correcta | Cómo se calcula | Total |
++|---|---|---|---|
++| EPOXY PRIMER (kilo exacto) | 5.3328 kg | 16 m² × 1 mm × 0.3333 | $2,133.12 |
++| EPOXY PISOS (cubeta) | 1 × 20 kg cubre los 19.2 kg | 16 m² × 1 mm × 1.2 | $8,000.00 |
++| EPOXY PASTA | 2 × 100 g (160 g) | 16 m² × 10 g/m² = 160 g | $224.00 |
++| EPOXY TINTA | 1 × 1 L (960 g cubiertos) | 16 m² × 60 g/m² = 960 g | $550.00 |
++| **Total (IVA incl.)** | | | **$10,907.12** |
++| Subtotal sin IVA | | | $9,402.69 |
++| IVA (16 %) | | | $1,504.43 |
++
++**Ahorro para el cliente: $21,466.00 (66.3 %).** La pasta también puede venderse en 250 g
++($270) o 1 kg ($840) si se prefiere una sola pieza; el cotizador recomienda la más
++económica y deja ver todas las presentaciones con su margen.
++
++## Qué cambió en el sistema (para que no vuelva a pasar)
++
++1. **Datos:** `Cat_Productos` ganó la columna `Dosis_g_m2` (g/m²) más `Fuente_Dosis`, y se
++   vació el `Rendimiento` heredado de las 19 filas de pigmentos. Valores de partida:
++   pasta `10`, metalizados `8` y fotoluminiscentes `10` g/m² (manual/criterio NEMET) y
++   tinta `60` g/m² (≈1 L por 16 m²; editable).
++2. **Lógica única:** `cotizador_calculo.py` decide la fórmula por familia —resina por
++   espesor o pigmento por dosificación—, calcula `unidades_para_cubrir` y elige la
++   presentación más económica. La app lo importa; no hay una segunda aritmética.
++3. **Reglas de seguridad:**
++   * Un nombre de familia pigmentada **nunca** se calcula con `Rendimiento`, aunque la hoja
++     lo traiga (así una hoja vieja tampoco infla).
++   * Sin `Dosis_g_m2` se usa la dosis de respaldo de su familia (`dosis_por_defecto`: pasta 10, metal 8, tinta 60 g/m²) y se avisa en pantalla.
++   * El cotizador muestra la dosificación con su fuente y **permite ajustarla** antes de
++     agregar al carrito (y al cambiar de pigmento se reinicia a la del catálogo).
++   * El espesor se deshabilita para pigmentos; el renglón del PDF queda como `[16.00 m²]`
++     sin «× 1 mm», y los pigmentos no ofrecen «kilo exacto» a granel.
++   * Las familias sin rendimiento ni dosificación se listan en un desplegable: ya no
++     desaparecen en silencio del cotizador por área.
++
++## Cómo ajustar una dosificación
++
++* **Definitiva:** edita la celda `Dosis_g_m2` de la familia en `Cat_Productos` (una vez por
++  fila, la app toma la primera y la usa para todas las presentaciones) y anota el origen en
++  `Fuente_Dosis`.
++* **Puntual, sin tocar el Excel:** cambia el número en «Dosificación del pigmento (g/m²)»
++  dentro del cotizador; el detalle interno del carrito guarda la dosis aplicada.
++
++## Pruebas
++
++```bash
++python tests_cotizador.py      # 20/20  aritmética y datos (sin Streamlit)
++python tests_cotizador_app.py  #  8/8   la interfaz real: campos en 0 sin predeterminados,
++                               #        pasta 160 g / 2×100 g / $224, tinta 1 L / $550,
++                               #        PISOS 20 kg, PRIMER 5.33 kg
++```
++
++`tests_cotizador.py` incluye el caso «catálogo viejo» (rendimiento 1 y sin dosis) para
++garantizar que 16 m² de pasta vuelven a dar 160 g, nunca 16 kg. Las suites anteriores siguen
++igual: `tests_bateria.py` 29/29, `tests_autenticacion.py` 55/55 y `tests_flujo_app.py`
++16/18 (los dos fallos son de Overpass y ya existían sin esta corrección).
+diff --git a/cotizador_calculo.py b/cotizador_calculo.py
+new file mode 100644
+index 0000000..f3cc166
+--- /dev/null
++++ b/cotizador_calculo.py
+@@ -0,0 +1,189 @@
++#!/usr/bin/env python3
++"""Cálculo de material del cotizador NEMET (por área, espesor y dosificación).
++
++El manual NEMET maneja dos formas de dosificar y confundirlas infla las cotizaciones:
++
++* **Sistemas epóxicos (resina + catalizador):** rendimiento en **kg por m² por mm** de
++  espesor, `kg = área × mm × rendimiento`. Ejemplos del manual: EPOXY PRIMER
++  ``0.3333`` kg/m²·mm (247 g de A + 86 g de B por m²) y EPOXY PISOS ``1.2`` kg/m²·mm
++  (800 g de A + 400 g de B por m²).
++* **Pigmentos (pastas, tintas, metal en polvo, fotoluminiscentes, micas):** dosificación
++  en **gramos por m²**, independiente del espesor, `g = área × dosis_g_m2`. El manual da
++  ``10`` g/m² para las pastas y ``8`` g/m² para los metalizados.
++
++Aquí estuvo el error que infló la cotización COT-2026-003: la hoja ``Cat_Productos``
++traía ``Rendimiento = 1`` (kg/m²·mm) en las filas de pastas y tintas, así que 16 m² de
++pasta se cotizaban como 16 kg (100 veces los 160 g de la receta) y la tinta como 16 L.
++
++Este módulo no depende de Streamlit para poder probarse directo con
++``python tests_cotizador.py``; la app lo importa como ``cotizador_calculo``.
++"""
++import math
++import re
++import unicodedata
++
++#: Rendimiento de respaldo (kg/m²·mm) si el producto no está en `Cat_Productos`.
++RENDIMIENTO_DEFAULT_KG_M2_MM = 1.2
++
++#: Dosificación de respaldo (g/m²) de un pigmento sin dosis capturada en `Cat_Productos`.
++#: Es la dosis de las pastas según el manual; sirve de red de seguridad para que un
++#: pigmento nunca vuelva a calcularse con un rendimiento de resina (1 kg/m²).
++DOSIS_PIGMENTO_DEFAULT_G_M2 = 10.0
++
++#: Dosis de respaldo por familia (manual NEMET) cuando el catálogo no trae `Dosis_g_m2`.
++#: Sin esto, una tinta cotizada con la dosis de pasta saldría a 10 g/m² en vez de 60.
++_DOSIS_POR_FAMILIA_G_M2 = (
++    ("TINTA", 60.0),   # ≈1 L por cada 16 m²
++    ("METAL", 8.0),    # manual NEMET
++    ("MICA", 8.0),
++)
++
++#: Familias que se dosifican por área (g/m²) y **nunca** por espesor.
++#: Se evalúa sobre el nombre normalizado (sin acentos y en mayúsculas).
++_RX_FAMILIA_DOSIFICADA = re.compile(
++    r"(PASTA|TINTA|PIGMENTO|FOTOLUMIN|METAL|MICA|GLITTER|PURPURINA|ESCARCHA)"
++
++)
++
++
++def normalizar_clave(texto):
++    """Mayúsculas, sin acentos y sin espacios repetidos, para comparar nombres de productos."""
++    texto = unicodedata.normalize("NFKD", str(texto or ""))
++    texto = "".join(c for c in texto if not unicodedata.combining(c))
++    return re.sub(r"\s+", " ", texto).strip().upper()
++
++
++def es_familia_dosificada(nombre):
++    """True si el producto se dosifica en g/m² (pigmento), sin importar el espesor."""
++    return bool(_RX_FAMILIA_DOSIFICADA.search(normalizar_clave(nombre)))
++
++
++def dosis_por_defecto(nombre):
++    """Dosis de respaldo (g/m²) de un pigmento que llegó sin `Dosis_g_m2` en el catálogo.
++
++    Usa la dosis del manual según la familia (tinta 60, metal y mica 8) y 10 g/m² para
++    el resto (pastas, fotoluminiscentes). Así, aun con un Excel viejo, una tinta no se
++    cotiza con la dosis de una pasta.
++    """
++    clave = normalizar_clave(nombre)
++    for fragmento, dosis in _DOSIS_POR_FAMILIA_G_M2:
++        if fragmento in clave:
++            return dosis
++    return DOSIS_PIGMENTO_DEFAULT_G_M2
++
++
++# ==========================================
++# PRESENTACIONES DEL INVENTARIO
++# ==========================================
++_RE_PRESENTACION = re.compile(
++    r"^\s*(\d+(?:[.,]\d+)?|\d+\s*/\s*\d+)\s*(kg|kgs|kilo|kilos|g|gr|grs|gramos|l|lt|lts|litro|litros|ml)\.?\s*$",
++    re.IGNORECASE,
++)
++_FACTOR_A_KG = {"kg": 1, "kgs": 1, "kilo": 1, "kilos": 1, "g": 0.001, "gr": 0.001, "grs": 0.001,
++                "gramos": 0.001, "l": 1, "lt": 1, "lts": 1, "litro": 1, "litros": 1, "ml": 0.001}
++FACTOR_A_KG = _FACTOR_A_KG
++
++
++def parsear_presentacion_kg(presentacion):
++    """'1.420 kg' -> 1.42 | '500 g' -> 0.5 | '1/2 kg' -> 0.5 | '1 L' -> 1.0 (1 L ~ 1 kg).
++
++    Piezas ('1 Pz') y rangos de precio ('10 a 20 kg', '< 10 kg') no son presentaciones
++    cotizables -> None.
++    """
++    coincidencia = _RE_PRESENTACION.match(str(presentacion))
++    if not coincidencia:
++        return None
++    numero, unidad = coincidencia.group(1), coincidencia.group(2).lower()
++    if "/" in numero:
++        numerador, denominador = numero.split("/")
++        valor = float(numerador) / float(denominador)
++    else:
++        valor = float(numero.replace(",", "."))
++    kg = valor * _FACTOR_A_KG[unidad]
++    return kg if kg > 0 else None
++
++
++def unidades_para_cubrir(kg_necesarios, kg_por_unidad):
++    """Unidades enteras de una presentación necesarias para cubrir los kg pedidos (0 si no aplica)."""
++    try:
++        kg_necesarios = float(kg_necesarios)
++        kg_por_unidad = float(kg_por_unidad)
++    except (TypeError, ValueError):
++        return 0
++    if kg_necesarios <= 0 or kg_por_unidad <= 0:
++        return 0
++    return max(1, math.ceil(round(kg_necesarios / kg_por_unidad, 6)))
++
++
++def elegir_opcion_mas_economica(opciones, clave_precio="precio", clave_unidades="unidades"):
++    """La opción más barata de la lista; si empatan, la de menos unidades (menos inventario)."""
++    candidatas = [o for o in (opciones or []) if o.get(clave_precio) is not None]
++    if not candidatas:
++        return None
++    return min(candidatas, key=lambda o: (float(o[clave_precio]), float(o.get(clave_unidades, 0) or 0)))
++
++
++# ==========================================
++# MATERIAL NECESARIO
++# ==========================================
++def calcular_material(area_m2, espesor_mm=1.0, info_producto=None, nombre="", dosis_manual_g_m2=None):
++    """Material necesario para un área, según sea resina (espesor) o pigmento (dosificación).
++
++    Devuelve un dict con ``kg_necesarios``, ``gramos``, ``modalidad`` (``"espesor"`` o
++    ``"dosificacion"``), la ``dosis_g_m2`` o el ``rendimiento`` aplicados y las banderas
++    ``dosis_por_defecto`` / ``rendimiento_por_defecto`` para avisar en pantalla cuando el
++    valor no venía del catálogo.
++    """
++    info_producto = info_producto or {}
++    try:
++        area = max(0.0, float(area_m2 or 0.0))
++    except (TypeError, ValueError):
++        area = 0.0
++
++    dosis_catalogo = info_producto.get("dosis_g_m2")
++
++    if es_familia_dosificada(nombre) or dosis_catalogo:
++        dosis = dosis_manual_g_m2 or dosis_catalogo
++        por_defecto = False
++        try:
++            dosis = float(dosis)
++        except (TypeError, ValueError):
++            dosis = 0.0
++        if dosis <= 0:
++            dosis = dosis_por_defecto(nombre)
++            por_defecto = True
++        gramos = area * dosis
++        return {
++            "kg_necesarios": gramos / 1000.0,
++            "gramos": gramos,
++            "modalidad": "dosificacion",
++            "es_dosificacion": True,
++            "dosis_g_m2": dosis,
++            "dosis_por_defecto": por_defecto,
++            "rendimiento": None,
++            "rendimiento_por_defecto": False,
++        }
++
++    try:
++        espesor = max(0.0, float(espesor_mm or 0.0))
++    except (TypeError, ValueError):
++        espesor = 0.0
++    rendimiento = info_producto.get("rendimiento")
++    try:
++        rendimiento = float(rendimiento)
++    except (TypeError, ValueError):
++        rendimiento = 0.0
++    por_defecto = rendimiento <= 0
++    if por_defecto:
++        rendimiento = RENDIMIENTO_DEFAULT_KG_M2_MM
++    kg = area * espesor * rendimiento
++    return {
++        "kg_necesarios": kg,
++        "gramos": kg * 1000.0,
++        "modalidad": "espesor",
++        "es_dosificacion": False,
++        "dosis_g_m2": None,
++        "dosis_por_defecto": False,
++        "rendimiento": rendimiento,
++        "rendimiento_por_defecto": por_defecto,
++    }
+diff --git a/tests_cotizador.py b/tests_cotizador.py
+new file mode 100644
+index 0000000..6c6974f
+--- /dev/null
++++ b/tests_cotizador.py
+@@ -0,0 +1,307 @@
++#!/usr/bin/env python3
++"""Pruebas del cotizador NEMET: dosificación de pigmentos contra rendimiento por espesor.
++
++Fijan el error que infló la cotización COT-2026-003 —16 m² de pasta cotizados como
++16 kg y 16 L de tinta como 16 L, cuando la receta pide **160 g** y **~1 L**— y protegen
++los cálculos que ya eran correctos (EPOXY PRIMER 0.3333 y EPOXY PISOS 1.2 kg/m²·mm).
++
++No hace falta Streamlit: prueba `cotizador_calculo` a fondo y valida los datos reales
++del Excel (`Cat_Productos`, `Inventario` y `Escalas_Precios_KG`).
++
++Uso:  python tests_cotizador.py     →  "N/N OK" si todo pasa.
++"""
++import os
++import sys
++import unittest
++
++import pandas as pd
++
++BASE = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, BASE)
++
++import cotizador_calculo as cc  # noqa: E402
++
++EXCEL = os.path.join(BASE, "Sistema_Inventario_NEMET_Final.xlsx")
++
++AREA = 16.0      # m² del caso COT-2026-003
++ESPESOR = 1.0    # mm
++
++PASTA = "EPOXY PASTA COLORES SÓLIDOS"
++TINTA = "EPOXY TINTA TRASLÚCIDOS LÍQUIDOS"   # familia del inventario
++TINTA_CATALOGO = "EPOXY TINTA"               # nombre en Cat_Productos
++METAL = "EPOXY METAL PERLADO Y METÁLICOS EN POLVO"
++FOTOLUMINISCENTES = "PIGMENTOS FOTOLUMINISCENTES"
++PRIMER = "EPOXY PRIMER (A Y B) TRANSPARENTE"
++PISOS = "EPOXY PISOS (A Y B) TRANSPARENTE"
++
++
++# ============================================================ lectura de datos
++def leer_catalogo():
++    return pd.read_excel(EXCEL, sheet_name="Cat_Productos")
++
++
++def leer_inventario():
++    df = pd.read_excel(EXCEL, sheet_name="Inventario", header=1)
++    return df.loc[:, ~df.columns.duplicated()].dropna(subset=["SKU"])
++
++
++def leer_escalas():
++    return pd.read_excel(EXCEL, sheet_name="Escalas_Precios_KG")
++
++
++def catalogo_efectivo(df_catalogo):
++    """Réplica mínima de `cargar_catalogo_rendimientos`: pigmentos -> dosis, resinas -> rendimiento."""
++    catalogo = {}
++    for _, fila in df_catalogo.iterrows():
++        nombre = cc.normalizar_clave(fila.get("Producto"))
++        if not nombre or nombre in catalogo:
++            continue
++        rendimiento = pd.to_numeric(fila.get("Rendimiento"), errors="coerce")
++        dosis = pd.to_numeric(fila.get("Dosis_g_m2"), errors="coerce")
++        if cc.es_familia_dosificada(nombre):
++            rendimiento = float("nan")   # un pigmento jamás se calcula por espesor
++        catalogo[nombre] = {
++            "rendimiento": float(rendimiento) if pd.notna(rendimiento) and rendimiento > 0 else None,
++            "prop_a": 100.0,
++            "prop_b": 0.0,
++            "dosis_g_m2": float(dosis) if pd.notna(dosis) and dosis > 0 else None,
++        }
++    return catalogo
++
++
++def info_de(catalogo, nombre):
++    """Mismo emparejamiento que la app: nombre exacto normalizado o por prefijo."""
++    clave = cc.normalizar_clave(nombre)
++    if clave in catalogo:
++        return catalogo[clave]
++    candidatos = [k for k in catalogo if clave.startswith(k) or k.startswith(clave)]
++    return catalogo[max(candidatos, key=len)] if candidatos else None
++
++
++# ============================================================ catálogo
++class TestDatosCatalogo(unittest.TestCase):
++    """La hoja `Cat_Productos` ya no puede confundir un pigmento con una resina."""
++
++    @classmethod
++    def setUpClass(cls):
++        cls.df = leer_catalogo()
++        cls.pigmentos = cls.df[cls.df["Dosis_g_m2"].notna()]
++
++    def test_01_los_pigmentos_declaran_su_dosis_en_g_m2(self):
++        familias = {cc.normalizar_clave(n) for n in self.pigmentos["Producto"]}
++        for esperada in (PASTA, TINTA_CATALOGO, METAL, FOTOLUMINISCENTES):
++            self.assertIn(cc.normalizar_clave(esperada), familias)
++        for _, fila in self.pigmentos.iterrows():
++            self.assertGreater(float(fila["Dosis_g_m2"]), 0,
++                               f"{fila['Producto']}: la dosis debe ser mayor que cero")
++
++    def test_02_las_dosis_son_de_pigmento_y_no_de_resina(self):
++        for _, fila in self.pigmentos.iterrows():
++            dosis = float(fila["Dosis_g_m2"])
++            self.assertGreaterEqual(dosis, 1.0, f"{fila['Producto']}: dosis sospechosamente baja")
++            self.assertLessEqual(dosis, 100.0,
++                                 f"{fila['Producto']}: {dosis} g/m² no es una dosis de pigmento; "
++                                 "revisa que no se haya colado un rendimiento de resina (kg/m²)")
++
++    def test_03_ningun_pigmento_conserva_rendimiento_por_mm(self):
++        for _, fila in self.pigmentos.iterrows():
++            self.assertTrue(pd.isna(fila["Rendimiento"]),
++                            f"{fila['Producto']}: deja vacío «Rendimiento» (kg/m²·mm); su dosis va en Dosis_g_m2")
++
++    def test_04_los_rendimientos_de_resina_siguen_intactos(self):
++        esperados = {PRIMER: 0.3333, PISOS: 1.2}
++        for nombre, rendimiento in esperados.items():
++            valor = float(self.df[self.df["Producto"] == nombre]["Rendimiento"].iloc[0])
++            self.assertAlmostEqual(valor, rendimiento, places=4,
++                                   msg=f"{nombre} debe conservar su rendimiento del manual")
++
++    def test_05_la_dosis_manda_sobre_cualquier_rendimiento_heredado(self):
++        """Con la hoja vieja (Rendimiento = 1 kg/m²·mm y sin dosis) igual se dosifica por área."""
++        catalogo = catalogo_efectivo(self.df)
++        info_vieja = dict(catalogo[cc.normalizar_clave(TINTA_CATALOGO)])
++        info_vieja["dosis_g_m2"] = None      # simula el catálogo sin la columna nueva
++        info_vieja["rendimiento"] = 1.0      # el valor que provocó el error
++        resultado = cc.calcular_material(AREA, ESPESOR, info_vieja, TINTA)
++        self.assertTrue(resultado["es_dosificacion"])
++        self.assertAlmostEqual(resultado["gramos"], cc.dosis_por_defecto(TINTA) * AREA, places=6)
++        self.assertAlmostEqual(resultado["gramos"], 960.0, places=6)   # 60 g/m², no 16 kg
++        self.assertIsNone(resultado["rendimiento"])
++
++
++# ============================================================ cálculo de material
++class TestCalculoMaterial(unittest.TestCase):
++
++    def test_06_pasta_16m2_son_160_gramos(self):
++        info = {"dosis_g_m2": 10.0, "rendimiento": None}
++        resultado = cc.calcular_material(AREA, ESPESOR, info, PASTA)
++        self.assertEqual(resultado["modalidad"], "dosificacion")
++        self.assertAlmostEqual(resultado["gramos"], 160.0, places=6)
++        self.assertAlmostEqual(resultado["kg_necesarios"], 0.16, places=6)
++
++    def test_07_el_espesor_no_cambia_el_pigmento(self):
++        info = {"dosis_g_m2": 10.0}
++        fino = cc.calcular_material(AREA, 0.5, info, PASTA)
++        grueso = cc.calcular_material(AREA, 5.0, info, PASTA)
++        self.assertAlmostEqual(fino["gramos"], grueso["gramos"], places=9)
++
++    def test_08_tinta_16m2_cabe_en_un_litro(self):
++        info = {"dosis_g_m2": 60.0}
++        resultado = cc.calcular_material(AREA, ESPESOR, info, TINTA)
++        self.assertLessEqual(resultado["gramos"], 1000.0)
++        self.assertGreater(resultado["gramos"], 0.0)
++
++    def test_09_metal_8g_por_m2(self):
++        info = {"dosis_g_m2": 8.0}
++        self.assertAlmostEqual(cc.calcular_material(AREA, ESPESOR, info, METAL)["gramos"], 128.0, places=6)
++
++    def test_10_primer_y_pisos_siguen_por_espesor(self):
++        primer = cc.calcular_material(AREA, ESPESOR, {"rendimiento": 0.3333}, PRIMER)
++        pisos = cc.calcular_material(AREA, ESPESOR, {"rendimiento": 1.2}, PISOS)
++        self.assertAlmostEqual(primer["kg_necesarios"], 16 * 0.3333, places=6)
++        self.assertAlmostEqual(pisos["kg_necesarios"], 19.2, places=6)
++        self.assertFalse(primer["es_dosificacion"])
++        self.assertFalse(pisos["es_dosificacion"])
++
++    def test_11_un_pigmento_sin_dosis_usa_el_respaldo_de_su_familia(self):
++        """Con un Excel viejo (sin `Dosis_g_m2`) cada familia conserva su dosis del manual."""
++        casos = {
++            "EPOXY PASTA NUEVA": 160.0,                          # 10 g/m²
++            TINTA: 960.0,                                        # 60 g/m² (≈1 L por 16 m²)
++            "EPOXY METAL PERLADO Y METÁLICOS EN POLVO": 128.0,   # 8 g/m²
++        }
++        for nombre, gramos in casos.items():
++            resultado = cc.calcular_material(AREA, ESPESOR, {"rendimiento": 1.0}, nombre)
++            self.assertTrue(resultado["es_dosificacion"], nombre)
++            self.assertTrue(resultado["dosis_por_defecto"], nombre)
++            self.assertAlmostEqual(resultado["gramos"], gramos, places=6, msg=nombre)
++
++    def test_12_la_dosis_capturada_en_pantalla_gana(self):
++        info = {"dosis_g_m2": 10.0}
++        resultado = cc.calcular_material(AREA, ESPESOR, info, PASTA, dosis_manual_g_m2=25.0)
++        self.assertAlmostEqual(resultado["dosis_g_m2"], 25.0, places=6)
++        self.assertAlmostEqual(resultado["gramos"], 400.0, places=6)
++
++    def test_13_un_producto_desconocido_cae_al_rendimiento_por_defecto(self):
++        resultado = cc.calcular_material(AREA, ESPESOR, {}, "SISTEMA SIN CATALOGO")
++        self.assertFalse(resultado["es_dosificacion"])
++        self.assertAlmostEqual(resultado["kg_necesarios"], AREA * ESPESOR * cc.RENDIMIENTO_DEFAULT_KG_M2_MM, places=6)
++
++    def test_14_unidades_para_cubrir_redondea_hacia_arriba(self):
++        self.assertEqual(cc.unidades_para_cubrir(0.16, 0.1), 2)     # 2 × 100 g
++        self.assertEqual(cc.unidades_para_cubrir(0.16, 0.25), 1)
++        self.assertEqual(cc.unidades_para_cubrir(0.16, 1.0), 1)
++        self.assertEqual(cc.unidades_para_cubrir(19.2, 20.0), 1)
++        self.assertEqual(cc.unidades_para_cubrir(0.0, 1.0), 0)
++
++    def test_15_la_presentacion_mas_economica_gana_y_desempata_por_unidades(self):
++        opciones = [
++            {"presentacion": "60 g", "precio": 225.0, "unidades": 3},
++            {"presentacion": "100 g", "precio": 224.0, "unidades": 2},
++            {"presentacion": "1 kg", "precio": 840.0, "unidades": 1},
++            {"presentacion": "1 kg", "precio": 224.0, "unidades": 4},
++        ]
++        mejor = cc.elegir_opcion_mas_economica(opciones, "precio", "unidades")
++        self.assertEqual(mejor["unidades"], 2)
++        self.assertEqual(mejor["precio"], 224.0)
++
++
++# ============================================================ cotización de 16 m²
++class TestCotizacion16m2(unittest.TestCase):
++    """El caso COT-2026-003 completo, con los precios reales del inventario."""
++
++    @classmethod
++    def setUpClass(cls):
++        cls.catalogo = catalogo_efectivo(leer_catalogo())
++        cls.inv = leer_inventario()
++        cls.escalas = leer_escalas()
++
++    def material(self, nombre, espesor=ESPESOR):
++        return cc.calcular_material(AREA, espesor, info_de(self.catalogo, nombre) or {}, nombre)
++
++    def cubetas(self, familia, kg):
++        filas = self.inv[self.inv["Descripcion"].astype(str).str.strip() == familia]
++        opciones = []
++        for _, fila in filas.iterrows():
++            kg_por_unidad = cc.parsear_presentacion_kg(fila["Presentacion"])
++            if not kg_por_unidad:
++                continue
++            unidades = cc.unidades_para_cubrir(kg, kg_por_unidad)
++            opciones.append({
++                "sku": fila["SKU"],
++                "presentacion": str(fila["Presentacion"]),
++                "kg_por_unidad": kg_por_unidad,
++                "unidades": unidades,
++                "kg_cubiertos": unidades * kg_por_unidad,
++                "precio": unidades * float(fila["PrecioPublicoIVA"]),
++            })
++        return cc.elegir_opcion_mas_economica(opciones, "precio", "unidades")
++
++    def granel(self, proveedor, kg):
++        filas = self.escalas[self.escalas["Producto_Proveedor"] == proveedor]
++        for _, fila in filas.iterrows():
++            hasta = fila["Rango_Hasta_Kg"]
++            if kg >= float(fila["Rango_Desde_Kg"]) and (pd.isna(hasta) or kg <= float(hasta)):
++                return kg * float(fila["Precio_Publico_por_Kg"])
++        return None
++
++    def test_16_la_pasta_se_cotiza_en_gramos_y_no_en_kilos(self):
++        pasta = self.material(PASTA)
++        self.assertAlmostEqual(pasta["gramos"], 160.0, places=6)
++        mejor = self.cubetas(PASTA, pasta["kg_necesarios"])
++        self.assertLessEqual(mejor["kg_cubiertos"], 0.3)                 # nunca 16 kg
++        self.assertLessEqual(mejor["precio"], 270.0)                     # ni la mitad de 1 kg ($840)
++        self.assertIn("100 g", [mejor["presentacion"]])                  # 2 × 100 g = $224
++
++    def test_17_la_tinta_se_cotiza_en_un_litro(self):
++        tinta = self.material(TINTA_CATALOGO)
++        mejor = self.cubetas(TINTA, tinta["kg_necesarios"])
++        self.assertEqual(mejor["unidades"], 1)
++        self.assertEqual(mejor["presentacion"], "1 L")
++        self.assertEqual(mejor["precio"], 550.0)                         # y no 16 L = $8,800
++
++    def test_18_los_metalizados_son_gramos_no_kilos(self):
++        metal = self.material(METAL)
++        self.assertAlmostEqual(metal["gramos"], 128.0, places=6)
++        self.assertLess(metal["kg_necesarios"], 0.2)
++
++    def test_19_primer_y_pisos_cubren_el_area_como_en_el_manual(self):
++        primer = self.material(PRIMER)
++        pisos = self.material(PISOS)
++        self.assertAlmostEqual(primer["kg_necesarios"], 5.3328, places=4)
++        self.assertAlmostEqual(pisos["kg_necesarios"], 19.2, places=6)
++        mejor_pisos = self.cubetas(PISOS, pisos["kg_necesarios"])
++        self.assertEqual(mejor_pisos["presentacion"], "20 kg")           # cubre los 19.2 kg
++        self.assertEqual(mejor_pisos["precio"], 8000.0)
++
++    def test_20_el_total_corregido_baja_mas_de_20_mil_pesos(self):
++        primer = self.material(PRIMER)
++        pisos = self.material(PISOS)
++        pasta = self.material(PASTA)
++        tinta = self.material(TINTA_CATALOGO)
++
++        opciones_primer = [x for x in (self.granel("EPOXY PRIMER", primer["kg_necesarios"]),
++                                       self.cubetas(PRIMER, primer["kg_necesarios"])["precio"]) if x]
++        opciones_pisos = [x for x in (self.granel("EPOXY PISOS", pisos["kg_necesarios"]),
++                                      self.cubetas(PISOS, pisos["kg_necesarios"])["precio"]) if x]
++        total = (min(opciones_primer) + min(opciones_pisos)
++                 + self.cubetas(PASTA, pasta["kg_necesarios"])["precio"]
++                 + self.cubetas(TINTA, tinta["kg_necesarios"])["precio"])
++        self.assertLess(total, 11000.0)
++
++        # Lo que se cotizó con el error: 16 kg de pasta y 16 L de tinta.
++        inflado = (min(opciones_primer) + min(opciones_pisos)
++                   + 16 * 840.0      # 16 × 1 kg de pasta
++                   + 16 * 550.0)     # 16 × 1 L de tinta
++        self.assertAlmostEqual(inflado - total, 22240.0 - 774.0, places=2)
++        self.assertGreaterEqual(inflado - total, 20000.0,
++                                "la corrección debe devolver más de $20,000 al cliente")
++
++
++if __name__ == "__main__":
++    resultado = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__]))
++    n = resultado.testsRun
++    if resultado.wasSuccessful() and n == 20:
++        print(f"\n{n}/{n} OK — cotizador verificado: pigmentos en g/m², resinas por espesor")
++        sys.exit(0)
++    print(f"\n{n - len(resultado.failures) - len(resultado.errors)}/{n} (esperadas 20/20)")
++    sys.exit(1)
+diff --git a/tests_cotizador_app.py b/tests_cotizador_app.py
+new file mode 100644
+index 0000000..599e839
+--- /dev/null
++++ b/tests_cotizador_app.py
+@@ -0,0 +1,213 @@
++#!/usr/bin/env python3
++"""Pruebas de extremo a extremo del cotizador por área (la app real, con `AppTest`).
++
++Reproducen la cotización COT-2026-003 (16 m², 1 mm) manejando la interfaz como lo haría
++una persona: elegir la línea de producto, capturar el área y agregar el renglón al carrito.
++Así se comprueba lo mismo que ve el usuario, no solo la aritmética:
++
++* Las **pastas** y **tintas** se dosifican en g/m² (espesor deshabilitado): 16 m² de pasta
++  son 160 g (dos bolsas de 100 g = $224) y la tinta cabe en 1 L ($550). Antes el sistema
++  cotizaba 16 kg y 16 L ($22,240).
++* Las **resinas** siguen por espesor: PRIMER 5.33 kg y PISOS 19.2 kg (una cubeta de 20 kg).
++* Los campos de captura arrancan en **0** (nada predeterminado) y sin medidas no se propone nada.
++
++Corre sobre una **copia temporal** del proyecto (Excel y base de usuarios propios), así que
++nunca toca los datos reales.  Uso:  python tests_cotizador_app.py  →  "8/8 OK".
++"""
++import os
++import shutil
++import sys
++import tempfile
++import unittest
++
++import pandas as pd
++
++BASE = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, BASE)
++
++import auth_nemet as auth  # noqa: E402
++
++try:
++    from streamlit.testing.v1 import AppTest
++except ImportError:  # sin Streamlit instalado, la batería no aplica
++    AppTest = None
++
++PASSWORD_SEMILLA = "ClaveAdminInicial2026"
++PASSWORD_ADMIN = "ClaveAdminDefinitiva2026"
++
++MENU_COTIZADOR = "📏 Cotizador por Área y Milimétrico"
++PASTA = "EPOXY PASTA COLORES SÓLIDOS"
++TINTA = "EPOXY TINTA TRASLÚCIDOS LÍQUIDOS"
++PISOS = "EPOXY PISOS (A Y B) TRANSPARENTE"
++PRIMER = "EPOXY PRIMER (A Y B) TRANSPARENTE"
++AREA_LADO = 4.0     # 4 m × 4 m = 16 m²
++
++
++@unittest.skipIf(AppTest is None, "Streamlit no está instalado")
++class TestCotizadorPorArea(unittest.TestCase):
++
++    @classmethod
++    def setUpClass(cls):
++        cls.tmp = tempfile.TemporaryDirectory()
++        cls.app_dir = os.path.join(cls.tmp.name, "nemet")
++        os.makedirs(os.path.join(cls.app_dir, "assets"), exist_ok=True)
++        for nombre in ("app.py", "auth_nemet.py", "prospeccion.py", "cotizador_calculo.py",
++                       "Sistema_Inventario_NEMET_Final.xlsx"):
++            shutil.copy(os.path.join(BASE, nombre), os.path.join(cls.app_dir, nombre))
++        for nombre in os.listdir(os.path.join(BASE, "assets")):
++            shutil.copy(os.path.join(BASE, "assets", nombre), os.path.join(cls.app_dir, "assets", nombre))
++
++        cls.ruta_db = os.path.join(cls.tmp.name, "usuarios.db")
++        os.environ["NEMET_DB_USUARIOS"] = cls.ruta_db
++        os.environ["NEMET_ADMIN_USUARIO"] = "jefe"
++        os.environ["NEMET_ADMIN_PASSWORD"] = PASSWORD_SEMILLA
++        os.environ["NEMET_ADMIN_NOMBRE"] = "Jefe de Planta"
++
++        conn = auth.conectar(cls.ruta_db)
++        auth.inicializar_db(conn)
++        auth.sembrar_admin_inicial(conn, "jefe", PASSWORD_SEMILLA, nombre="Jefe de Planta")
++        admin = auth.obtener_por_login(conn, "jefe")
++        auth.cambiar_password_propia(conn, admin["id"], PASSWORD_SEMILLA, PASSWORD_ADMIN)
++        conn.close()
++
++        cls.at = AppTest.from_file(os.path.join(cls.app_dir, "app.py"), default_timeout=120)
++        cls.at.run()
++        cls.at.text_input(key="acceso_usuario").set_value("jefe")
++        cls.at.text_input(key="acceso_password").set_value(PASSWORD_ADMIN)
++        cls.at.button(key="acceso_entrar").click()
++        cls.at.run()
++
++    @classmethod
++    def tearDownClass(cls):
++        for variable in ("NEMET_DB_USUARIOS", "NEMET_ADMIN_USUARIO", "NEMET_ADMIN_PASSWORD",
++                         "NEMET_ADMIN_NOMBRE"):
++            os.environ.pop(variable, None)
++        cls.tmp.cleanup()
++
++    # ------------------------------------------------------------------ utilidades
++    def ir_al_cotizador(self):
++        self.assertFalse(self.at.exception, [e.value for e in self.at.exception])
++        self.at.sidebar.selectbox[0].select(MENU_COTIZADOR)
++        self.at.run()
++        self.assertFalse(self.at.exception, [e.value for e in self.at.exception])
++
++    def cotizar(self, familia, ancho=AREA_LADO, largo=AREA_LADO, espesor=None):
++        self.at.selectbox(key="area_prod").select(familia)
++        self.at.number_input(key="area_ancho").set_value(ancho)
++        self.at.number_input(key="area_largo").set_value(largo)
++        self.at.run()
++        if espesor is not None:
++            # Se captura después de cambiar de producto: el espesor está deshabilitado
++            # mientras el producto seleccionado sea un pigmento.
++            self.at.number_input(key="area_espesor").set_value(espesor)
++            self.at.run()
++        self.assertFalse(self.at.exception, [e.value for e in self.at.exception])
++
++    def texto_infos(self):
++        return " ".join(str(i.value) for i in self.at.info)
++
++    def widget_dosis(self):
++        """El campo «Dosificación del pigmento (g/m²)», sin depender de su clave interna."""
++        campo = [n for n in self.at.number_input if n.label.startswith("Dosificación")]
++        self.assertEqual(len(campo), 1, "debe haber un solo campo de dosificación")
++        return campo[0]
++
++    # ------------------------------------------------------------------ flujo
++    def test_00_los_campos_empiezan_en_cero_y_sin_medidas_no_se_propone_nada(self):
++        self.ir_al_cotizador()
++        for campo in ("area_ancho", "area_largo", "area_espesor"):
++            self.assertEqual(self.at.number_input(key=campo).value, 0.0,
++                             f"{campo} debe arrancar en 0: nada predeterminado")
++        self.assertEqual([m.label for m in self.at.metric], [],
++                         "sin medidas no debe haber recomendación de presentación")
++        self.assertEqual([b for b in self.at.button if b.key in ("add_kilo", "add_cubeta")], [],
++                         "sin medidas no debe haber botones para agregar al carrito")
++        self.assertIn("Captura", self.texto_infos(),
++                      "debe pedir las medidas en lugar de mostrar 0 kg")
++
++        # Una resina con área capturada pero sin espesor tampoco calcula: pide el espesor.
++        self.at.selectbox(key="area_prod").select(PISOS)
++        self.at.run()
++        self.at.number_input(key="area_ancho").set_value(4.0)
++        self.at.number_input(key="area_largo").set_value(4.0)
++        self.at.run()
++        self.assertIn("espesor", self.texto_infos())
++        self.assertEqual([b for b in self.at.button if b.key in ("add_kilo", "add_cubeta")], [],
++                         "sin espesor capturado tampoco debe ofrecerse agregar al carrito")
++
++    def test_01_la_pasta_de_16m2_son_160_gramos_sin_espesor(self):
++        self.ir_al_cotizador()
++        self.cotizar(PASTA)
++        info = self.texto_infos()
++        self.assertIn("Dosificación:** 10 g/m²", info)
++        self.assertIn("160 g", info)
++        self.assertIn("no depende del espesor", info)
++        self.assertNotIn("kg/m² por mm", info)
++        self.assertTrue(self.at.number_input(key="area_espesor").disabled,
++                        "el espesor no aplica a un pigmento")
++        self.assertEqual(self.widget_dosis().value, 10.0)
++
++    def test_02_la_pasta_mas_economica_son_dos_bolsas_de_100g(self):
++        self.assertIn("100 g × 2", [m.value for m in self.at.metric])
++        self.assertTrue(all(b.disabled for b in self.at.button if b.key is None and "Kilo Exacto" in b.label),
++                        "los pigmentos no se cotizan a granel por kg")
++
++    def test_03_la_pasta_entra_al_carrito_con_224_pesos_y_sin_mm(self):
++        self.at.button(key="add_cubeta").click()
++        self.at.run()
++        carrito = self.at.session_state["carrito_area"]
++        self.assertEqual(len(carrito), 1)
++        fila = carrito.iloc[0]
++        self.assertEqual(fila["SKU"], "EP 02")           # bolsa de 100 g
++        self.assertEqual(int(fila["Cantidad"]), 2)
++        self.assertEqual(float(fila["Subtotal"]), 224.0)
++        self.assertEqual(float(fila["Espesor_mm"]), 0.0)
++        self.assertEqual(float(fila["Kg_Necesarios"]), 0.16)
++        self.assertIn("10 g/m²", fila["Detalle"])
++        self.assertIn("160 g", fila["Detalle"])
++
++    def test_04_la_tinta_cabe_en_un_litro_de_550(self):
++        self.cotizar(TINTA)
++        self.assertEqual(self.widget_dosis().value, 60.0,
++                         "al cambiar de pigmento el campo debe traer la dosis del catálogo, no la del anterior")
++        self.assertIn("960 g", self.texto_infos())
++        self.assertIn("1 L × 1", [m.value for m in self.at.metric])
++        self.at.button(key="add_cubeta").click()
++        self.at.run()
++        carrito = self.at.session_state["carrito_area"]
++        tinta = carrito[carrito["Descripcion"] == TINTA].iloc[0]
++        self.assertEqual(tinta["SKU"], "ET 06")           # 1 L
++        self.assertEqual(float(tinta["Subtotal"]), 550.0)
++
++    def test_05_los_pigmentos_del_area_no_llegan_a_mil_pesos(self):
++        carrito = self.at.session_state["carrito_area"]
++        pigmentos = carrito[carrito["Descripcion"].isin([PASTA, TINTA])]
++        self.assertEqual(len(pigmentos), 2)
++        subtotal = float(pigmentos["Subtotal"].sum())
++        self.assertAlmostEqual(subtotal, 224.0 + 550.0, places=2)
++        self.assertLess(subtotal, 1000.0,
++                        "con el error anterior estos dos renglones costaban $22,240")
++
++    def test_06_los_pisos_siguen_calculandose_por_espesor(self):
++        self.cotizar(PISOS, ancho=4.0, largo=4.0, espesor=1.0)
++        self.assertFalse(self.at.number_input(key="area_espesor").disabled)
++        info = self.texto_infos()
++        self.assertIn("kg/m² por mm", info)
++        self.assertIn("19.20 kg", info)
++        self.assertIn("20 kg × 1", [m.value for m in self.at.metric])
++
++    def test_07_el_primer_conserva_su_rendimiento_del_manual(self):
++        self.cotizar(PRIMER, ancho=4.0, largo=4.0, espesor=1.0)
++        info = self.texto_infos()
++        self.assertIn("5.33 kg", info)
++        self.assertIn("0.3333", info)
++
++
++if __name__ == "__main__":
++    resultado = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__]))
++    n = resultado.testsRun
++    if resultado.wasSuccessful() and n == 8:
++        print(f"\n{n}/{n} OK — cotizador por área verificado en la interfaz")
++        sys.exit(0)
++    print(f"\n{n - len(resultado.failures) - len(resultado.errors)}/{n} (esperadas 8/8)")
++    sys.exit(1)
+diff --git a/tests_flujo_app.py b/tests_flujo_app.py
+index 0df532b..09dc7a4 100644
+--- a/tests_flujo_app.py
++++ b/tests_flujo_app.py
+@@ -49,7 +49,8 @@ class TestFlujoAcceso(unittest.TestCase):
+         cls.tmp = tempfile.TemporaryDirectory()
+         cls.app_dir = os.path.join(cls.tmp.name, "nemet")
+         os.makedirs(os.path.join(cls.app_dir, "assets"), exist_ok=True)
+-        for nombre in ("app.py", "auth_nemet.py", "prospeccion.py", "Sistema_Inventario_NEMET_Final.xlsx"):
++        for nombre in ("app.py", "auth_nemet.py", "prospeccion.py", "cotizador_calculo.py",
++                       "Sistema_Inventario_NEMET_Final.xlsx"):
+             shutil.copy(os.path.join(BASE, nombre), os.path.join(cls.app_dir, nombre))
+         for nombre in os.listdir(os.path.join(BASE, "assets")):
+             shutil.copy(os.path.join(BASE, "assets", nombre), os.path.join(cls.app_dir, "assets", nombre))
