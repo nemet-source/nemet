@@ -2728,15 +2728,18 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
         es_pieza = df_inv[(df_inv[col_desc] == descripcion) & (df_inv[col_pres].astype(str).str.contains("Pz", case=False, na=False))].shape[0] > 0
         if tiene_kg:
             familias_peso_vol.append(descripcion)
-            if not catalogo or buscar_en_catalogo(descripcion, catalogo) is not None:
-                familias_area.append(descripcion)
+            # Todos los productos con presentaciones en kg pueden cotizarse por área.
+            # Si no tienen rendimiento en Cat_Productos, se usa el rendimiento por defecto (1.2 kg/m²·mm).
+            familias_area.append(descripcion)
         elif es_pieza:
             familias_piezas.append(descripcion)
 
     familias_directas = sorted(set(familias_peso_vol + familias_piezas))
-    # Familias con peso/volumen que no se pueden cotizar por área por falta de rendimiento
-    # o dosificación en Cat_Productos: se listan para que no desaparezcan en silencio.
-    familias_sin_area = [f for f in familias_peso_vol if f not in familias_area]
+    # Productos sin rendimiento específico en el catálogo (usan el rendimiento por defecto)
+    familias_sin_rendimiento = []
+    for f in familias_area:
+        if catalogo and buscar_en_catalogo(f, catalogo) is None:
+            familias_sin_rendimiento.append(f)
 
     if not familias_area and not familias_directas:
         st.error("No hay productos cotizables.")
@@ -2763,12 +2766,11 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
     espesor_carrito = 0         # 0 = el renglón no muestra espesor (pigmentos por m²)
     medidas_area_completas = True  # El modo directo no requiere capturar área ni espesor.
 
-    if familias_sin_area:
-        with st.expander(f"ℹ️ {len(familias_sin_area)} familias solo se cotizan en modo cantidad directa"):
-            st.caption(f"Por área solo aparecen los productos que tienen rendimiento (kg/m²·mm) o dosificación "
-                       f"(`Dosis_g_m2`, g/m²) en la hoja `{HOJA_CATALOGO}`. Estas familias siguen disponibles en "
-                       f"«⚖️ Por Cantidad directa»:")
-            st.dataframe(pd.DataFrame({"Familia": sorted(familias_sin_area)}), width="stretch", hide_index=True)
+    if familias_sin_rendimiento:
+        with st.expander(f"️ {len(familias_sin_rendimiento)} productos usarán el rendimiento por defecto ({RENDIMIENTO_DEFAULT} kg/m²·mm)"):
+            st.caption(f"Estos productos no tienen rendimiento específico en `{HOJA_CATALOGO}`, por lo que se usará el rendimiento por defecto "
+                       f"({RENDIMIENTO_DEFAULT} kg/m²·mm). Si deseas un rendimiento específico, agrégalo en la hoja `{HOJA_CATALOGO}`:")
+            st.dataframe(pd.DataFrame({"Producto": sorted(familias_sin_rendimiento)}), width="stretch", hide_index=True)
 
     if modo_cot.startswith("📋"):
         # ==========================================
