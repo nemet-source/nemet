@@ -2744,7 +2744,7 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
     cliente_area, correo_area = seleccionar_cliente("area")
 
     # Selector de modo
-    modo_cot = st.radio("Modo de cotización", ["📐 Por Área (m² × mm)", "⚖️ Por Cantidad directa (kg/g/L/ml/Pz)"],
+    modo_cot = st.radio("Modo de cotización", ["📐 Por Área (m² × mm)", "⚖️ Por Cantidad directa (kg/g/L/ml/Pz)", "📋 Cotización Completa (múltiples productos)"],
                         horizontal=True, key="modo_cot_area")
 
     # Variables que se llenan según modo
@@ -2768,7 +2768,242 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
                        f"«⚖️ Por Cantidad directa»:")
             st.dataframe(pd.DataFrame({"Familia": sorted(familias_sin_area)}), width="stretch", hide_index=True)
 
-    if modo_cot.startswith("📐"):
+    if modo_cot.startswith("📋"):
+        # ==========================================
+        # 📋 COTIZACIÓN COMPLETA (múltiples productos por m²)
+        # ==========================================
+        st.markdown("#### 📋 Cotización Completa — Selecciona todos los productos del cliente")
+        st.caption("Ingresa las medidas del área y selecciona **todos** los productos que el cliente necesita. "
+                   "El sistema calculará automáticamente la cantidad de cada producto y el total a pagar.")
+
+        # --- Medidas del área ---
+        col_mc1, col_mc2 = st.columns(2)
+        with col_mc1:
+            mc_ancho = st.number_input("Ancho del área (metros)", min_value=0.0, value=0.0, step=0.1, key="mc_ancho")
+        with col_mc2:
+            mc_largo = st.number_input("Largo del área (metros)", min_value=0.0, value=0.0, step=0.1, key="mc_largo")
+        mc_area_total = mc_ancho * mc_largo
+
+        col_mc3, col_mc4 = st.columns(2)
+        with col_mc3:
+            mc_espesor = st.number_input("Espesor (mm) — para resinas/sistemas", min_value=0.0, value=1.0, step=0.5, key="mc_espesor",
+                                         help="Solo aplica a resinas y sistemas epóxicos. Los pigmentos se dosifican por área (g/m²) sin importar el espesor.")
+        with col_mc4:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if mc_area_total > 0:
+                st.success(f"📐 **Área Total:** {mc_area_total:.2f} m²")
+            else:
+                st.info("📐 Ingresa el ancho y largo para calcular el área.")
+
+        # --- Selector múltiple de productos ---
+        todos_los_productos_area = sorted(set(familias_area))
+        productos_seleccionados = st.multiselect(
+            "Selecciona los productos que el cliente necesita",
+            todos_los_productos_area,
+            default=[],
+            key="mc_productos",
+            help="Selecciona uno o más productos. El sistema calculará la cantidad necesaria de cada uno según el área.",
+        )
+
+        if mc_area_total <= 0:
+            st.warning("⚠️ Captura el ancho y largo del área para calcular los materiales.")
+        elif not productos_seleccionados:
+            st.info("📦 Selecciona al menos un producto para ver las cantidades y el total.")
+        else:
+            # --- Calcular material necesario para cada producto seleccionado ---
+            resumen_productos = []
+            total_general_completo = 0.0
+            escalas_dict_mc = cargar_escalas_kg()
+
+            for prod_nombre in productos_seleccionados:
+                info_prod = buscar_en_catalogo(prod_nombre, catalogo) or {}
+                es_dosif = cocalc.es_familia_dosificada(prod_nombre)
+
+                # Calcular material necesario
+                mat = cocalc.calcular_material(mc_area_total, mc_espesor, info_prod, prod_nombre, None)
+                kg_nec = mat["kg_necesarios"]
+                esp_carrito_prod = 0 if mat["es_dosificacion"] else mc_espesor
+
+                # Determinar modalidad y cantidad en texto
+                if mat["es_dosificacion"]:
+                    modalidad = "Dosificación (g/m²)"
+                    cantidad_texto = f"{mat['gramos']:,.0f} g"
+                    factor_texto = f"{mat['dosis_g_m2']:g} g/m²"
+                else:
+                    modalidad = "Espesor (kg/m²·mm)"
+                    cantidad_texto = f"{kg_nec:.3f} kg"
+                    factor_texto = f"{mat['rendimiento']:g} kg/m²·mm"
+
+                # Buscar la mejor presentación para cubrir los kg necesarios
+                df_prod = df_inv[df_inv[col_desc] == prod_nombre].copy()
+                if not df_prod.empty:
+                    df_prod["Kg_Num"] = kg_por_fila[df_prod.index]
+                    df_prod_kg = df_prod[df_prod["Kg_Num"].notna()].sort_values(by="Kg_Num", ascending=False)
+
+                    mejor_precio = None
+                    mejor_unidades = 0
+                    mejor_sku = ""
+                    mejor_pres = ""
+                    mejor_subtotal = float("inf")
+
+                    for _, fila in df_prod_kg.iterrows():
+                        pres_kg = float(fila["Kg_Num"])
+                        precio_pub = float(valor_celda(fila, "PrecioPublicoIVA", 0.0))
+                        sku_fila = str(valor_celda(fila, col_sku))
+                        unidades = cocalc.unidades_para_cubrir(kg_nec, pres_kg)
+                        subtotal = unidades * precio_pub
+                        if subtotal < mejor_subtotal:
+                            mejor_subtotal = subtotal
+                            mejor_precio = precio_pub
+                            mejor_unidades = unidades
+                            mejor_sku = sku_fila
+                            mejor_pres = str(fila[col_pres])
+
+                    # También verificar opción de kilo exacto (granel)
+                    opcion_kilo_mc = None
+                    if escalas_dict_mc and not es_dosif and kg_nec > 0:
+                        escala_mc = buscar_escala_kg(prod_nombre, kg_nec, escalas_dict_mc)
+                        if escala_mc:
+                            opcion_kilo_mc = calcular_opcion_kilo_exacto(kg_nec, escala_mc)
+
+                    # Elegir la opción más barata
+                    if opcion_kilo_mc and opcion_kilo_mc["total_publico"] < mejor_subtotal:
+                        mejor_subtotal = opcion_kilo_mc["total_publico"]
+                        mejor_pres = f"{kg_nec:.3f} kg granel ({opcion_kilo_mc['escala']['rango_texto']})"
+                        mejor_sku = f"KG-{mejor_sku}" if mejor_sku else "GRANEL"
+                        mejor_unidades = round(kg_nec, 3)
+                        mejor_precio = opcion_kilo_mc["precio_kg"]
+
+                    if mejor_subtotal < float("inf"):
+                        total_general_completo += mejor_subtotal
+                        resumen_productos.append({
+                            "Producto": prod_nombre,
+                            "Modalidad": modalidad,
+                            "Factor": factor_texto,
+                            "Cantidad Necesaria": cantidad_texto,
+                            "Presentación Recomendada": mejor_pres,
+                            "Unidades": formato_cantidad(mejor_unidades),
+                            "Precio Unitario": f"${mejor_precio:,.2f}",
+                            "Subtotal": f"${mejor_subtotal:,.2f}",
+                            # Datos internos para agregar al carrito
+                            "_sku": mejor_sku,
+                            "_descripcion": prod_nombre,
+                            "_presentacion": mejor_pres,
+                            "_area_m2": round(mc_area_total, 2),
+                            "_espesor_mm": esp_carrito_prod,
+                            "_kg_necesarios": round(kg_nec, 3),
+                            "_cantidad": mejor_unidades,
+                            "_subtotal": round(mejor_subtotal, 2),
+                            "_es_dosificacion": mat["es_dosificacion"],
+                            "_dosis_g_m2": mat["dosis_g_m2"],
+                            "_gramos": mat["gramos"],
+                            "_rendimiento": mat["rendimiento"],
+                        })
+                    else:
+                        resumen_productos.append({
+                            "Producto": prod_nombre,
+                            "Modalidad": modalidad,
+                            "Factor": factor_texto,
+                            "Cantidad Necesaria": cantidad_texto,
+                            "Presentación Recomendada": "⚠️ Sin presentación disponible",
+                            "Unidades": "—",
+                            "Precio Unitario": "—",
+                            "Subtotal": "—",
+                            "_sku": "",
+                            "_descripcion": prod_nombre,
+                            "_presentacion": "",
+                            "_area_m2": round(mc_area_total, 2),
+                            "_espesor_mm": esp_carrito_prod,
+                            "_kg_necesarios": round(kg_nec, 3),
+                            "_cantidad": 0,
+                            "_subtotal": 0,
+                            "_es_dosificacion": mat["es_dosificacion"],
+                            "_dosis_g_m2": mat["dosis_g_m2"],
+                            "_gramos": mat["gramos"],
+                            "_rendimiento": mat["rendimiento"],
+                        })
+                else:
+                    resumen_productos.append({
+                        "Producto": prod_nombre,
+                        "Modalidad": modalidad,
+                        "Factor": factor_texto,
+                        "Cantidad Necesaria": cantidad_texto,
+                        "Presentación Recomendada": "⚠️ Producto no encontrado en inventario",
+                        "Unidades": "—",
+                        "Precio Unitario": "—",
+                        "Subtotal": "—",
+                        "_sku": "",
+                        "_descripcion": prod_nombre,
+                        "_presentacion": "",
+                        "_area_m2": round(mc_area_total, 2),
+                        "_espesor_mm": esp_carrito_prod,
+                        "_kg_necesarios": round(kg_nec, 3),
+                        "_cantidad": 0,
+                        "_subtotal": 0,
+                        "_es_dosificacion": mat["es_dosificacion"],
+                        "_dosis_g_m2": mat["dosis_g_m2"],
+                        "_gramos": mat["gramos"],
+                        "_rendimiento": mat["rendimiento"],
+                    })
+
+            # --- Mostrar tabla resumen ---
+            st.markdown("### 📊 Resumen de Cotización Completa")
+
+            # Tabla visual (sin columnas internas que empiezan con _)
+            columnas_visibles = [k for k in resumen_productos[0].keys() if not k.startswith("_")]
+            df_resumen = pd.DataFrame(resumen_productos)
+            df_resumen_visual = df_resumen[columnas_visibles]
+
+            st.dataframe(df_resumen_visual, width="stretch", hide_index=True)
+
+            # --- Totales ---
+            st.markdown("---")
+            col_t1, col_t2 = st.columns([2, 1])
+            with col_t1:
+                st.metric("📦 Productos seleccionados", len(productos_seleccionados))
+            with col_t2:
+                base_completa = total_general_completo / (1 + TASA_IVA)
+                iva_completo = total_general_completo - base_completa
+                st.metric("💰 Total a Pagar (con IVA)", f"${total_general_completo:,.2f} MXN")
+
+            st.caption(f"Subtotal sin IVA: ${base_completa:,.2f} | IVA 16%: ${iva_completo:,.2f} | **Total: ${total_general_completo:,.2f} MXN**")
+
+            # --- Botón para agregar TODOS al carrito ---
+            productos_con_precio = [r for r in resumen_productos if r["_subtotal"] > 0]
+            if productos_con_precio:
+                if st.button(f"🛒 Agregar TODOS los productos al carrito ({len(productos_con_precio)} productos — ${total_general_completo:,.2f} MXN)",
+                             type="primary", key="mc_agregar_todos"):
+                    for prod_data in productos_con_precio:
+                        # Construir detalle
+                        if prod_data["_es_dosificacion"]:
+                            detalle_mc = (f"{prod_data['_descripcion']}\n"
+                                          f"{prod_data['_area_m2']:.2f} m² · dosificación {prod_data['_dosis_g_m2']:g} g/m² "
+                                          f"= {prod_data['_gramos']:,.0f} g ({prod_data['_kg_necesarios']:.3f} kg)\n"
+                                          f"Modalidad: CUBETA/PRESENTACIÓN - {prod_data['_cantidad']}x {prod_data['_presentacion']}\n"
+                                          f"Subtotal: ${prod_data['_subtotal']:,.2f}")
+                        else:
+                            detalle_mc = (f"{prod_data['_descripcion']}\n"
+                                          f"{prod_data['_area_m2']:.2f} m² x {prod_data['_espesor_mm']:g} mm "
+                                          f"= {prod_data['_kg_necesarios']:.3f} kg\n"
+                                          f"Modalidad: CUBETA/PRESENTACIÓN - {prod_data['_cantidad']}x {prod_data['_presentacion']}\n"
+                                          f"Subtotal: ${prod_data['_subtotal']:,.2f}")
+                        agregar_al_carrito("carrito_area", {
+                            "SKU": prod_data["_sku"],
+                            "Descripcion": prod_data["_descripcion"],
+                            "Presentacion": prod_data["_presentacion"],
+                            "Area_m2": prod_data["_area_m2"],
+                            "Espesor_mm": prod_data["_espesor_mm"],
+                            "Kg_Necesarios": prod_data["_kg_necesarios"],
+                            "Cantidad": prod_data["_cantidad"],
+                            "Subtotal": prod_data["_subtotal"],
+                            "Detalle": detalle_mc,
+                        })
+                    st.success(f"✅ ¡{len(productos_con_precio)} productos agregados al carrito! Total: ${total_general_completo:,.2f} MXN")
+                    st.rerun()
+            else:
+                st.info("No hay productos con precio disponible para agregar al carrito.")
+
+    elif modo_cot.startswith("📐"):
         # Primero el producto: define si el material se calcula por espesor (resinas) o
         # por dosificación en g/m² (pigmentos), y con eso se habilita o no el espesor.
         col_a2, col_a3, col_a4 = st.columns(3)
@@ -2872,315 +3107,316 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
             st.info(f"⚖️ **Cantidad solicitada:** {cantidad_solicitada_original:g} {unidad_solicitada} = "
                     f"**{kg_necesarios:.3f} kg** ({g_equiv:.0f} g / {ml_equiv:.0f} ml aprox, 1L≈1kg) de **{prod_familia}**")
 
-    # --- Datos comunes para cálculos ---
-    df_familia = df_inv[df_inv[col_desc] == prod_familia].copy() if prod_familia else pd.DataFrame()
-    if not df_familia.empty:
-        df_familia["Kg_Num"] = kg_por_fila[df_familia.index]
-        # Para piezas, Kg_Num será NaN, mantenemos dataframe
-    else:
-        df_familia["Kg_Num"] = pd.Series(dtype=float)
+    # --- Datos comunes para cálculos (solo modos de producto individual) ---
+    if not modo_cot.startswith("📋"):
+        df_familia = df_inv[df_inv[col_desc] == prod_familia].copy() if prod_familia else pd.DataFrame()
+        if not df_familia.empty:
+            df_familia["Kg_Num"] = kg_por_fila[df_familia.index]
+            # Para piezas, Kg_Num será NaN, mantenemos dataframe
+        else:
+            df_familia["Kg_Num"] = pd.Series(dtype=float)
 
-    stock_por_sku = {}
-    if "StockActual" in df_inv.columns and not df_inv.empty:
-        stock_norm = pd.to_numeric(df_inv["StockActual"], errors="coerce").fillna(0)
-        stock_por_sku = {str(s).strip(): float(v) for s, v in zip(df_inv[col_sku], stock_norm)}
+        stock_por_sku = {}
+        if "StockActual" in df_inv.columns and not df_inv.empty:
+            stock_norm = pd.to_numeric(df_inv["StockActual"], errors="coerce").fillna(0)
+            stock_por_sku = {str(s).strip(): float(v) for s, v in zip(df_inv[col_sku], stock_norm)}
 
-    costo_por_sku = {}
-    if "PrecioCompra" in df_inv.columns and not df_inv.empty:
-        costo_norm = pd.to_numeric(df_inv["PrecioCompra"], errors="coerce").fillna(0)
-        costo_por_sku = {str(s).strip(): float(v) for s, v in zip(df_inv[col_sku], costo_norm)}
+        costo_por_sku = {}
+        if "PrecioCompra" in df_inv.columns and not df_inv.empty:
+            costo_norm = pd.to_numeric(df_inv["PrecioCompra"], errors="coerce").fillna(0)
+            costo_por_sku = {str(s).strip(): float(v) for s, v in zip(df_inv[col_sku], costo_norm)}
 
-    resultados = []
-    resultados_pz = []
+        resultados = []
+        resultados_pz = []
 
-    if medidas_area_completas and es_modo_pieza:
-        # Piezas: cada fila es 1 Pz, unidades = cantidad solicitada
-        for _, fila in df_familia.iterrows():
-            precio_pub = float(valor_celda(fila, "PrecioPublicoIVA", 0.0))
-            precio_compra_unit = costo_por_sku.get(str(valor_celda(fila, col_sku)).strip(), 0.0)
-            sku_fila = str(valor_celda(fila, col_sku))
-            unidades = cantidad_pieza_solicitada
-            costo_total_pub = unidades * precio_pub
-            costo_total_compra = unidades * precio_compra_unit
-            margen_total = costo_total_pub - costo_total_compra
-            margen_pct_venta = (margen_total / costo_total_pub * 100) if costo_total_pub else 0
-            margen_pct_costo = (margen_total / costo_total_compra * 100) if costo_total_compra else 0
-            resultados_pz.append({
-                "SKU": sku_fila,
-                "Presentación": str(fila[col_pres]),
-                "Precio Público": precio_pub,
-                "Costo Compra": precio_compra_unit,
-                "Unidades": unidades,
-                "Costo Total": costo_total_pub,
-                "Costo Compra Total": costo_total_compra,
-                "Margen Total": margen_total,
-                "Margen % Venta": margen_pct_venta,
-                "Margen % Costo": margen_pct_costo,
-                "Stock": stock_por_sku.get(sku_fila.strip(), 0.0),
-            })
-    elif medidas_area_completas:
-        # Peso/volumen
-        df_familia_kg = df_familia[df_familia["Kg_Num"].notna()].sort_values(by="Kg_Num", ascending=False)
-        for _, fila in df_familia_kg.iterrows():
-            pres_kg = float(fila["Kg_Num"])
-            precio_pub = float(valor_celda(fila, "PrecioPublicoIVA", 0.0))
-            precio_compra_unit = costo_por_sku.get(str(valor_celda(fila, col_sku)).strip(), 0.0)
-            unidades = cocalc.unidades_para_cubrir(kg_necesarios, pres_kg)
-            sku_fila = str(valor_celda(fila, col_sku))
-            costo_total_pub = unidades * precio_pub
-            costo_total_compra = unidades * precio_compra_unit
-            margen_total = costo_total_pub - costo_total_compra
-            margen_pct_venta = (margen_total / costo_total_pub * 100) if costo_total_pub else 0
-            margen_pct_costo = (margen_total / costo_total_compra * 100) if costo_total_compra else 0
-            resultados.append({
-                "SKU": sku_fila,
-                "Presentación": str(fila[col_pres]),
-                "Kg por unidad": pres_kg,
-                "Precio Público": precio_pub,
-                "Costo Compra": precio_compra_unit,
-                "Unidades": unidades,
-                "Kg cubiertos": unidades * pres_kg,
-                "Costo Total": costo_total_pub,
-                "Costo Compra Total": costo_total_compra,
-                "Margen Total": margen_total,
-                "Margen % Venta": margen_pct_venta,
-                "Margen % Costo": margen_pct_costo,
-                "Stock": stock_por_sku.get(sku_fila.strip(), 0.0),
-            })
-
-    # --- Opción por kilo exacto (granel) usando Escalas_Precios_KG ---
-    escalas_dict = cargar_escalas_kg()
-    escala_aplicable = None
-    opcion_kilo = None
-    if not es_modo_pieza and kg_necesarios > 0:
-        escala_aplicable = buscar_escala_kg(prod_familia, kg_necesarios, escalas_dict) if escalas_dict else None
-        opcion_kilo = calcular_opcion_kilo_exacto(kg_necesarios, escala_aplicable) if escala_aplicable else None
-
-    optima = cocalc.elegir_opcion_mas_economica(resultados, "Costo Total", "Unidades")
-    optima_pz = cocalc.elegir_opcion_mas_economica(resultados_pz, "Costo Total", "Unidades")
-
-    # --- UI comparativa ---
-    if not medidas_area_completas:
-        # El aviso de captura ya se muestra junto a las medidas; no hay cotización todavía.
-        pass
-    elif es_modo_pieza:
-        st.markdown("### 🧩 Cotización por Piezas")
-        if optima_pz:
-            st.metric("Total piezas", f"{optima_pz['Unidades']} Pz", help=f"SKU: {optima_pz['SKU']}")
-            st.write(f"**Total cliente:** **${optima_pz['Costo Total']:,.2f} MXN**")
-            st.write(f"**Costo compra:** ${optima_pz['Costo Compra Total']:,.2f} MXN")
-            st.write(f"**Margen:** ${optima_pz['Margen Total']:,.2f} ({optima_pz['Margen % Venta']:.1f}% venta / {optima_pz['Margen % Costo']:.1f}% markup)")
-            if optima_pz["Unidades"] > optima_pz["Stock"]:
-                st.warning(f"⚠️ Stock insuficiente: {formato_cantidad(optima_pz['Stock'])} en almacén, se requieren {formato_cantidad(optima_pz['Unidades'])}.")
-            with st.expander("Ver todas las presentaciones (Pz)"):
-                st.dataframe(pd.DataFrame(resultados_pz), width="stretch", hide_index=True)
-            if st.button(f"➕ Agregar {optima_pz['Unidades']} Pz al Carrito", key="add_pz"):
-                agregar_al_carrito("carrito_area", {
-                    "SKU": optima_pz["SKU"],
-                    "Descripcion": prod_familia,
-                    "Presentacion": optima_pz["Presentación"],
-                    "Area_m2": round(area_total, 2) if modo_cot.startswith("📐") else 0,
-                    "Espesor_mm": espesor_carrito if modo_cot.startswith("📐") else 0,
-                    "Kg_Necesarios": 0,
-                    "Cantidad": optima_pz["Unidades"],
-                    "Subtotal": optima_pz["Costo Total"],
-                    "Detalle": (f"{prod_familia}\nModalidad: PIEZAS DIRECTAS - {optima_pz['Unidades']} Pz\n"
-                               f"Precio: ${optima_pz['Costo Total']:,.2f} | Costo compra: ${optima_pz['Costo Compra Total']:,.2f}\n"
-                               f"Margen: ${optima_pz['Margen Total']:,.2f} ({optima_pz['Margen % Venta']:.1f}% venta)"),
+        if medidas_area_completas and es_modo_pieza:
+            # Piezas: cada fila es 1 Pz, unidades = cantidad solicitada
+            for _, fila in df_familia.iterrows():
+                precio_pub = float(valor_celda(fila, "PrecioPublicoIVA", 0.0))
+                precio_compra_unit = costo_por_sku.get(str(valor_celda(fila, col_sku)).strip(), 0.0)
+                sku_fila = str(valor_celda(fila, col_sku))
+                unidades = cantidad_pieza_solicitada
+                costo_total_pub = unidades * precio_pub
+                costo_total_compra = unidades * precio_compra_unit
+                margen_total = costo_total_pub - costo_total_compra
+                margen_pct_venta = (margen_total / costo_total_pub * 100) if costo_total_pub else 0
+                margen_pct_costo = (margen_total / costo_total_compra * 100) if costo_total_compra else 0
+                resultados_pz.append({
+                    "SKU": sku_fila,
+                    "Presentación": str(fila[col_pres]),
+                    "Precio Público": precio_pub,
+                    "Costo Compra": precio_compra_unit,
+                    "Unidades": unidades,
+                    "Costo Total": costo_total_pub,
+                    "Costo Compra Total": costo_total_compra,
+                    "Margen Total": margen_total,
+                    "Margen % Venta": margen_pct_venta,
+                    "Margen % Costo": margen_pct_costo,
+                    "Stock": stock_por_sku.get(sku_fila.strip(), 0.0),
                 })
-                st.rerun()
-        else:
-            st.info("No hay presentaciones por pieza para este producto.")
-    else:
-        st.markdown("### ⚖️ Comparativa: Kilo Exacto (Granel) vs Cubetas")
+        elif medidas_area_completas:
+            # Peso/volumen
+            df_familia_kg = df_familia[df_familia["Kg_Num"].notna()].sort_values(by="Kg_Num", ascending=False)
+            for _, fila in df_familia_kg.iterrows():
+                pres_kg = float(fila["Kg_Num"])
+                precio_pub = float(valor_celda(fila, "PrecioPublicoIVA", 0.0))
+                precio_compra_unit = costo_por_sku.get(str(valor_celda(fila, col_sku)).strip(), 0.0)
+                unidades = cocalc.unidades_para_cubrir(kg_necesarios, pres_kg)
+                sku_fila = str(valor_celda(fila, col_sku))
+                costo_total_pub = unidades * precio_pub
+                costo_total_compra = unidades * precio_compra_unit
+                margen_total = costo_total_pub - costo_total_compra
+                margen_pct_venta = (margen_total / costo_total_pub * 100) if costo_total_pub else 0
+                margen_pct_costo = (margen_total / costo_total_compra * 100) if costo_total_compra else 0
+                resultados.append({
+                    "SKU": sku_fila,
+                    "Presentación": str(fila[col_pres]),
+                    "Kg por unidad": pres_kg,
+                    "Precio Público": precio_pub,
+                    "Costo Compra": precio_compra_unit,
+                    "Unidades": unidades,
+                    "Kg cubiertos": unidades * pres_kg,
+                    "Costo Total": costo_total_pub,
+                    "Costo Compra Total": costo_total_compra,
+                    "Margen Total": margen_total,
+                    "Margen % Venta": margen_pct_venta,
+                    "Margen % Costo": margen_pct_costo,
+                    "Stock": stock_por_sku.get(sku_fila.strip(), 0.0),
+                })
 
-        if opcion_kilo is None and not resultados:
-            st.warning("No se encontraron presentaciones ni escalas por kg para este producto.")
-        else:
-            col_kilo, col_cubeta = st.columns(2)
+        # --- Opción por kilo exacto (granel) usando Escalas_Precios_KG ---
+        escalas_dict = cargar_escalas_kg()
+        escala_aplicable = None
+        opcion_kilo = None
+        if not es_modo_pieza and kg_necesarios > 0:
+            escala_aplicable = buscar_escala_kg(prod_familia, kg_necesarios, escalas_dict) if escalas_dict else None
+            opcion_kilo = calcular_opcion_kilo_exacto(kg_necesarios, escala_aplicable) if escala_aplicable else None
 
-            with col_kilo:
-                st.markdown("#### 🧮 Opción A: Kilo Exacto (Granel)")
-                if opcion_kilo:
-                    esc = opcion_kilo["escala"]
-                    st.metric("Precio por kg (público)", f"${opcion_kilo['precio_kg']:,.2f} MXN",
-                              help=f"Escala: {esc['rango_texto']} | Costo: ${esc['costo']:.2f}/kg")
-                    st.write(f"**Kg necesarios:** {opcion_kilo['kg']:.3f} kg ({opcion_kilo['kg']*1000:.0f} g)")
-                    st.write(f"**Escala aplicada:** `{esc['rango_texto']}` ({esc['producto_proveedor']})")
-                    st.write(f"**Total cliente:** **${opcion_kilo['total_publico']:,.2f} MXN**")
-                    st.write(f"**Costo compra:** ${opcion_kilo['total_costo']:,.2f} MXN")
-                    st.write(f"**Margen:** ${opcion_kilo['margen_total']:,.2f} "
-                             f"({opcion_kilo['margen_venta_pct']:.1f}% sobre venta / "
-                             f"{opcion_kilo['margen_costo_pct']:.1f}% markup)")
-                    st.caption(f"Compra: ${opcion_kilo['costo_kg']:.2f}/kg × {kg_necesarios:.3f} kg = "
-                               f"${opcion_kilo['total_costo']:,.2f} | "
-                               f"Venta: ${opcion_kilo['precio_kg']:.2f}/kg × {kg_necesarios:.3f} kg")
-                    # Mostrar equivalencias
-                    st.caption(f"Equivalencias: {kg_necesarios:.3f} kg = {kg_necesarios*1000:.0f} g = {kg_necesarios:.3f} L ≈ {kg_necesarios*1000:.0f} ml")
-                else:
-                    if es_dosificado:
-                        st.info("Los pigmentos se dosifican por área (g/m²) y se venden por presentación "
-                                "(gramos, mililitros o litros): cotiza con las presentaciones de la derecha.")
+        optima = cocalc.elegir_opcion_mas_economica(resultados, "Costo Total", "Unidades")
+        optima_pz = cocalc.elegir_opcion_mas_economica(resultados_pz, "Costo Total", "Unidades")
+
+        # --- UI comparativa ---
+        if not medidas_area_completas:
+            # El aviso de captura ya se muestra junto a las medidas; no hay cotización todavía.
+            pass
+        elif es_modo_pieza:
+            st.markdown("### 🧩 Cotización por Piezas")
+            if optima_pz:
+                st.metric("Total piezas", f"{optima_pz['Unidades']} Pz", help=f"SKU: {optima_pz['SKU']}")
+                st.write(f"**Total cliente:** **${optima_pz['Costo Total']:,.2f} MXN**")
+                st.write(f"**Costo compra:** ${optima_pz['Costo Compra Total']:,.2f} MXN")
+                st.write(f"**Margen:** ${optima_pz['Margen Total']:,.2f} ({optima_pz['Margen % Venta']:.1f}% venta / {optima_pz['Margen % Costo']:.1f}% markup)")
+                if optima_pz["Unidades"] > optima_pz["Stock"]:
+                    st.warning(f"⚠️ Stock insuficiente: {formato_cantidad(optima_pz['Stock'])} en almacén, se requieren {formato_cantidad(optima_pz['Unidades'])}.")
+                with st.expander("Ver todas las presentaciones (Pz)"):
+                    st.dataframe(pd.DataFrame(resultados_pz), width="stretch", hide_index=True)
+                if st.button(f"➕ Agregar {optima_pz['Unidades']} Pz al Carrito", key="add_pz"):
+                    agregar_al_carrito("carrito_area", {
+                        "SKU": optima_pz["SKU"],
+                        "Descripcion": prod_familia,
+                        "Presentacion": optima_pz["Presentación"],
+                        "Area_m2": round(area_total, 2) if modo_cot.startswith("📐") else 0,
+                        "Espesor_mm": espesor_carrito if modo_cot.startswith("📐") else 0,
+                        "Kg_Necesarios": 0,
+                        "Cantidad": optima_pz["Unidades"],
+                        "Subtotal": optima_pz["Costo Total"],
+                        "Detalle": (f"{prod_familia}\nModalidad: PIEZAS DIRECTAS - {optima_pz['Unidades']} Pz\n"
+                                   f"Precio: ${optima_pz['Costo Total']:,.2f} | Costo compra: ${optima_pz['Costo Compra Total']:,.2f}\n"
+                                   f"Margen: ${optima_pz['Margen Total']:,.2f} ({optima_pz['Margen % Venta']:.1f}% venta)"),
+                    })
+                    st.rerun()
+            else:
+                st.info("No hay presentaciones por pieza para este producto.")
+        else:
+            st.markdown("### ⚖️ Comparativa: Kilo Exacto (Granel) vs Cubetas")
+
+            if opcion_kilo is None and not resultados:
+                st.warning("No se encontraron presentaciones ni escalas por kg para este producto.")
+            else:
+                col_kilo, col_cubeta = st.columns(2)
+
+                with col_kilo:
+                    st.markdown("#### 🧮 Opción A: Kilo Exacto (Granel)")
+                    if opcion_kilo:
+                        esc = opcion_kilo["escala"]
+                        st.metric("Precio por kg (público)", f"${opcion_kilo['precio_kg']:,.2f} MXN",
+                                  help=f"Escala: {esc['rango_texto']} | Costo: ${esc['costo']:.2f}/kg")
+                        st.write(f"**Kg necesarios:** {opcion_kilo['kg']:.3f} kg ({opcion_kilo['kg']*1000:.0f} g)")
+                        st.write(f"**Escala aplicada:** `{esc['rango_texto']}` ({esc['producto_proveedor']})")
+                        st.write(f"**Total cliente:** **${opcion_kilo['total_publico']:,.2f} MXN**")
+                        st.write(f"**Costo compra:** ${opcion_kilo['total_costo']:,.2f} MXN")
+                        st.write(f"**Margen:** ${opcion_kilo['margen_total']:,.2f} "
+                                 f"({opcion_kilo['margen_venta_pct']:.1f}% sobre venta / "
+                                 f"{opcion_kilo['margen_costo_pct']:.1f}% markup)")
+                        st.caption(f"Compra: ${opcion_kilo['costo_kg']:.2f}/kg × {kg_necesarios:.3f} kg = "
+                                   f"${opcion_kilo['total_costo']:,.2f} | "
+                                   f"Venta: ${opcion_kilo['precio_kg']:.2f}/kg × {kg_necesarios:.3f} kg")
+                        # Mostrar equivalencias
+                        st.caption(f"Equivalencias: {kg_necesarios:.3f} kg = {kg_necesarios*1000:.0f} g = {kg_necesarios:.3f} L ≈ {kg_necesarios*1000:.0f} ml")
                     else:
-                        st.info("Sin escala por kg disponible para este producto/cantidad. "
-                                f"Revisa la hoja `{HOJA_ESCALAS_KG}` o cotiza por cubetas.")
-                    if not escalas_dict:
-                        st.caption(f"La hoja `{HOJA_ESCALAS_KG}` no existe o está vacía.")
-                    # Si no hay escala, ofrecer precio por kg derivado del inventario como fallback
-                    # (no aplica a pigmentos: su precio real es el de las presentaciones en g/L).
-                    if resultados and kg_necesarios > 0 and not es_dosificado:
-                        # precio por kg más barato de presentaciones
-                        mejor_por_kg = min((r["Precio Público"]/r["Kg por unidad"] for r in resultados if r["Kg por unidad"]>0), default=None)
-                        if mejor_por_kg:
-                            total_estim = kg_necesarios * mejor_por_kg
-                            st.caption(f"💡 Estimado sin escala (usando mejor $/kg de cubetas ${mejor_por_kg:.2f}/kg): "
-                                       f"${total_estim:,.2f} por {kg_necesarios:.3f} kg")
-
-            with col_cubeta:
-                st.markdown("#### 🪣 Opción B: Cubetas / Presentaciones")
-                if optima:
-                    st.metric("Mejor cubeta", f"{optima['Presentación']} × {optima['Unidades']}",
-                              help=f"SKU: {optima['SKU']} | Kg por unidad: {optima['Kg por unidad']}")
-                    st.write(f"**Kg cubiertos:** {optima['Kg cubiertos']:.3f} kg "
-                             f"(necesarios: {kg_necesarios:.3f} kg, excedente: {optima['Kg cubiertos']-kg_necesarios:.3f} kg)")
-                    st.write(f"**Total cliente:** **${optima['Costo Total']:,.2f} MXN**")
-                    st.write(f"**Costo compra:** ${optima['Costo Compra Total']:,.2f} MXN")
-                    st.write(f"**Margen:** ${optima['Margen Total']:,.2f} "
-                             f"({optima['Margen % Venta']:.1f}% sobre venta / "
-                             f"{optima['Margen % Costo']:.1f}% markup)")
-                    if optima["Unidades"] > optima["Stock"]:
-                        st.warning(f"⚠️ Stock insuficiente: {formato_cantidad(optima['Stock'])} en almacén, "
-                                   f"se requieren {formato_cantidad(optima['Unidades'])}.")
-                else:
-                    st.info("No hay presentaciones en kg/L para este producto.")
-
-            # Recomendación
-            if opcion_kilo and optima:
-                if opcion_kilo["total_publico"] < optima["Costo Total"] - 0.01:
-                    ahorro = optima["Costo Total"] - opcion_kilo["total_publico"]
-                    st.success(f"💡 **Recomendación: Kilo Exacto conviene más** — "
-                               f"ahorra **${ahorro:,.2f} MXN** al cliente vs cubetas. "
-                               f"Cliente paga ${opcion_kilo['total_publico']:,.2f} vs ${optima['Costo Total']:,.2f}.")
-                elif optima["Costo Total"] < opcion_kilo["total_publico"] - 0.01:
-                    ahorro = opcion_kilo["total_publico"] - optima["Costo Total"]
-                    st.success(f"💡 **Recomendación: Cubetas conviene más** — "
-                               f"ahorra **${ahorro:,.2f} MXN** al cliente vs kilo exacto. "
-                               f"Cliente paga ${optima['Costo Total']:,.2f} vs ${opcion_kilo['total_publico']:,.2f}.")
-                else:
-                    st.info(f"⚖️ Ambas opciones cuestan prácticamente lo mismo "
-                            f"(${opcion_kilo['total_publico']:,.2f} vs ${optima['Costo Total']:,.2f}). "
-                            f"Elige según logística (granel sin sobrante vs cubetas cerradas).")
-            elif opcion_kilo:
-                st.success(f"💡 **Recomendación: Kilo Exacto** — única opción con escala disponible: "
-                           f"${opcion_kilo['total_publico']:,.2f} MXN por {kg_necesarios:.3f} kg.")
-            elif optima:
-                st.success(f"💡 **Recomendación: Cubetas** — Presentación **{optima['Presentación']}** "
-                           f"× {optima['Unidades']} por **${optima['Costo Total']:,.2f} MXN**.")
-
-            if resultados:
-                with st.expander("📊 Ver comparativa de todas las presentaciones (cubetas) con margen"):
-                    st.dataframe(pd.DataFrame(resultados), width="stretch", hide_index=True)
-
-            if escalas_dict and prod_familia:
-                clave_norm = normalizar_texto(prod_familia)
-                entrada = escalas_dict.get(clave_norm)
-                if entrada is None:
-                    candidatos = [k for k in escalas_dict if clave_norm.startswith(k) or k.startswith(clave_norm) or k in clave_norm or clave_norm in k]
-                    if candidatos:
-                        entrada = escalas_dict[max(candidatos, key=len)]
-                if entrada and entrada["escalas"]:
-                    with st.expander(f"📈 Escalas por kg del proveedor para {prod_familia}"):
-                        df_esc = pd.DataFrame([{
-                            "Rango": e["rango_texto"],
-                            "Desde kg": e["desde"],
-                            "Hasta kg": f"{e['hasta']:g}" if e["hasta"] is not None else "∞",
-                            "Costo $/kg": e["costo"],
-                            "Público $/kg": e["publico"],
-                            "Margen $/kg": e["margen"],
-                            "Margen % Venta": f"{e['margen_venta_pct']:.1f}%",
-                            "Margen % Costo": f"{e['margen_costo_pct']:.1f}%",
-                        } for e in entrada["escalas"]])
-                        st.dataframe(df_esc, width="stretch", hide_index=True)
-
-            # Botones para agregar al carrito ambas modalidades
-            st.markdown("#### 🛒 Agregar al carrito")
-            b1, b2 = st.columns(2)
-            with b1:
-                if opcion_kilo:
-                    label_kilo = f"➕ Agregar Kilo Exacto ({opcion_kilo['kg']:.3f} kg) al Carrito"
-                    if modo_cot.startswith("⚖️"):
-                        label_kilo = f"➕ Agregar {cantidad_solicitada_original:g} {unidad_solicitada} (exacto) al Carrito"
-                    if st.button(label_kilo, key="add_kilo"):
-                        sku_kilo = f"KG-{optima['SKU'] if optima else df_familia.iloc[0][col_sku] if not df_familia.empty and 'Kg_Num' in df_familia and df_familia['Kg_Num'].notna().any() else 'GRANEL'}"
-                        sku_kilo = sku_kilo.strip()
-                        # Detalle según modo
-                        if modo_cot.startswith("📐"):
-                            detalle_kilo = (f"{prod_familia} - {area_total:.2f} m² x {espesor_carrito:g} mm = {kg_necesarios:.3f} kg\n"
-                                            f"Modalidad: KILO EXACTO (granel) - Escala {opcion_kilo['escala']['rango_texto']}\n"
-                                            f"Precio: ${opcion_kilo['precio_kg']:.2f}/kg | Total: ${opcion_kilo['total_publico']:,.2f}\n"
-                                            f"Costo compra: ${opcion_kilo['costo_kg']:.2f}/kg | Total costo: ${opcion_kilo['total_costo']:,.2f}\n"
-                                            f"Margen: ${opcion_kilo['margen_total']:,.2f} ({opcion_kilo['margen_venta_pct']:.1f}% venta / {opcion_kilo['margen_costo_pct']:.1f}% markup)")
+                        if es_dosificado:
+                            st.info("Los pigmentos se dosifican por área (g/m²) y se venden por presentación "
+                                    "(gramos, mililitros o litros): cotiza con las presentaciones de la derecha.")
                         else:
-                            detalle_kilo = (f"{prod_familia} - Solicitado: {cantidad_solicitada_original:g} {unidad_solicitada} = {kg_necesarios:.3f} kg\n"
-                                            f"Modalidad: KILO EXACTO (granel) - Escala {opcion_kilo['escala']['rango_texto']}\n"
-                                            f"Precio: ${opcion_kilo['precio_kg']:.2f}/kg | Total: ${opcion_kilo['total_publico']:,.2f}\n"
-                                            f"Costo compra: ${opcion_kilo['costo_kg']:.2f}/kg | Total costo: ${opcion_kilo['total_costo']:,.2f}\n"
-                                            f"Margen: ${opcion_kilo['margen_total']:,.2f} ({opcion_kilo['margen_venta_pct']:.1f}% venta)")
-                        agregar_al_carrito("carrito_area", {
-                            "SKU": sku_kilo,
-                            "Descripcion": f"{prod_familia} (Granel por Kilo)",
-                            "Presentacion": f"{kg_necesarios:.3f} kg granel - {opcion_kilo['escala']['rango_texto']} @ ${opcion_kilo['precio_kg']:.2f}/kg",
-                            "Area_m2": round(area_total, 2) if modo_cot.startswith("📐") else 0,
-                            "Espesor_mm": espesor_carrito if modo_cot.startswith("📐") else 0,
-                            "Kg_Necesarios": round(kg_necesarios, 3),
-                            "Cantidad": round(kg_necesarios, 3),
-                            "Subtotal": round(opcion_kilo["total_publico"], 2),
-                            "Detalle": detalle_kilo,
-                        })
-                        st.rerun()
-                elif es_dosificado:
-                    st.button("➕ Agregar Kilo Exacto", disabled=True,
-                              help="Los pigmentos no se cotizan a granel por kg: se venden por presentación (g/L).")
-                else:
-                    st.button("➕ Agregar Kilo Exacto", disabled=True, help="Sin escala disponible")
-            with b2:
-                if optima:
-                    label_cub = f"➕ Agregar Cubetas ({optima['Presentación']} × {optima['Unidades']}) al Carrito"
-                    if modo_cot.startswith("⚖️"):
-                        label_cub = f"➕ Agregar Cubetas para {cantidad_solicitada_original:g} {unidad_solicitada} al Carrito"
-                    if st.button(label_cub, key="add_cubeta"):
-                        if modo_cot.startswith("📐"):
-                            if material and material["es_dosificacion"]:
-                                renglon_area = (f"{prod_familia}\n{area_total:.2f} m² · dosificación "
-                                                f"{material['dosis_g_m2']:g} g/m² = {material['gramos']:,.0f} g "
-                                                f"({kg_necesarios:.3f} kg) — el espesor no aplica\n")
+                            st.info("Sin escala por kg disponible para este producto/cantidad. "
+                                    f"Revisa la hoja `{HOJA_ESCALAS_KG}` o cotiza por cubetas.")
+                        if not escalas_dict:
+                            st.caption(f"La hoja `{HOJA_ESCALAS_KG}` no existe o está vacía.")
+                        # Si no hay escala, ofrecer precio por kg derivado del inventario como fallback
+                        # (no aplica a pigmentos: su precio real es el de las presentaciones en g/L).
+                        if resultados and kg_necesarios > 0 and not es_dosificado:
+                            # precio por kg más barato de presentaciones
+                            mejor_por_kg = min((r["Precio Público"]/r["Kg por unidad"] for r in resultados if r["Kg por unidad"]>0), default=None)
+                            if mejor_por_kg:
+                                total_estim = kg_necesarios * mejor_por_kg
+                                st.caption(f"💡 Estimado sin escala (usando mejor $/kg de cubetas ${mejor_por_kg:.2f}/kg): "
+                                           f"${total_estim:,.2f} por {kg_necesarios:.3f} kg")
+
+                with col_cubeta:
+                    st.markdown("#### 🪣 Opción B: Cubetas / Presentaciones")
+                    if optima:
+                        st.metric("Mejor cubeta", f"{optima['Presentación']} × {optima['Unidades']}",
+                                  help=f"SKU: {optima['SKU']} | Kg por unidad: {optima['Kg por unidad']}")
+                        st.write(f"**Kg cubiertos:** {optima['Kg cubiertos']:.3f} kg "
+                                 f"(necesarios: {kg_necesarios:.3f} kg, excedente: {optima['Kg cubiertos']-kg_necesarios:.3f} kg)")
+                        st.write(f"**Total cliente:** **${optima['Costo Total']:,.2f} MXN**")
+                        st.write(f"**Costo compra:** ${optima['Costo Compra Total']:,.2f} MXN")
+                        st.write(f"**Margen:** ${optima['Margen Total']:,.2f} "
+                                 f"({optima['Margen % Venta']:.1f}% sobre venta / "
+                                 f"{optima['Margen % Costo']:.1f}% markup)")
+                        if optima["Unidades"] > optima["Stock"]:
+                            st.warning(f"⚠️ Stock insuficiente: {formato_cantidad(optima['Stock'])} en almacén, "
+                                       f"se requieren {formato_cantidad(optima['Unidades'])}.")
+                    else:
+                        st.info("No hay presentaciones en kg/L para este producto.")
+
+                # Recomendación
+                if opcion_kilo and optima:
+                    if opcion_kilo["total_publico"] < optima["Costo Total"] - 0.01:
+                        ahorro = optima["Costo Total"] - opcion_kilo["total_publico"]
+                        st.success(f"💡 **Recomendación: Kilo Exacto conviene más** — "
+                                   f"ahorra **${ahorro:,.2f} MXN** al cliente vs cubetas. "
+                                   f"Cliente paga ${opcion_kilo['total_publico']:,.2f} vs ${optima['Costo Total']:,.2f}.")
+                    elif optima["Costo Total"] < opcion_kilo["total_publico"] - 0.01:
+                        ahorro = opcion_kilo["total_publico"] - optima["Costo Total"]
+                        st.success(f"💡 **Recomendación: Cubetas conviene más** — "
+                                   f"ahorra **${ahorro:,.2f} MXN** al cliente vs kilo exacto. "
+                                   f"Cliente paga ${optima['Costo Total']:,.2f} vs ${opcion_kilo['total_publico']:,.2f}.")
+                    else:
+                        st.info(f"⚖️ Ambas opciones cuestan prácticamente lo mismo "
+                                f"(${opcion_kilo['total_publico']:,.2f} vs ${optima['Costo Total']:,.2f}). "
+                                f"Elige según logística (granel sin sobrante vs cubetas cerradas).")
+                elif opcion_kilo:
+                    st.success(f"💡 **Recomendación: Kilo Exacto** — única opción con escala disponible: "
+                               f"${opcion_kilo['total_publico']:,.2f} MXN por {kg_necesarios:.3f} kg.")
+                elif optima:
+                    st.success(f"💡 **Recomendación: Cubetas** — Presentación **{optima['Presentación']}** "
+                               f"× {optima['Unidades']} por **${optima['Costo Total']:,.2f} MXN**.")
+
+                if resultados:
+                    with st.expander("📊 Ver comparativa de todas las presentaciones (cubetas) con margen"):
+                        st.dataframe(pd.DataFrame(resultados), width="stretch", hide_index=True)
+
+                if escalas_dict and prod_familia:
+                    clave_norm = normalizar_texto(prod_familia)
+                    entrada = escalas_dict.get(clave_norm)
+                    if entrada is None:
+                        candidatos = [k for k in escalas_dict if clave_norm.startswith(k) or k.startswith(clave_norm) or k in clave_norm or clave_norm in k]
+                        if candidatos:
+                            entrada = escalas_dict[max(candidatos, key=len)]
+                    if entrada and entrada["escalas"]:
+                        with st.expander(f"📈 Escalas por kg del proveedor para {prod_familia}"):
+                            df_esc = pd.DataFrame([{
+                                "Rango": e["rango_texto"],
+                                "Desde kg": e["desde"],
+                                "Hasta kg": f"{e['hasta']:g}" if e["hasta"] is not None else "∞",
+                                "Costo $/kg": e["costo"],
+                                "Público $/kg": e["publico"],
+                                "Margen $/kg": e["margen"],
+                                "Margen % Venta": f"{e['margen_venta_pct']:.1f}%",
+                                "Margen % Costo": f"{e['margen_costo_pct']:.1f}%",
+                            } for e in entrada["escalas"]])
+                            st.dataframe(df_esc, width="stretch", hide_index=True)
+
+                # Botones para agregar al carrito ambas modalidades
+                st.markdown("#### 🛒 Agregar al carrito")
+                b1, b2 = st.columns(2)
+                with b1:
+                    if opcion_kilo:
+                        label_kilo = f"➕ Agregar Kilo Exacto ({opcion_kilo['kg']:.3f} kg) al Carrito"
+                        if modo_cot.startswith("⚖️"):
+                            label_kilo = f"➕ Agregar {cantidad_solicitada_original:g} {unidad_solicitada} (exacto) al Carrito"
+                        if st.button(label_kilo, key="add_kilo"):
+                            sku_kilo = f"KG-{optima['SKU'] if optima else df_familia.iloc[0][col_sku] if not df_familia.empty and 'Kg_Num' in df_familia and df_familia['Kg_Num'].notna().any() else 'GRANEL'}"
+                            sku_kilo = sku_kilo.strip()
+                            # Detalle según modo
+                            if modo_cot.startswith("📐"):
+                                detalle_kilo = (f"{prod_familia} - {area_total:.2f} m² x {espesor_carrito:g} mm = {kg_necesarios:.3f} kg\n"
+                                                f"Modalidad: KILO EXACTO (granel) - Escala {opcion_kilo['escala']['rango_texto']}\n"
+                                                f"Precio: ${opcion_kilo['precio_kg']:.2f}/kg | Total: ${opcion_kilo['total_publico']:,.2f}\n"
+                                                f"Costo compra: ${opcion_kilo['costo_kg']:.2f}/kg | Total costo: ${opcion_kilo['total_costo']:,.2f}\n"
+                                                f"Margen: ${opcion_kilo['margen_total']:,.2f} ({opcion_kilo['margen_venta_pct']:.1f}% venta / {opcion_kilo['margen_costo_pct']:.1f}% markup)")
                             else:
-                                renglon_area = f"{prod_familia}\n{area_total:.2f} m² x {espesor_mm:g} mm ({kg_necesarios:.3f} kg)\n"
-                            detalle_cub = (renglon_area +
-                                           f"Modalidad: CUBETAS - {optima['Unidades']}x {optima['Presentación']} = {optima['Kg cubiertos']:.3f} kg\n"
-                                           f"Precio: ${optima['Costo Total']:,.2f} | Costo compra: ${optima['Costo Compra Total']:,.2f}\n"
-                                           f"Margen: ${optima['Margen Total']:,.2f} ({optima['Margen % Venta']:.1f}% venta / {optima['Margen % Costo']:.1f}% markup)"
-                                           + (f"\n⚠️ Excede stock: {formato_cantidad(optima['Stock'])} en almacén"
-                                              if optima["Unidades"] > optima["Stock"] else ""))
-                        else:
-                            detalle_cub = (f"{prod_familia}\nSolicitado: {cantidad_solicitada_original:g} {unidad_solicitada} = {kg_necesarios:.3f} kg\n"
-                                           f"Modalidad: CUBETAS - {optima['Unidades']}x {optima['Presentación']} = {optima['Kg cubiertos']:.3f} kg\n"
-                                           f"Precio: ${optima['Costo Total']:,.2f} | Costo compra: ${optima['Costo Compra Total']:,.2f}\n"
-                                           f"Margen: ${optima['Margen Total']:,.2f} ({optima['Margen % Venta']:.1f}% venta)")
-                        agregar_al_carrito("carrito_area", {
-                            "SKU": optima["SKU"],
-                            "Descripcion": prod_familia,
-                            "Presentacion": optima["Presentación"],
-                            "Area_m2": round(area_total, 2) if modo_cot.startswith("📐") else 0,
-                            "Espesor_mm": espesor_carrito if modo_cot.startswith("📐") else 0,
-                            "Kg_Necesarios": round(kg_necesarios, 3),
-                            "Cantidad": optima["Unidades"],
-                            "Subtotal": optima["Costo Total"],
-                            "Detalle": detalle_cub,
-                        })
-                        st.rerun()
-                else:
-                    st.button("➕ Agregar Cubetas", disabled=True, help="Sin presentaciones")
+                                detalle_kilo = (f"{prod_familia} - Solicitado: {cantidad_solicitada_original:g} {unidad_solicitada} = {kg_necesarios:.3f} kg\n"
+                                                f"Modalidad: KILO EXACTO (granel) - Escala {opcion_kilo['escala']['rango_texto']}\n"
+                                                f"Precio: ${opcion_kilo['precio_kg']:.2f}/kg | Total: ${opcion_kilo['total_publico']:,.2f}\n"
+                                                f"Costo compra: ${opcion_kilo['costo_kg']:.2f}/kg | Total costo: ${opcion_kilo['total_costo']:,.2f}\n"
+                                                f"Margen: ${opcion_kilo['margen_total']:,.2f} ({opcion_kilo['margen_venta_pct']:.1f}% venta)")
+                            agregar_al_carrito("carrito_area", {
+                                "SKU": sku_kilo,
+                                "Descripcion": f"{prod_familia} (Granel por Kilo)",
+                                "Presentacion": f"{kg_necesarios:.3f} kg granel - {opcion_kilo['escala']['rango_texto']} @ ${opcion_kilo['precio_kg']:.2f}/kg",
+                                "Area_m2": round(area_total, 2) if modo_cot.startswith("📐") else 0,
+                                "Espesor_mm": espesor_carrito if modo_cot.startswith("📐") else 0,
+                                "Kg_Necesarios": round(kg_necesarios, 3),
+                                "Cantidad": round(kg_necesarios, 3),
+                                "Subtotal": round(opcion_kilo["total_publico"], 2),
+                                "Detalle": detalle_kilo,
+                            })
+                            st.rerun()
+                    elif es_dosificado:
+                        st.button("➕ Agregar Kilo Exacto", disabled=True,
+                                  help="Los pigmentos no se cotizan a granel por kg: se venden por presentación (g/L).")
+                    else:
+                        st.button("➕ Agregar Kilo Exacto", disabled=True, help="Sin escala disponible")
+                with b2:
+                    if optima:
+                        label_cub = f"➕ Agregar Cubetas ({optima['Presentación']} × {optima['Unidades']}) al Carrito"
+                        if modo_cot.startswith("⚖️"):
+                            label_cub = f"➕ Agregar Cubetas para {cantidad_solicitada_original:g} {unidad_solicitada} al Carrito"
+                        if st.button(label_cub, key="add_cubeta"):
+                            if modo_cot.startswith("📐"):
+                                if material and material["es_dosificacion"]:
+                                    renglon_area = (f"{prod_familia}\n{area_total:.2f} m² · dosificación "
+                                                    f"{material['dosis_g_m2']:g} g/m² = {material['gramos']:,.0f} g "
+                                                    f"({kg_necesarios:.3f} kg) — el espesor no aplica\n")
+                                else:
+                                    renglon_area = f"{prod_familia}\n{area_total:.2f} m² x {espesor_mm:g} mm ({kg_necesarios:.3f} kg)\n"
+                                detalle_cub = (renglon_area +
+                                               f"Modalidad: CUBETAS - {optima['Unidades']}x {optima['Presentación']} = {optima['Kg cubiertos']:.3f} kg\n"
+                                               f"Precio: ${optima['Costo Total']:,.2f} | Costo compra: ${optima['Costo Compra Total']:,.2f}\n"
+                                               f"Margen: ${optima['Margen Total']:,.2f} ({optima['Margen % Venta']:.1f}% venta / {optima['Margen % Costo']:.1f}% markup)"
+                                               + (f"\n⚠️ Excede stock: {formato_cantidad(optima['Stock'])} en almacén"
+                                                  if optima["Unidades"] > optima["Stock"] else ""))
+                            else:
+                                detalle_cub = (f"{prod_familia}\nSolicitado: {cantidad_solicitada_original:g} {unidad_solicitada} = {kg_necesarios:.3f} kg\n"
+                                               f"Modalidad: CUBETAS - {optima['Unidades']}x {optima['Presentación']} = {optima['Kg cubiertos']:.3f} kg\n"
+                                               f"Precio: ${optima['Costo Total']:,.2f} | Costo compra: ${optima['Costo Compra Total']:,.2f}\n"
+                                               f"Margen: ${optima['Margen Total']:,.2f} ({optima['Margen % Venta']:.1f}% venta)")
+                            agregar_al_carrito("carrito_area", {
+                                "SKU": optima["SKU"],
+                                "Descripcion": prod_familia,
+                                "Presentacion": optima["Presentación"],
+                                "Area_m2": round(area_total, 2) if modo_cot.startswith("📐") else 0,
+                                "Espesor_mm": espesor_carrito if modo_cot.startswith("📐") else 0,
+                                "Kg_Necesarios": round(kg_necesarios, 3),
+                                "Cantidad": optima["Unidades"],
+                                "Subtotal": optima["Costo Total"],
+                                "Detalle": detalle_cub,
+                            })
+                            st.rerun()
+                    else:
+                        st.button("➕ Agregar Cubetas", disabled=True, help="Sin presentaciones")
 
     carrito_area = st.session_state["carrito_area"]
     if not carrito_area.empty:
