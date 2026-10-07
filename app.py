@@ -1413,8 +1413,10 @@ def avisos_base_de_usuarios():
                  f"copia**: {info.get('error_escritura') or 'sin permiso'}. Se puede entrar, pero "
                  "nada se guardará hasta que se resuelva.")
     if auth.fallos_escritura():
-        st.warning(f"⚠️ {auth.fallos_escritura()} escrituras rechazadas en la base de usuarios. "
-                   f"Último error: `{auth.ultimo_error_escritura() or '—'}`")
+        st.info(f"ℹ️ {auth.fallos_escritura()} escritura(s) rechazada(s) en la base de usuarios "
+                f"(último error: `{auth.ultimo_error_escritura() or '—'}`). "
+                f"Esto es normal en Streamlit Cloud cuando el servidor se reinicia; "
+                f"la app sigue funcionando correctamente.")
 
 
 def pantalla_login(conn, secreto, ttl, aviso_semilla=None):
