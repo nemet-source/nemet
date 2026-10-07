@@ -22,6 +22,7 @@ from fpdf.enums import XPos, YPos
 from fpdf.fonts import FontFace
 
 import auth_nemet as auth  # autenticación, roles y administración de usuarios (SQLite + scrypt)
+import cotizador_calculo as cocalc  # rendimiento por mm vs. dosificación g/m² de pigmentos
 import prospeccion as pros  # búsqueda pública, clasificación y deduplicación de prospectos
 
 try:
@@ -132,7 +133,8 @@ HOJA_ESCALAS_KG = "Escalas_Precios_KG"
 
 TITULO_INVENTARIO = "CONTROL DE INVENTARIO Y FACTURACIÓN - NEMET"
 TASA_IVA = 0.16
-RENDIMIENTO_DEFAULT = 1.2  # kg por m² por mm, si el producto no está en Cat_Productos
+RENDIMIENTO_DEFAULT = cocalc.RENDIMIENTO_DEFAULT_KG_M2_MM  # kg por m² por mm, si el producto no está en Cat_Productos
+DOSIS_PIGMENTO_DEFAULT_G_M2 = cocalc.DOSIS_PIGMENTO_DEFAULT_G_M2  # g/m², si un pigmento no trae Dosis_g_m2
 
 # Sonora (MX) usa UTC-7 todo el año; el servidor de Streamlit Community Cloud vive en UTC.
 try:
@@ -484,7 +486,13 @@ def cargar_historial():
 
 
 def cargar_catalogo_rendimientos():
-    """Lee Cat_Productos -> {producto_normalizado: {rendimiento, prop_a, prop_b}}."""
+    """Lee Cat_Productos -> {producto_normalizado: {rendimiento, prop_a, prop_b, dosis_g_m2, fuente_dosis}}.
+
+    `rendimiento` son kg por m² **por mm** (resinas y sistemas). `dosis_g_m2` son los
+    gramos por m² de los pigmentos, que **no** dependen del espesor (ver cotizador_calculo).
+    Si un pigmento llegara sin dosis capturada se usa la dosis de respaldo, nunca un
+    rendimiento de resina: así ninguna pasta o tinta se vuelve a cotizar a 1 kg/m².
+    """
     try:
         df_cat = pd.read_excel(EXCEL_FILE, sheet_name=HOJA_CATALOGO)
     except Exception:
@@ -495,15 +503,28 @@ def cargar_catalogo_rendimientos():
     catalogo = {}
     for _, fila in df_cat.iterrows():
         nombre = normalizar_texto(valor_celda(fila, "Producto"))
+        if not nombre or nombre in catalogo:
+            continue
         rendimiento = pd.to_numeric(fila.get("Rendimiento"), errors="coerce")
-        if not nombre or pd.isna(rendimiento) or rendimiento <= 0 or nombre in catalogo:
+        dosis = pd.to_numeric(fila.get("Dosis_g_m2"), errors="coerce")
+        if cocalc.es_familia_dosificada(nombre):
+            # Un pigmento siempre se dosifica por área; si el catálogo todavía trae un
+            # «Rendimiento» heredado (kg/m²·mm) se ignora por completo.
+            rendimiento = float("nan")
+            if pd.isna(dosis) or dosis <= 0:
+                dosis = DOSIS_PIGMENTO_DEFAULT_G_M2
+        tiene_rendimiento = pd.notna(rendimiento) and rendimiento > 0
+        tiene_dosis = pd.notna(dosis) and dosis > 0
+        if not tiene_rendimiento and not tiene_dosis:
             continue
         prop_a = pd.to_numeric(fila.get("Prop_A"), errors="coerce")
         prop_b = pd.to_numeric(fila.get("Prop_B"), errors="coerce")
         catalogo[nombre] = {
-            "rendimiento": float(rendimiento),
+            "rendimiento": float(rendimiento) if tiene_rendimiento else None,
             "prop_a": float(prop_a) if pd.notna(prop_a) and prop_a > 0 else 100.0,
             "prop_b": float(prop_b) if pd.notna(prop_b) and prop_b > 0 else 0.0,
+            "dosis_g_m2": float(dosis) if tiene_dosis else None,
+            "fuente_dosis": str(valor_celda(fila, "Fuente_Dosis", "") or ""),
         }
     return catalogo
 
@@ -674,28 +695,16 @@ def calcular_opcion_kilo_exacto(kg_necesarios, escala):
     }
 
 
-_RE_PRESENTACION = re.compile(
-    r"^\s*(\d+(?:[.,]\d+)?|\d+\s*/\s*\d+)\s*(kg|kgs|kilo|kilos|g|gr|grs|gramos|l|lt|lts|litro|litros|ml)\.?\s*$",
-    re.IGNORECASE,
-)
-_FACTOR_A_KG = {"kg": 1, "kgs": 1, "kilo": 1, "kilos": 1, "g": 0.001, "gr": 0.001, "grs": 0.001, "gramos": 0.001,
-                "l": 1, "lt": 1, "lts": 1, "litro": 1, "litros": 1, "ml": 0.001}
+_FACTOR_A_KG = cocalc.FACTOR_A_KG  # alias: la tabla vive en cotizador_calculo (probada sin Streamlit)
 
 
 def parsear_presentacion_kg(presentacion):
     """'1.420 kg' -> 1.42 | '500 g' -> 0.5 | '1/2 kg' -> 0.5 | '1 L' -> 1.0 (1 L ~ 1 kg).
-    Piezas ('1 Pz') y rangos de precio ('10 a 20 kg', '< 10 kg') no son presentaciones cotizables -> None."""
-    coincidencia = _RE_PRESENTACION.match(str(presentacion))
-    if not coincidencia:
-        return None
-    numero, unidad = coincidencia.group(1), coincidencia.group(2).lower()
-    if "/" in numero:
-        numerador, denominador = numero.split("/")
-        valor = float(numerador) / float(denominador)
-    else:
-        valor = float(numero.replace(",", "."))
-    kg = valor * _FACTOR_A_KG[unidad]
-    return kg if kg > 0 else None
+
+    Piezas ('1 Pz') y rangos de precio ('10 a 20 kg', '< 10 kg') no son presentaciones
+    cotizables -> None. Implementación en `cotizador_calculo` para poder probarla sola.
+    """
+    return cocalc.parsear_presentacion_kg(presentacion)
 
 
 def columnas_inventario(df):
@@ -703,6 +712,17 @@ def columnas_inventario(df):
     col_sku = "SKU" if "SKU" in df.columns else df.columns[0]
     col_pres = "Presentacion" if "Presentacion" in df.columns else df.columns[2]
     return col_desc, col_sku, col_pres
+
+
+def clave_widget_dosis(familia):
+    """Clave estable de widget para la dosificación (g/m²) de cada familia pigmentada.
+
+    Al ser una clave por producto, el widget arranca con la dosis del catálogo y no se
+    queda con el valor del pigmento anterior (p. ej. los 10 g/m² de la pasta aplicados a
+    una tinta de 60 g/m²).
+    """
+    limpia = re.sub(r"[^0-9A-Z]+", "_", cocalc.normalizar_clave(familia)).strip("_")[:60]
+    return f"area_dosis_{limpia.lower() or 'pigmento'}"
 
 
 # ==========================================
@@ -899,8 +919,12 @@ def describir_item(fila):
     texto = f"{formato_cantidad(valor_celda(fila, 'Cantidad', 1))}x {valor_celda(fila, 'Descripcion')} ({valor_celda(fila, 'Presentacion')})"
     area = valor_celda(fila, "Area_m2", None)
     espesor = valor_celda(fila, "Espesor_mm", None)
-    if area is not None and espesor is not None:
-        texto += f" [{float(area):.2f} m² x {float(espesor):g} mm]"
+    if area is not None and float(area) > 0:
+        # Los pigmentos se dosifican por m² (g/m²): su renglón del historial va sin espesor.
+        if espesor is not None and float(espesor) > 0:
+            texto += f" [{float(area):.2f} m² x {float(espesor):g} mm]"
+        else:
+            texto += f" [{float(area):.2f} m²]"
     return texto
 
 
@@ -1002,8 +1026,12 @@ def descripcion_para_cliente(fila):
     texto = str(valor_celda(fila, "Descripcion", "") or "")
     area = valor_celda(fila, "Area_m2", None)
     espesor = valor_celda(fila, "Espesor_mm", None)
-    if area is not None and espesor is not None and float(area) > 0 and float(espesor) > 0:
-        texto += f" [{float(area):.2f} m² x {float(espesor):g} mm]"
+    if area is not None and float(area) > 0:
+        # Los pigmentos se dosifican por m² (g/m²): su renglón va sin espesor.
+        if espesor is not None and float(espesor) > 0:
+            texto += f" [{float(area):.2f} m² x {float(espesor):g} mm]"
+        else:
+            texto += f" [{float(area):.2f} m²]"
     return texto
 
 
@@ -2705,6 +2733,9 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
             familias_piezas.append(descripcion)
 
     familias_directas = sorted(set(familias_peso_vol + familias_piezas))
+    # Familias con peso/volumen que no se pueden cotizar por área por falta de rendimiento
+    # o dosificación en Cat_Productos: se listan para que no desaparezcan en silencio.
+    familias_sin_area = [f for f in familias_peso_vol if f not in familias_area]
 
     if not familias_area and not familias_directas:
         st.error("No hay productos cotizables.")
@@ -2726,27 +2757,64 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
     cantidad_pieza_solicitada = 0
     unidad_solicitada = "kg"
     cantidad_solicitada_original = 0.0
+    es_dosificado = False       # True = pigmento dosificado por área (g/m²)
+    material = None             # resultado de cotizador_calculo.calcular_material
+    espesor_carrito = 0         # 0 = el renglón no muestra espesor (pigmentos por m²)
+
+    if familias_sin_area:
+        with st.expander(f"ℹ️ {len(familias_sin_area)} familias solo se cotizan en modo cantidad directa"):
+            st.caption(f"Por área solo aparecen los productos que tienen rendimiento (kg/m²·mm) o dosificación "
+                       f"(`Dosis_g_m2`, g/m²) en la hoja `{HOJA_CATALOGO}`. Estas familias siguen disponibles en "
+                       f"«⚖️ Por Cantidad directa»:")
+            st.dataframe(pd.DataFrame({"Familia": sorted(familias_sin_area)}), width="stretch", hide_index=True)
 
     if modo_cot.startswith("📐"):
+        # Primero el producto: define si el material se calcula por espesor (resinas) o
+        # por dosificación en g/m² (pigmentos), y con eso se habilita o no el espesor.
         col_a2, col_a3, col_a4 = st.columns(3)
+        with col_a4:
+            prod_familia = st.selectbox("Línea de Producto", familias_area if familias_area else familias_directas, key="area_prod")
+        info_producto = buscar_en_catalogo(prod_familia, catalogo) or {}
+        es_dosificado = cocalc.es_familia_dosificada(prod_familia)
+        usa_dosis_catalogo = bool(info_producto.get("dosis_g_m2"))
         with col_a2:
             ancho = st.number_input("Ancho (metros)", min_value=0.1, value=3.0, step=0.1, key="area_ancho")
             largo = st.number_input("Largo (metros)", min_value=0.1, value=4.0, step=0.1, key="area_largo")
             area_total = ancho * largo
         with col_a3:
-            espesor_mm = st.number_input("Espesor (mm)", min_value=0.1, value=1.0, step=0.5, key="area_espesor")
-        with col_a4:
-            prod_familia = st.selectbox("Línea de Producto", familias_area if familias_area else familias_directas, key="area_prod")
+            espesor_mm = st.number_input("Espesor (mm)", min_value=0.1, value=1.0, step=0.5, key="area_espesor",
+                                         disabled=es_dosificado,
+                                         help=("Los pigmentos se dosifican por área (g/m²): el espesor no cambia el consumo."
+                                               if es_dosificado else None))
 
-        info_producto = buscar_en_catalogo(prod_familia, catalogo) or {}
-        rendimiento = info_producto.get("rendimiento", RENDIMIENTO_DEFAULT)
-        kg_necesarios = area_total * espesor_mm * rendimiento
+        dosis_manual = None
+        if es_dosificado:
+            dosis_sugerida = float(info_producto.get("dosis_g_m2") or DOSIS_PIGMENTO_DEFAULT_G_M2)
+            dosis_manual = st.number_input("Dosificación del pigmento (g/m²)", min_value=0.1, value=dosis_sugerida,
+                                           step=1.0, key=clave_widget_dosis(prod_familia),
+                                           help="Gramos de pigmento por cada m² (manual NEMET). No depende del espesor.")
+            if usa_dosis_catalogo:
+                fuente = info_producto.get("fuente_dosis")
+                st.caption(f"Dosificación de `{HOJA_CATALOGO}`: {dosis_sugerida:g} g/m²" + (f" · {fuente}" if fuente else ""))
+            else:
+                st.caption(f"⚠️ `{prod_familia}` no trae `Dosis_g_m2` en `{HOJA_CATALOGO}`; se propone "
+                           f"{DOSIS_PIGMENTO_DEFAULT_G_M2:g} g/m². Ajústala aquí o captúrala en la hoja.")
 
-        st.info(f"📐 **Área Total:** {area_total:.2f} m² | **Rendimiento:** {rendimiento:g} kg/m² por mm | "
-                f"**Material necesario:** **{kg_necesarios:.2f} kg**")
-        if not info_producto:
-            st.caption(f"Este producto no está en `{HOJA_CATALOGO}`; se usa el rendimiento por defecto ({RENDIMIENTO_DEFAULT}).")
-        elif info_producto.get("prop_b", 0) > 0:
+        material = cocalc.calcular_material(area_total, espesor_mm, info_producto, prod_familia, dosis_manual)
+        kg_necesarios = material["kg_necesarios"]
+        espesor_carrito = 0 if material["es_dosificacion"] else espesor_mm
+
+        if material["es_dosificacion"]:
+            st.info(f"📐 **Área Total:** {area_total:.2f} m² | **Dosificación:** {material['dosis_g_m2']:g} g/m² "
+                    f"(no depende del espesor) | **Material necesario:** "
+                    f"**{material['gramos']:,.0f} g** ({material['kg_necesarios']:.3f} kg)")
+        else:
+            st.info(f"📐 **Área Total:** {area_total:.2f} m² | **Rendimiento:** {material['rendimiento']:g} kg/m² por mm | "
+                    f"**Material necesario:** **{kg_necesarios:.2f} kg**")
+            if material["rendimiento_por_defecto"]:
+                st.caption(f"Este producto no tiene rendimiento en `{HOJA_CATALOGO}`; se usa el rendimiento por defecto "
+                           f"({RENDIMIENTO_DEFAULT} kg/m² por mm).")
+        if not material["es_dosificacion"] and info_producto.get("prop_b", 0) > 0:
             prop_a, prop_b = info_producto["prop_a"], info_producto["prop_b"]
             kg_a = kg_necesarios * prop_a / (prop_a + prop_b)
             st.caption(f"🧪 Proporción de mezcla A:B = {prop_a:g}:{prop_b:g} → Parte A (resina): {kg_a:.2f} kg | "
@@ -2759,6 +2827,7 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
         c1, c2, c3 = st.columns([2, 1, 1])
         with c1:
             prod_familia = st.selectbox("Producto", familias_directas, key="direct_prod")
+        es_dosificado = cocalc.es_familia_dosificada(prod_familia)
         with c2:
             cantidad_solicitada_original = st.number_input("Cantidad que pide el cliente", min_value=0.01, value=1.0, step=0.1, format="%.3f", key="direct_cant")
         with c3:
@@ -2846,10 +2915,7 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
             pres_kg = float(fila["Kg_Num"])
             precio_pub = float(valor_celda(fila, "PrecioPublicoIVA", 0.0))
             precio_compra_unit = costo_por_sku.get(str(valor_celda(fila, col_sku)).strip(), 0.0)
-            if kg_necesarios <= 0:
-                unidades = 0
-            else:
-                unidades = max(1, math.ceil(round(kg_necesarios / pres_kg, 6)))
+            unidades = cocalc.unidades_para_cubrir(kg_necesarios, pres_kg)
             sku_fila = str(valor_celda(fila, col_sku))
             costo_total_pub = unidades * precio_pub
             costo_total_compra = unidades * precio_compra_unit
@@ -2880,12 +2946,8 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
         escala_aplicable = buscar_escala_kg(prod_familia, kg_necesarios, escalas_dict) if escalas_dict else None
         opcion_kilo = calcular_opcion_kilo_exacto(kg_necesarios, escala_aplicable) if escala_aplicable else None
 
-    optima = None
-    optima_pz = None
-    if resultados:
-        optima = min(resultados, key=lambda x: (x["Costo Total"], x["Unidades"]))
-    if resultados_pz:
-        optima_pz = min(resultados_pz, key=lambda x: (x["Costo Total"], x["Unidades"]))
+    optima = cocalc.elegir_opcion_mas_economica(resultados, "Costo Total", "Unidades")
+    optima_pz = cocalc.elegir_opcion_mas_economica(resultados_pz, "Costo Total", "Unidades")
 
     # --- UI comparativa ---
     if es_modo_pieza:
@@ -2905,7 +2967,7 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
                     "Descripcion": prod_familia,
                     "Presentacion": optima_pz["Presentación"],
                     "Area_m2": round(area_total, 2) if modo_cot.startswith("📐") else 0,
-                    "Espesor_mm": espesor_mm if modo_cot.startswith("📐") else 0,
+                    "Espesor_mm": espesor_carrito if modo_cot.startswith("📐") else 0,
                     "Kg_Necesarios": 0,
                     "Cantidad": optima_pz["Unidades"],
                     "Subtotal": optima_pz["Costo Total"],
@@ -2943,12 +3005,17 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
                     # Mostrar equivalencias
                     st.caption(f"Equivalencias: {kg_necesarios:.3f} kg = {kg_necesarios*1000:.0f} g = {kg_necesarios:.3f} L ≈ {kg_necesarios*1000:.0f} ml")
                 else:
-                    st.info("Sin escala por kg disponible para este producto/cantidad. "
-                            f"Revisa la hoja `{HOJA_ESCALAS_KG}` o cotiza por cubetas.")
+                    if es_dosificado:
+                        st.info("Los pigmentos se dosifican por área (g/m²) y se venden por presentación "
+                                "(gramos, mililitros o litros): cotiza con las presentaciones de la derecha.")
+                    else:
+                        st.info("Sin escala por kg disponible para este producto/cantidad. "
+                                f"Revisa la hoja `{HOJA_ESCALAS_KG}` o cotiza por cubetas.")
                     if not escalas_dict:
                         st.caption(f"La hoja `{HOJA_ESCALAS_KG}` no existe o está vacía.")
                     # Si no hay escala, ofrecer precio por kg derivado del inventario como fallback
-                    if resultados and kg_necesarios > 0:
+                    # (no aplica a pigmentos: su precio real es el de las presentaciones en g/L).
+                    if resultados and kg_necesarios > 0 and not es_dosificado:
                         # precio por kg más barato de presentaciones
                         mejor_por_kg = min((r["Precio Público"]/r["Kg por unidad"] for r in resultados if r["Kg por unidad"]>0), default=None)
                         if mejor_por_kg:
@@ -3013,7 +3080,7 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
                         df_esc = pd.DataFrame([{
                             "Rango": e["rango_texto"],
                             "Desde kg": e["desde"],
-                            "Hasta kg": e["hasta"] if e["hasta"] is not None else "∞",
+                            "Hasta kg": f"{e['hasta']:g}" if e["hasta"] is not None else "∞",
                             "Costo $/kg": e["costo"],
                             "Público $/kg": e["publico"],
                             "Margen $/kg": e["margen"],
@@ -3035,7 +3102,7 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
                         sku_kilo = sku_kilo.strip()
                         # Detalle según modo
                         if modo_cot.startswith("📐"):
-                            detalle_kilo = (f"{prod_familia} - {area_total:.2f} m² x {espesor_mm:g} mm = {kg_necesarios:.3f} kg\n"
+                            detalle_kilo = (f"{prod_familia} - {area_total:.2f} m² x {espesor_carrito:g} mm = {kg_necesarios:.3f} kg\n"
                                             f"Modalidad: KILO EXACTO (granel) - Escala {opcion_kilo['escala']['rango_texto']}\n"
                                             f"Precio: ${opcion_kilo['precio_kg']:.2f}/kg | Total: ${opcion_kilo['total_publico']:,.2f}\n"
                                             f"Costo compra: ${opcion_kilo['costo_kg']:.2f}/kg | Total costo: ${opcion_kilo['total_costo']:,.2f}\n"
@@ -3051,13 +3118,16 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
                             "Descripcion": f"{prod_familia} (Granel por Kilo)",
                             "Presentacion": f"{kg_necesarios:.3f} kg granel - {opcion_kilo['escala']['rango_texto']} @ ${opcion_kilo['precio_kg']:.2f}/kg",
                             "Area_m2": round(area_total, 2) if modo_cot.startswith("📐") else 0,
-                            "Espesor_mm": espesor_mm if modo_cot.startswith("📐") else 0,
+                            "Espesor_mm": espesor_carrito if modo_cot.startswith("📐") else 0,
                             "Kg_Necesarios": round(kg_necesarios, 3),
                             "Cantidad": round(kg_necesarios, 3),
                             "Subtotal": round(opcion_kilo["total_publico"], 2),
                             "Detalle": detalle_kilo,
                         })
                         st.rerun()
+                elif es_dosificado:
+                    st.button("➕ Agregar Kilo Exacto", disabled=True,
+                              help="Los pigmentos no se cotizan a granel por kg: se venden por presentación (g/L).")
                 else:
                     st.button("➕ Agregar Kilo Exacto", disabled=True, help="Sin escala disponible")
             with b2:
@@ -3067,7 +3137,13 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
                         label_cub = f"➕ Agregar Cubetas para {cantidad_solicitada_original:g} {unidad_solicitada} al Carrito"
                     if st.button(label_cub, key="add_cubeta"):
                         if modo_cot.startswith("📐"):
-                            detalle_cub = (f"{prod_familia}\n{area_total:.2f} m² x {espesor_mm:g} mm ({kg_necesarios:.3f} kg)\n"
+                            if material and material["es_dosificacion"]:
+                                renglon_area = (f"{prod_familia}\n{area_total:.2f} m² · dosificación "
+                                                f"{material['dosis_g_m2']:g} g/m² = {material['gramos']:,.0f} g "
+                                                f"({kg_necesarios:.3f} kg) — el espesor no aplica\n")
+                            else:
+                                renglon_area = f"{prod_familia}\n{area_total:.2f} m² x {espesor_mm:g} mm ({kg_necesarios:.3f} kg)\n"
+                            detalle_cub = (renglon_area +
                                            f"Modalidad: CUBETAS - {optima['Unidades']}x {optima['Presentación']} = {optima['Kg cubiertos']:.3f} kg\n"
                                            f"Precio: ${optima['Costo Total']:,.2f} | Costo compra: ${optima['Costo Compra Total']:,.2f}\n"
                                            f"Margen: ${optima['Margen Total']:,.2f} ({optima['Margen % Venta']:.1f}% venta / {optima['Margen % Costo']:.1f}% markup)"
@@ -3083,7 +3159,7 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
                             "Descripcion": prod_familia,
                             "Presentacion": optima["Presentación"],
                             "Area_m2": round(area_total, 2) if modo_cot.startswith("📐") else 0,
-                            "Espesor_mm": espesor_mm if modo_cot.startswith("📐") else 0,
+                            "Espesor_mm": espesor_carrito if modo_cot.startswith("📐") else 0,
                             "Kg_Necesarios": round(kg_necesarios, 3),
                             "Cantidad": optima["Unidades"],
                             "Subtotal": optima["Costo Total"],
