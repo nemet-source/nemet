@@ -124,7 +124,7 @@ def portada_marca():
         with col_texto:
             st.markdown(
                 f"""
-                <div class="nm-hero__eyebrow">Materiales epóxicos · Hermosillo, Sonora</div>
+                <div class="nm-hero__eyebrow">Materiales epóxicos · Ciudad Obregón, Sonora</div>
                 <div class="nm-hero__title">{LEMA_NEMET}</div>
                 <p class="nm-hero__text">Resinas, pigmentos y sistemas epóxicos con inventario,
                 precios y cotizaciones al día: de la prospección comercial al folio emitido.</p>
@@ -3587,4 +3587,4 @@ elif menu == "🛡️ Administración de Usuarios":
 
 # Pie de marca (todas las vistas)
 with st.container(key="nm_pie"):
-    st.caption(f"© {ahora_local().year} NEMET · {LEMA_NEMET} · Materiales epóxicos y acabados arquitectónicos — Hermosillo, Sonora")
+    st.caption(f"© {ahora_local().year} NEMET · {LEMA_NEMET} · Materiales epóxicos y acabados arquitectónicos — Ciudad Obregón, Sonora")
