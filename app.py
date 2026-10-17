@@ -1,4 +1,5 @@
 import hashlib
+import importlib
 import math
 import os
 import re
@@ -24,6 +25,7 @@ from fpdf.fonts import FontFace
 import auth_nemet as auth  # autenticación, roles y administración de usuarios (SQLite + scrypt)
 import cotizador_calculo as cocalc  # rendimiento por mm vs. dosificación g/m² de pigmentos
 import prospeccion as pros  # búsqueda pública, clasificación y deduplicación de prospectos
+import tema_nemet as tema  # sistema visual moderno: hoja de estilo y componentes de interfaz
 
 try:
     from PIL import Image as _PILImage
@@ -68,44 +70,74 @@ def logo_marca():
     return _imagen_asset("logo_claro.png")
 
 
+def _recargar_tema():
+    """Recarga `tema_nemet` para que sus cambios se vean sin reiniciar el servidor.
+
+    Streamlit no vuelve a importar de forma fiable los módulos locales, así que sin
+    este `reload` los ajustes del tema (CSS y componentes) llegarían a la app solo
+    tras reiniciar el proceso. El módulo es pequeño y no guarda estado.
+    """
+    try:
+        importlib.reload(tema)
+    except Exception:  # pragma: no cover - nunca debe tumbar la app por el tema
+        pass
+
+
 def estilos_marca():
-    """Tipografía y detalles visuales de la marca sobre el tema base de Streamlit."""
-    st.markdown(f"""
+    """Tipografía, color y detalles visuales de la marca (sistema de diseño de `tema_nemet`)."""
+    _recargar_tema()
+    tema.aplicar()
+    st.markdown("""
     <style>
-    @import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@300;400;500;600;700&display=swap');
-    html, body, [class*="css"] {{ font-family: 'Montserrat', 'Source Sans Pro', sans-serif; }}
-    h1, h2, h3 {{ letter-spacing: 0.02em; }}
-    .stButton > button, .stDownloadButton > button {{ border-radius: 10px; font-weight: 600; letter-spacing: 0.02em; }}
-    .nemet-lema {{ font-weight: 300; letter-spacing: 0.34em; text-transform: uppercase;
-                   font-size: 0.72rem; opacity: 0.7; text-align: center; margin-top: -6px; }}
-    .nemet-linea {{ border-bottom: 1px solid rgba(143,139,132,0.35); margin: 10px 0 22px 0; }}
+    .nemet-lema { font-weight: 300; letter-spacing: 0.34em; text-transform: uppercase;
+                  font-size: 0.72rem; color: rgba(38,35,31,0.55); }
+    .nemet-linea { border-bottom: 1px solid rgba(143,139,132,0.28); }
     </style>
     """, unsafe_allow_html=True)
 
 
 def cabecera_marca():
-    """Franja de marca al inicio de cada vista (logo claro + lema). Silenciosa si faltan los assets."""
-    logo = logo_marca()
-    if logo is None:
-        return
-    col_izq, col_centro, col_der = st.columns([1, 2, 1])
-    with col_centro:
-        st.image(logo, width=250)
-        st.markdown(f"<div class='nemet-lema'>{LEMA_NEMET}</div>", unsafe_allow_html=True)
-        st.markdown("<div class='nemet-linea'></div>", unsafe_allow_html=True)
+    """Franja de marca al inicio de cada vista (firma de NEMET + lema)."""
+    st.markdown(
+        f"""
+        <div class="nm-strip">
+          <span class="nm-strip__mark">NEMET</span>
+          <span class="nm-strip__line"></span>
+          <span class="nemet-lema">{LEMA_NEMET}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def portada_marca():
-    """Portada cinematográfica del dashboard: el hero claro cubre todo el ancho.
+    """Portada del dashboard: hero de marca con el lema, la propuesta de valor y la imagen.
 
-    Devuelve True si se mostró (el hero ya lleva logo + lema, así que la vista omite
-    la franja compacta para no duplicar la marca).
+    Devuelve True si se mostró (el hero ya lleva la marca, así que la vista omite
+    la franja compacta para no duplicarla).
     """
     hero = _imagen_asset("hero_claro.png")
     if hero is None:
         return False
-    with st.container(border=True):
-        st.image(hero, width="stretch")
+    with st.container(key="nm_hero"):
+        col_texto, col_media = st.columns([1.5, 1], gap="large", vertical_alignment="center")
+        with col_texto:
+            st.markdown(
+                f"""
+                <div class="nm-hero__eyebrow">Materiales epóxicos · Hermosillo, Sonora</div>
+                <div class="nm-hero__title">{LEMA_NEMET}</div>
+                <p class="nm-hero__text">Resinas, pigmentos y sistemas epóxicos con inventario,
+                precios y cotizaciones al día: de la prospección comercial al folio emitido.</p>
+                <div class="nm-hero__facts">
+                  <span class="nm-chip">Resinas y sistemas</span>
+                  <span class="nm-chip nm-chip--verde">Pigmentos y colorantes</span>
+                  <span class="nm-chip nm-chip--neutro">Cotización por m² · mm y kg</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with col_media:
+            st.image(hero, width="stretch")
     return True
 
 
@@ -1433,80 +1465,81 @@ def pantalla_login(conn, secreto, ttl, aviso_semilla=None):
     """Formulario de acceso. Devuelve None (la sesión se fija y se recarga la app)."""
     estilos_marca()
     cabecera_marca()
-    st.subheader("🔐 Acceso al sistema")
-    st.caption("Sistema interno de NEMET. El acceso está restringido a cuentas autorizadas "
-               "y todas las acciones quedan registradas en la bitácora.")
-    st.info("🔒 **No hay registro abierto.** Las cuentas las crea un administrador desde el panel "
-            "🛡️ *Administración de Usuarios*; si no tienes cuenta, pídesela a un administrador "
-            "(te dará un usuario y una contraseña provisional).")
+    with st.container(key="nm_acceso"):
+        st.subheader("🔐 Acceso al sistema")
+        st.caption("Sistema interno de NEMET. El acceso está restringido a cuentas autorizadas "
+                   "y todas las acciones quedan registradas en la bitácora.")
+        st.info("🔒 **No hay registro abierto.** Las cuentas las crea un administrador desde el panel "
+                "🛡️ *Administración de Usuarios*; si no tienes cuenta, pídesela a un administrador "
+                "(te dará un usuario y una contraseña provisional).")
 
-    if aviso_semilla and aviso_semilla[0] in ("creado", "actualizado"):
-        st.success(f"🌱 {aviso_semilla[1]}")
-        # Se publica la base en GitHub de inmediato: si el servidor se reinicia antes del
-        # primer guardado, la cuenta de administrador no se pierde (disco efímero en la nube).
-        respaldo = _respaldar_usuarios("alta del administrador inicial")
-        if respaldo:
-            getattr(st, respaldo[0], st.info)(respaldo[1])
-    if aviso_semilla and aviso_semilla[0] == "sin_admins":
-        st.error("🚨 El sistema no tiene ningún administrador activo y los Secrets no traen "
-                 "credenciales de administrador inicial (`[auth] admin_usuario` y `admin_password`). "
-                 "Configúralas en los Secrets de la app (o, en una instalación local, ejecuta "
-                 "`python herramientas/crear_admin.py --usuario tu_usuario`) y recarga esta página. "
-                 "Por seguridad, el primer administrador nunca se crea desde esta pantalla.")
-        with st.expander("👤 Soy el administrador: ¿cómo entro?"):
-            st.markdown(
-                "**En Streamlit Community Cloud o servidor con Secrets**\n\n"
-                "1. Abre los Secrets de la app (o el archivo `.streamlit/secrets.toml`) y agrega:\n"
-                "   ```toml\n"
-                "   [auth]\n"
-                '   admin_usuario = "tu_usuario"\n'
-                '   admin_password = "una-contraseña-larga-y-única"\n'
-                "   ```\n"
-                "2. Recarga la página: la app crea esa cuenta y te pide cambiar la contraseña al entrar.\n\n"
-                "**En una instalación local (sin Secrets)**\n\n"
-                "```bash\n"
-                "python herramientas/crear_admin.py --usuario tu_usuario\n"
-                "```\n\n"
-                "Si ya tenías cuenta y olvidaste la contraseña, un administrador puede restablecerla "
-                "desde el panel; o pon `admin_forzar = true` una sola vez en los Secrets para "
-                "restablecer la del administrador inicial.")
-        return None
+        if aviso_semilla and aviso_semilla[0] in ("creado", "actualizado"):
+            st.success(f"🌱 {aviso_semilla[1]}")
+            # Se publica la base en GitHub de inmediato: si el servidor se reinicia antes del
+            # primer guardado, la cuenta de administrador no se pierde (disco efímero en la nube).
+            respaldo = _respaldar_usuarios("alta del administrador inicial")
+            if respaldo:
+                getattr(st, respaldo[0], st.info)(respaldo[1])
+        if aviso_semilla and aviso_semilla[0] == "sin_admins":
+            st.error("🚨 El sistema no tiene ningún administrador activo y los Secrets no traen "
+                     "credenciales de administrador inicial (`[auth] admin_usuario` y `admin_password`). "
+                     "Configúralas en los Secrets de la app (o, en una instalación local, ejecuta "
+                     "`python herramientas/crear_admin.py --usuario tu_usuario`) y recarga esta página. "
+                     "Por seguridad, el primer administrador nunca se crea desde esta pantalla.")
+            with st.expander("👤 Soy el administrador: ¿cómo entro?"):
+                st.markdown(
+                    "**En Streamlit Community Cloud o servidor con Secrets**\n\n"
+                    "1. Abre los Secrets de la app (o el archivo `.streamlit/secrets.toml`) y agrega:\n"
+                    "   ```toml\n"
+                    "   [auth]\n"
+                    '   admin_usuario = "tu_usuario"\n'
+                    '   admin_password = "una-contraseña-larga-y-única"\n'
+                    "   ```\n"
+                    "2. Recarga la página: la app crea esa cuenta y te pide cambiar la contraseña al entrar.\n\n"
+                    "**En una instalación local (sin Secrets)**\n\n"
+                    "```bash\n"
+                    "python herramientas/crear_admin.py --usuario tu_usuario\n"
+                    "```\n\n"
+                    "Si ya tenías cuenta y olvidaste la contraseña, un administrador puede restablecerla "
+                    "desde el panel; o pon `admin_forzar = true` una sola vez en los Secrets para "
+                    "restablecer la del administrador inicial.")
+            return None
 
-    with st.form("form_acceso"):
-        usuario = st.text_input("Usuario", key="acceso_usuario", autocomplete="username")
-        password = st.text_input("Contraseña", type="password", key="acceso_password",
-                                 autocomplete="current-password")
-        entrar = st.form_submit_button("Entrar", type="primary", key="acceso_entrar")
+        with st.form("form_acceso"):
+            usuario = st.text_input("Usuario", key="acceso_usuario", autocomplete="username")
+            password = st.text_input("Contraseña", type="password", key="acceso_password",
+                                     autocomplete="current-password")
+            entrar = st.form_submit_button("Entrar", type="primary", key="acceso_entrar", width="stretch")
 
-    if entrar:
-        try:
-            datos, mensaje = auth.autenticar(conn, usuario, password, zona=ZONA_HORARIA)
-        except (sqlite3.Error, OSError) as error:
-            # Nunca más un cuadro rojo con el mensaje censurado: aquí se ve la causa real.
-            pantalla_error_base(error)
-            datos, mensaje = None, None
-        if datos:
-            st.session_state["_usuario"] = datos
-            _fijar_token(datos, secreto, ttl)
-            st.rerun()
-        elif mensaje:
-            st.error(f"❌ {mensaje}")
+        if entrar:
+            try:
+                datos, mensaje = auth.autenticar(conn, usuario, password, zona=ZONA_HORARIA)
+            except (sqlite3.Error, OSError) as error:
+                # Nunca más un cuadro rojo con el mensaje censurado: aquí se ve la causa real.
+                pantalla_error_base(error)
+                datos, mensaje = None, None
+            if datos:
+                st.session_state["_usuario"] = datos
+                _fijar_token(datos, secreto, ttl)
+                st.rerun()
+            elif mensaje:
+                st.error(f"❌ {mensaje}")
 
-    st.caption("¿Olvidaste tu contraseña? Pide a un administrador que la restablezca desde el "
-               "panel de administración; nadie puede recuperarla porque se guarda cifrada.")
+        st.caption("¿Olvidaste tu contraseña? Pide a un administrador que la restablezca desde el "
+                   "panel de administración; nadie puede recuperarla porque se guarda cifrada.")
 
-    with st.expander("🔧 ¿Problemas para entrar?"):
-        detalle = _diagnostico_base_markdown()
-        if detalle:
-            st.markdown(detalle)
-            st.caption("Si algo falla, la app muestra el motivo exacto en pantalla antes de "
-                       "cualquier cuadro de error genérico.")
-        else:
-            st.caption("La app no pudo leer el estado de la base de usuarios.")
-    if not obtener_secret("auth", "session_secret"):
-        st.caption("💡 Sugerencia de seguridad: define `[auth] session_secret` en los Secrets para "
-                   "rotar la clave que firma las sesiones y `[auth] session_minutos` para ajustar "
-                   "la expiración por inactividad.")
+        with st.expander("🔧 ¿Problemas para entrar?"):
+            detalle = _diagnostico_base_markdown()
+            if detalle:
+                st.markdown(detalle)
+                st.caption("Si algo falla, la app muestra el motivo exacto en pantalla antes de "
+                           "cualquier cuadro de error genérico.")
+            else:
+                st.caption("La app no pudo leer el estado de la base de usuarios.")
+        if not obtener_secret("auth", "session_secret"):
+            st.caption("💡 Sugerencia de seguridad: define `[auth] session_secret` en los Secrets para "
+                       "rotar la clave que firma las sesiones y `[auth] session_minutos` para ajustar "
+                       "la expiración por inactividad.")
     return None
 
 
@@ -1602,10 +1635,22 @@ def recargar_datos():
 
 def bloque_usuario_sidebar(conn, secreto, ttl):
     """Identidad de la sesión, cambio de contraseña propio y cierre de sesión."""
-    with st.sidebar.container(border=True):
-        st.markdown(f"**{SESION['nombre'] or SESION['usuario']}**")
-        st.caption(f"👤 `{SESION['usuario']}` · {auth.etiqueta_rol(SESION['rol'])}")
-        st.caption(f"🕒 Último acceso: {fecha_legible(SESION['ultimo_acceso']) or '—'}")
+    nombre = SESION["nombre"] or SESION["usuario"]
+    iniciales = "".join(parte[0] for parte in str(nombre).split()[:2] if parte).upper() or "N"
+    st.sidebar.markdown(
+        f"""
+        <div class="nm-side-user">
+          <div class="nm-side-user__avatar">{tema.escapar(iniciales)}</div>
+          <div style="min-width:0">
+            <div class="nm-side-user__name">{tema.escapar(nombre)}</div>
+            <div class="nm-side-user__meta">{tema.escapar(SESION['usuario'])}</div>
+            <span class="nm-role-chip">{tema.escapar(auth.etiqueta_rol(SESION['rol']))}</span>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.sidebar.caption(f"🕒 Último acceso: {fecha_legible(SESION['ultimo_acceso']) or '—'}")
 
     with st.sidebar.expander("🔑 Cambiar mi contraseña"):
         with st.form("form_mi_password"):
@@ -1658,7 +1703,8 @@ def _respaldar_usuarios(motivo):
 def panel_usuarios(conn):
     """Panel de administración: crear, editar, desactivar y eliminar administradores y usuarios."""
     requiere_modulo("usuarios_gestionar")  # doble candado: además del módulo, exige la acción de administrar
-    st.subheader("🛡️ Administración de Usuarios y Permisos")
+    tema.encabezado("NEMET · Administración", "Usuarios y Permisos",
+                    "Cuentas, roles y bitácora de accesos del sistema.")
     st.caption("Solo los administradores activos ven este panel. Las contraseñas se guardan con hash "
                "scrypt (nunca en texto plano) y todas las acciones quedan en la bitácora.")
 
@@ -2008,8 +2054,8 @@ def panel_prospeccion(inventario):
       .st-key-prospector-movil [data-testid="stHorizontalBlock"] {
         flex-direction: column !important; align-items: stretch !important;
       }
-      .st-key-prospector-movil [data-testid="column"] {
-        flex: 1 1 100% !important; width: 100% !important; min-width: 0 !important;
+      .st-key-prospector-movil [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
+        flex: 1 1 100% !important; width: 100% !important; min-width: 100% !important;
       }
       .st-key-prospector-movil [data-testid="stMarkdownContainer"] { overflow-wrap: anywhere; }
       .st-key-prospector-movil [data-testid="stDataFrame"] { max-width: 100%; }
@@ -2020,8 +2066,8 @@ def panel_prospeccion(inventario):
 
 
 def _contenido_prospeccion(inventario):
-    st.subheader("🎯 NEMET PROSPECTOR")
-    st.caption("Buscar → Detectar → Calificar → Contactar → Dar seguimiento → Vender")
+    tema.encabezado("NEMET · Prospección", "NEMET PROSPECTOR",
+                    "Buscar → Detectar → Calificar → Contactar → Dar seguimiento → Vender")
     st.write("Busca negocios públicos por ciudad y giro, revisa el mapa y arma tu lista comercial. "
              "**Potencial no significa intención de compra:** comprueba los datos antes de contactar.")
     st.caption("Fuentes: © OpenStreetMap contributors (ODbL) y DENUE (INEGI). Si Overpass falla o no hay "
@@ -2568,7 +2614,7 @@ df_clientes = st.session_state["clientes"]
 # ==========================================
 _logo_sidebar = logo_marca()
 if _logo_sidebar is not None:
-    st.sidebar.image(_logo_sidebar, width=160)
+    st.sidebar.image(_logo_sidebar, width=150)
 st.sidebar.title("📂 Menú Principal")
 menu = st.sidebar.selectbox("Navegación", modulos_visibles(SESION["rol"]))
 st.sidebar.divider()
@@ -2585,16 +2631,16 @@ bloque_usuario_sidebar(CONN, auth.secreto_sesion(CONN, obtener_secret("auth", "s
 mostrar_flash()
 estilos_marca()
 
-# El dashboard abre con la portada de marca (ya incluye logo y lema); si no se muestra,
-# o en cualquier otra vista, entra la franja compacta de marca.
-_portada_activa = menu == "📊 Dashboard & Resumen" and portada_marca()
-if not _portada_activa:
+# El dashboard abre con la portada de marca (ya incluye el lema); en cualquier otra
+# vista entra la franja compacta con la firma de NEMET.
+if menu != "📊 Dashboard & Resumen":
     cabecera_marca()
 
 if menu == "📊 Dashboard & Resumen":
     requiere_modulo("dashboard")
     st.title("🧪 Sistema Maestro NEMET")
     st.subheader("Panel General de Control y Logística")
+    portada_marca()
 
     if st.button("🔄 Sincronizar Datos con Excel"):
         recargar_datos()
@@ -2611,14 +2657,22 @@ if menu == "📊 Dashboard & Resumen":
         if stock is not None and "StockMinimo" in df_inv.columns else 0
 
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Total de SKUs Registrados", len(df_inv))
-    if auth.puede(SESION["rol"], "clientes"):
-        col2.metric("Clientes Registrados", len(df_clientes))
-    else:
-        col2.metric("Clientes Registrados", "🔒",
-                    help="Tu rol no tiene acceso al directorio de clientes.")
-    col3.metric("Valor Total Inventario ($)", f"${valor_total:,.2f} MXN")
-    col4.metric("SKUs por Reabastecer", por_reabastecer)
+    with col1:
+        tema.kpi(f"{len(df_inv):,}", "SKUs registrados", icono="📦",
+                 nota="Productos y presentaciones en el Excel", tono="barro")
+    with col2:
+        if auth.puede(SESION["rol"], "clientes"):
+            tema.kpi(f"{len(df_clientes):,}", "Clientes registrados", icono="👥",
+                     nota="Directorio comercial activo", tono="verde")
+        else:
+            tema.kpi("🔒", "Clientes registrados", icono="👥",
+                     nota="Tu rol no tiene acceso al directorio", tono="piedra")
+    with col3:
+        tema.kpi(f"${valor_total:,.0f}", "Valor del inventario", icono="💰",
+                 nota="MXN a precio de lista con IVA", tono="tinta")
+    with col4:
+        tema.kpi(f"{por_reabastecer:,}", "Por reabastecer", icono="🔔",
+                 nota="SKU en o por debajo del mínimo", tono="barro")
 
     if "SKU" in df_inv.columns:
         duplicados = sorted(df_inv.loc[df_inv["SKU"].duplicated() & df_inv["SKU"].ne(""), "SKU"].unique())
@@ -2631,7 +2685,8 @@ if menu == "📊 Dashboard & Resumen":
 
 elif menu == "📦 Control de Inventario y Edición":
     requiere_modulo("inventario")
-    st.subheader("Gestión, Entradas, Salidas y Edición Directa")
+    tema.encabezado("NEMET · Módulo", "Control de Inventario y Edición",
+                    "Gestión, entradas, salidas y edición directa de las fichas de producto.")
     st.caption("Captura StockInicial, Entradas, Salidas, StockMinimo, PrecioCompra y PrecioPublicoIVA. "
                "Las columnas StockActual, AlertaStock, PrecioBaseSinIVA, IVA 16% y ValorInventario se calculan al guardar.")
     columnas_bloqueadas = [c for c in COLUMNAS_DERIVADAS_INV if c in df_inv.columns]
@@ -2670,7 +2725,8 @@ elif menu == "📦 Control de Inventario y Edición":
 
 elif menu == "👥 Gestión de Clientes":
     requiere_modulo("clientes")
-    st.subheader("👥 Base de Datos y Directorio de Clientes")
+    tema.encabezado("NEMET · Módulo", "Gestión de Clientes",
+                    "Base de datos y directorio de clientes para cotizar y dar seguimiento.")
     st.markdown("Agrega, edita o elimina la información de tus clientes directamente. Los cambios se guardarán en la pestaña `Clientes` de tu Excel.")
 
     df_cli_editado = st.data_editor(
@@ -2712,7 +2768,8 @@ elif menu == "🎯 Prospección Comercial":
 
 elif menu == "📏 Cotizador por Área y Milimétrico":
     requiere_modulo("cotizador_area")
-    st.subheader("Cotizador por Área, Espesor y por Cantidad Directa (kg/g/L/ml/Pz)")
+    tema.encabezado("NEMET · Cotizador", "Cotizador por Área y Milimétrico",
+                    "Calcula el material necesario por m² y mm —o la cantidad directa— y arma la cotización.")
 
     with st.expander("📦 Consultar Inventario General"):
         st.dataframe(df_inv, width="stretch")
@@ -3446,7 +3503,8 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
 
 elif menu == "📝 Cotizador Comercial Profesional":
     requiere_modulo("cotizador_comercial")
-    st.subheader("Generador de Cotizaciones Comerciales")
+    tema.encabezado("NEMET · Cotizador", "Cotizador Comercial Profesional",
+                    "Generador de cotizaciones comerciales por producto y presentación.")
 
     if df_inv.empty:
         st.warning("No hay inventario cargado; revisa el archivo Excel.")
@@ -3484,7 +3542,8 @@ elif menu == "📝 Cotizador Comercial Profesional":
 
 elif menu == "📋 Historial de Cotizaciones (Folios)":
     requiere_modulo("historial")
-    st.subheader("Historial y Auditoría de Cotizaciones")
+    tema.encabezado("NEMET · Módulo", "Historial de Cotizaciones",
+                    "Folios emitidos y auditoría de cotizaciones.")
 
     if auth.puede(SESION["rol"], "historial_borrar"):
         with st.expander("🗑️ Borrar Todo el Historial de Cotizaciones"):
@@ -3518,12 +3577,14 @@ elif menu == "📋 Historial de Cotizaciones (Folios)":
                 df_hist["Folio"].astype(str).str.contains(busqueda, case=False, na=False, regex=False)
             ]
         st.dataframe(df_hist, width="stretch", hide_index=True)
-        st.metric("Total de Cotizaciones Emitidas", len(df_hist))
+        col_total, _vacio = st.columns([1, 3])
+        with col_total:
+            st.metric("Total de Cotizaciones Emitidas", len(df_hist))
 
 elif menu == "🛡️ Administración de Usuarios":
     requiere_modulo("admin_usuarios")
     panel_usuarios(CONN)
 
 # Pie de marca (todas las vistas)
-st.divider()
-st.caption(f"© {ahora_local().year} NEMET · {LEMA_NEMET} · Materiales epóxicos y acabados arquitectónicos — Hermosillo, Sonora")
+with st.container(key="nm_pie"):
+    st.caption(f"© {ahora_local().year} NEMET · {LEMA_NEMET} · Materiales epóxicos y acabados arquitectónicos — Hermosillo, Sonora")
