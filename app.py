@@ -2614,7 +2614,7 @@ df_clientes = st.session_state["clientes"]
 # ==========================================
 _logo_sidebar = logo_marca()
 if _logo_sidebar is not None:
-    st.sidebar.image(_logo_sidebar, width=150)
+    st.sidebar.image(_logo_sidebar, width=120)
 st.sidebar.title("📂 Menú Principal")
 menu = st.sidebar.selectbox("Navegación", modulos_visibles(SESION["rol"]))
 st.sidebar.divider()
