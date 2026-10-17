@@ -186,9 +186,45 @@ hr { border-color: var(--nm-line) !important; margin: 1.6rem 0 !important; }
   background: linear-gradient(178deg, #FFFDF9 0%, #F8F2E9 100%) !important;
   border-right: 1px solid var(--nm-line);
 }
+/* Barra lateral compacto: menos ancha que el ancho por defecto de Streamlit
+   (~336px) para dar ese espacio al contenido, y con menos aire vertical para
+   que menú, respaldo y bloque de usuario quepan sin tener que bajar tanto.
+   Solo se acota cuando está desplegada: el colapso queda como lo trae Streamlit. */
+[data-testid="stSidebar"][aria-expanded="true"] {
+  min-width: 248px !important;
+  max-width: 272px !important;
+}
+[data-testid="stSidebarUserContent"] {
+  padding: 1.1rem 1rem 1rem !important;
+}
 [data-testid="stSidebar"] [data-testid="stVerticalBlock"] { gap: .15rem; }
 [data-testid="stSidebar"] .stButton > button,
-[data-testid="stSidebar"] .stDownloadButton > button { width: 100%; }
+[data-testid="stSidebar"] .stDownloadButton > button {
+  width: 100%;
+  padding: .35rem .7rem !important;
+  font-size: .85rem !important;
+}
+/* Los separadores y expansores heredan el aire generoso de la vista principal;
+   en la barra lateral compacto se pegan un poco más a su contenido. */
+[data-testid="stSidebar"] hr { margin: .55rem 0 !important; }
+[data-testid="stSidebar"] [data-testid="stExpander"] summary {
+  padding: .45rem .7rem !important;
+  font-size: .84rem !important;
+}
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"] p {
+  font-size: .72rem !important;
+  line-height: 1.4;
+}
+[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p { font-size: .78rem !important; }
+/* El logo de la barra lateral se muestra más chico y centrado (ver app.py). */
+[data-testid="stSidebar"] [data-testid="stImage"] {
+  display: flex;
+  justify-content: center;
+}
+[data-testid="stSidebar"] [data-testid="stImage"] img {
+  max-width: 120px;
+  height: auto;
+}
 /* El título del menú se vuelve una micro-etiqueta, no un encabezado gigante. */
 [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h1 {
   font-family: var(--nm-font) !important; font-size: .68rem !important; font-weight: 800 !important;
@@ -209,8 +245,8 @@ hr { border-color: var(--nm-line) !important; margin: 1.6rem 0 !important; }
 .nm-strip__line { flex: 1 1 auto; height: 1px; background: var(--nm-line); }
 
 .nm-side-brand {
-  display: flex; flex-direction: column; align-items: center; gap: .5rem;
-  padding: .6rem 0 1rem;
+  display: flex; flex-direction: column; align-items: center; gap: .35rem;
+  padding: .3rem 0 .5rem;
 }
 .nm-side-brand img { border-radius: var(--nm-r-sm); }
 .nm-eyebrow {
@@ -218,29 +254,29 @@ hr { border-color: var(--nm-line) !important; margin: 1.6rem 0 !important; }
   text-transform: uppercase; color: var(--nm-muted);
 }
 .nm-side-user {
-  display: flex; align-items: center; gap: .7rem;
+  display: flex; align-items: center; gap: .55rem;
   background: var(--nm-card);
   border: 1px solid var(--nm-line);
   border-radius: var(--nm-r);
-  padding: .65rem .7rem;
+  padding: .5rem .6rem;
   box-shadow: var(--nm-shadow-sm);
 }
 .nm-side-user__avatar {
-  width: 38px; height: 38px; flex: 0 0 38px;
-  border-radius: 12px;
+  width: 32px; height: 32px; flex: 0 0 32px;
+  border-radius: 10px;
   display: grid; place-items: center;
-  font-weight: 800; font-size: .92rem; color: #fff;
+  font-weight: 800; font-size: .82rem; color: #fff;
   background: linear-gradient(150deg, var(--nm-clay) 0%, var(--nm-clay-600) 100%);
   box-shadow: 0 4px 10px -4px rgba(180, 85, 45, .7);
 }
-.nm-side-user__name { font-weight: 700; font-size: .88rem; color: var(--nm-ink); line-height: 1.25; }
-.nm-side-user__meta { font-size: .72rem; color: var(--nm-muted); }
+.nm-side-user__name { font-weight: 700; font-size: .82rem; color: var(--nm-ink); line-height: 1.25; }
+.nm-side-user__meta { font-size: .68rem; color: var(--nm-muted); }
 .nm-role-chip {
-  display: inline-block; margin-top: .18rem;
-  font-size: .64rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+  display: inline-block; margin-top: .12rem;
+  font-size: .6rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
   color: var(--nm-green); background: var(--nm-green-50);
   border: 1px solid rgba(47, 93, 58, .18);
-  border-radius: var(--nm-r-pill); padding: .1rem .5rem;
+  border-radius: var(--nm-r-pill); padding: .05rem .45rem;
 }
 
 /* ============================================================
@@ -701,14 +737,47 @@ button:focus-visible, input:focus-visible {
 /* ============================================================
    14 · SCROLLBAR, SELECCIÓN Y ENLACES
    ============================================================ */
-::-webkit-scrollbar { width: 11px; height: 11px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb {
-  background: rgba(38, 35, 31, .16);
-  border: 3px solid transparent; background-clip: content-box;
+/* Scroll visible: antes la pista era transparente y el pulgar una línea
+   casi invisible (16% de tinta recortada con un borde de 3px), así que no
+   se notaba que la página —y sobre todo la barra lateral compacto— se podía
+   seguir bajando. Ahora la pista se insinúa siempre, el pulgar es más grueso
+   y con más contraste, y al pasar el cursor o arrastrarlo se tiñe de barro.
+   Firefox no usa los pseudo-elementos -webkit-: se le da el mismo tratamiento
+   con scrollbar-width/scrollbar-color (delgada, pero siempre presente). */
+html {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(180, 85, 45, .55) rgba(38, 35, 31, .06);
+}
+[data-testid="stSidebar"],
+[data-testid="stSidebarContent"],
+[data-testid="stSidebarUserContent"],
+[data-testid="stDataFrame"],
+[data-testid="stDataEditor"] {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(180, 85, 45, .55) rgba(38, 35, 31, .06);
+}
+::-webkit-scrollbar { width: 12px; height: 12px; }
+::-webkit-scrollbar-track {
+  background: rgba(38, 35, 31, .06);
   border-radius: var(--nm-r-pill);
 }
-::-webkit-scrollbar-thumb:hover { background: rgba(180, 85, 45, .4); background-clip: content-box; }
+::-webkit-scrollbar-thumb {
+  background: rgba(38, 35, 31, .32);
+  border: 2px solid transparent; background-clip: content-box;
+  border-radius: var(--nm-r-pill);
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(180, 85, 45, .65); background-clip: content-box; }
+::-webkit-scrollbar-thumb:active { background: rgba(154, 69, 38, .8); background-clip: content-box; }
+::-webkit-scrollbar-corner { background: transparent; }
+/* En la barra lateral el pulgar va un punto más presente: es el scroll que
+   más pasaba desapercibido cuando el bloque de usuario quedaba abajo. */
+[data-testid="stSidebar"]::-webkit-scrollbar,
+[data-testid="stSidebarContent"]::-webkit-scrollbar { width: 10px; }
+[data-testid="stSidebar"]::-webkit-scrollbar-thumb,
+[data-testid="stSidebarContent"]::-webkit-scrollbar-thumb {
+  background: rgba(180, 85, 45, .5);
+  border: 2px solid transparent; background-clip: content-box;
+}
 ::selection { background: var(--nm-clay-100); color: var(--nm-ink); }
 [data-testid="stFullScreenFrame"] > div { border-radius: var(--nm-r) !important; }
 
