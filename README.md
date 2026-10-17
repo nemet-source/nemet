@@ -286,6 +286,26 @@ La app usa **solo el logo claro**: el letterpress oscuro (`logo_oscuro.png` /
 La paleta (`PALETA_NEMET` en `app.py`) y el tema (`assets` en `.streamlit/config.toml`) comparten
 los colores de los logos: crema `#F5EFE6`, tinta `#26231F`, barro `#B4552D`, verde `#2F5D3A`.
 
+### Sistema visual (`tema_nemet.py`)
+
+Streamlit no expone una API de estilos, así que toda la capa visual vive en `tema_nemet.py`:
+una hoja de estilo inyectada con `st.markdown(..., unsafe_allow_html=True)` y los componentes
+propios que Streamlit no trae de fábrica.
+
+| Pieza | Qué resuelve |
+|---|---|
+| `tema.aplicar()` | Inyecta la hoja de estilo completa (tokens, tipografía, superficies, controles, vista adaptable). |
+| `tema.encabezado(…)` | Encabezado de vista: micro-etiqueta, título y descripción con filete inferior. |
+| `tema.kpi(…)` | Tarjeta de indicador con barra de acento, etiqueta en versalitas y valor tabulado. |
+| `tema.chip(…)` / `tema.panel(…)` | Pastillas de estado y tarjetas de contenido. |
+| `tema.escapar(…)` | Escapa los textos que llegan de datos antes de incrustarlos en el HTML. |
+
+Reglas de la nueva estética: superficies blancas sobre crema, esquinas redondeadas (11–28 px),
+sombras suaves en dos capas, tipografía **Fraunces** para los títulos editoriales y **Plus Jakarta
+Sans** para la interfaz, botones primarios con degradado terracota y foco visible en todos los
+campos. El diseño se adapta a móvil: las columnas se apilan en dos por fila y el hero del
+dashboard se arma en una sola columna.
+
 ## Ejecución local
 
 ```bash
