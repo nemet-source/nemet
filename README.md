@@ -83,7 +83,7 @@ python herramientas/migrar_plantilla.py             # actualiza Inventario, Cat_
 | Qué hace | Ejemplo |
 |---|---|
 | Amarra cada renglón al nombre de `Cat_Productos` | `Epoxy pisos 5K` → `EPOXY PISOS (A Y B) TRANSPARENTE` |
-| Multiplica el tramo por el tamaño de la presentación | 1.5 kg × $480/kg = **$720**; 19 L × $440/L = **$8 360** |
+| Lee los precios como **$/kg del tramo** y multiplica por el bulto | 1.5 kg × $480/kg = **$720**; 19 L × $440/L = **$8 360** |
 | Llena `PrecioCompra` con el costo del mismo tramo | `EPT 06` cuesta $6 029 y se vende en $8 000 (24.6 %) |
 | Recalcula `Línea` por familia | Cáscara de Naranja y Estuco Veneciano → **Acabado**, no *Herramienta* |
 | Conserva los SKU históricos y solo genera los faltantes | 88 códigos, ninguno repetido |
@@ -95,9 +95,12 @@ arena sílica, EPO-PAINT) y `Escalas_Precios_KG` las escalas del proveedor que s
 plantilla (poliuretano, estuco y grano wall). Los consumos sin respaldo del manual quedan
 marcados «Criterio NEMET … ajustable» en `Fuente_Dosis`.
 
-Pendientes de captura: `EPA 01` y `AS 01` no tienen presentación ni precio en ninguna fuente
-(no se pueden cotizar) y 17 fichas siguen sin costo del proveedor. El detalle —con la tabla de
-precios convertidos— está en `skus_automaticos.md`.
+El inventario conserva **88 fichas** aunque la lista del proveedor traiga 70 renglones: las 17
+fichas que la lista nueva todavía no cubre (fotoluminiscentes, grano, mica, jalador nivelador,
+mezclador, copa diamante, báscula) se quedan con su precio anterior hasta que se agreguen, y
+`EPA 01` / `AS 01` siguen sin presentación ni precio en ninguna fuente. La conciliación renglón
+por renglón contra el archivo subido se prueba en `tests_migracion.py`; el detalle —con la tabla
+de precios convertidos y la lista de pendientes— está en `skus_automaticos.md` §7.
 
 ## 🎯 NEMET PROSPECTOR
 
@@ -378,7 +381,7 @@ python tests_cotizador.py      #  20/20  dosificación de pigmentos vs. rendimie
 python tests_cotizador_app.py  #  11/11  el cotizador por área manejado como lo hace una persona (AppTest)
 python tests_sku.py            #  21/21  prefijos, consecutivos y relleno de SKUs faltantes (sin Streamlit)
 python tests_sku_app.py        #    7/7  el alta automática de SKUs en la interfaz (AppTest)
-python tests_migracion.py      #  24/24  plantilla migrada: nombres, precios por presentación, costos y línea
+python tests_migracion.py      #  27/27  plantilla migrada: nombres, precios, costos, línea y conciliación
 ```
 
 > El cotizador se apoya en `cotizador_calculo.py` (lógica pura, sin Streamlit) para que la

@@ -52,8 +52,8 @@ Consecuencias que no se ven a simple vista:
      borrado por accidente nunca dejan el archivo sin SKU;
    * los SKUs ya capturados no se reescriben ni se reenumeran.
 4. **Pruebas**: `tests_sku.py` (21 casos, sin Streamlit), `tests_sku_app.py` (7 casos, AppTest:
-   la hoja vacía y el libro migrado) y `tests_migracion.py` (24 casos con los precios, costos,
-   `Línea` y el catálogo completo).
+   la hoja vacía y el libro migrado) y `tests_migracion.py` (27 casos con los precios, costos,
+   `Línea`, el catálogo completo y la conciliación contra el archivo subido).
 
 ## 4. Cómo se arman los códigos
 
@@ -77,7 +77,7 @@ códigos nuevos sigan la nomenclatura correcta.
 ```bash
 python tests_sku.py        # 21/21 reglas de generación, datos reales y plantilla migrada
 python tests_sku_app.py    #  7/7 la app rellena, avisa y guarda los SKUs faltantes
-python tests_migracion.py  # 24/24 nombres, precios por presentación, costos, línea y catálogo
+python tests_migracion.py  # 27/27 nombres, precios, costos, línea, catálogo y conciliación
 python tests_cotizador.py  # 20/20 el cotizador vuelve a encontrar los productos del inventario
 ```
 
@@ -108,7 +108,8 @@ python herramientas/migrar_plantilla.py             # actualiza el Excel
 | `Costo proveedor` y `Precio sugerido` **por kg/L** | `PrecioCompra` y `PrecioPublicoIVA` **por presentación**, con IVA |
 | `Línea` corrida dos filas | `Línea` recalculada por familia |
 
-Las escalas se convierten multiplicando el tramo que le toca a cada presentación:
+Las escalas se leen como **$ por kg/L del tramo** (confirmado por NEMET el 31-oct-2026: «ya son los
+precios finales») y se convierten multiplicando por el tamaño de la presentación:
 
 | SKU | Presentación | Tramo del proveedor | Precio con IVA | Costo |
 |---|---|---|---|---|
@@ -164,12 +165,35 @@ anotada en `Fuente_Dosis` (las que no vienen del manual dicen «Criterio NEMET �
 estuco veneciano (3) y grano wall (2). El cotizador ahora marca como dosificación por área todo
 producto que traiga `Dosis_g_m2`, aunque su nombre no sea de los pigmentos de siempre.
 
-### 7.4 Lo que sigue pendiente de capturar
+### 7.4 Las 17 fichas que la lista nueva todavía no trae
 
-* `EPA 01` (EPO-PAINT) y `AS 01` (ARENA SILICA) **no tienen presentación ni precio** en ninguna
-  de las dos fuentes, así que la app no puede cotizarlos: faltan datos del proveedor.
-* 17 fichas siguen sin `PrecioCompra` (fotoluminiscentes, grano, mica, jalador nivelador,
-  mezclador, copa diamante y báscula): la plantilla no trae su costo. Mientras tanto su margen
-  aparece como «desconocido» en el aviso de validación.
-* Los consumos marcados «Criterio NEMET» son valores de arranque; ajústalos en `Cat_Productos`
-  cuando el manual NEMET los especifique.
+El archivo subido tiene 70 renglones; el inventario conserva **88 fichas** (decisión del
+31-oct-2026: *los productos que falten se agregarán después*). Las 17 fichas que la lista no
+cubre se quedan con su precio anterior y sin costo del proveedor; cuando llegue la lista nueva
+solo hay que volver a correr `herramientas/migrar_plantilla.py` y se actualizan solas:
+
+| SKU | Producto | Presentación | Precio actual (IVA) |
+|---|---|---|---|
+| `PF 01-03` | PIGMENTOS FOTOLUMINISCENTES | 20 / 50 / 100 g | $275 / $630 / $1 100 |
+| `EG 01-02` | EPOXY-GRANO | 1 a 20 kg / 22.7 a 24.3 kg | $65 / $55 por kg |
+| `EGC 01-02` | EPOXY-GRANO (combinación) | 1 a 20 kg / 22.7 a 24.3 kg | $90 / $70 por kg |
+| `EMI 01-02` | EPOXY-MICA | 1 kg / ½ kg | $470 / $830 |
+| `EMC 01-02` | EPOXY-MICA (combinado) | 1 kg / ½ kg | $495 / $855 |
+| `JNE 01` | JALADOR NIVELADOR EPÓXICO | 1 Pz | $1 590 |
+| `M 01` | MEZCLADOR | 1 Pz | $190 |
+| `CD 01` | COPA DIAMANTE PARA DESBASTE 7" | 1 Pz | $1 915 |
+| `BD 01` | BÁSCULA DIGITAL CAPACIDAD 5kg | 1 Pz | $250 |
+| `EPA 01` | EPO-PAINT (A y B) | — | sin presentación ni precio |
+| `AS 01` | ARENA SILICA | — | sin presentación ni precio |
+
+`EPA 01` y `AS 01` no traen presentación ni precio en **ninguna** de las dos fuentes, así que la
+app no puede cotizarlas (aparecen con el aviso «sin presentación capturada»); el resto se cotiza
+con su precio anterior pero el margen sale «desconocido» hasta que tengan costo.
+
+Dos renglones de la lista no corresponden a ningún bulto del catálogo y la migración los reporta
+como «sin destino»: `Epo Deep 7 KG` (tramo 4.3 – 7.099 kg) y `Epo Deep ULTRA 13 KG`
+(6.7 – 13.299 kg). El bote de 7.1 kg y el de 13.3 kg caen en el tramo siguiente de la lista
+(7.1 – 16.999 y 13.3 – 23.999), que es el que se aplica.
+
+Los consumos marcados «Criterio NEMET» son valores de arranque; ajústalos en `Cat_Productos`
+cuando el manual NEMET los especifique.

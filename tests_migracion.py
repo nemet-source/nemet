@@ -419,6 +419,59 @@ class TestCotizadorPorFamilia(unittest.TestCase):
             self.assertIsNotNone(cc.elegir_opcion_mas_economica(opciones), familia)
 
 
+class TestConciliacionConElArchivoSubido(unittest.TestCase):
+    """El Inventario guardado refleja, renglón por renglón, el archivo que subió NEMET.
+
+    La lista del proveedor se toma **tal cual**: cada renglón aporta su costo y su precio
+    por kg/L del tramo, y el precio de venta se obtiene multiplicando por el tamaño de la
+    presentación (decisión del 31-oct-2026: «son $/kg del tramo»). Las 17 fichas que ese
+    archivo no trae se conservan con su precio anterior hasta que llegue la lista nueva.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.inventario = leer_inventario()
+        cls.filas = mp.leer_plantilla(PLANTILLA)
+        cls.migrado, cls.informe = mp.migrar_inventario(cls.inventario, cls.filas)
+
+    def test_25_cada_renglon_aplicado_esta_guardado_con_su_mismo_precio_y_costo(self):
+        guardado = self.inventario.set_index("SKU")
+        aplicados = {fila["sku"]: fila for fila in self.informe["filas"]}
+        self.assertEqual(len(aplicados), 71, "71 presentaciones vienen de la lista del proveedor")
+        for sku, fila in aplicados.items():
+            self.assertAlmostEqual(float(guardado.at[sku, "PrecioPublicoIVA"]), fila["precio"],
+                                   places=2, msg=f"{sku}: precio distinto al del archivo subido")
+            self.assertAlmostEqual(float(guardado.at[sku, "PrecioCompra"]), fila["costo"],
+                                   places=2, msg=f"{sku}: costo distinto al del archivo subido")
+            # El precio sale de multiplicar el tramo por el tamaño de la presentación…
+            self.assertIn("·", fila["origen"])
+            self.assertGreater(fila["precio"], fila["costo"])
+
+    def test_26_las_fichas_que_el_archivo_no_trae_se_conservan_intactas(self):
+        aplicados = {fila["sku"] for fila in self.informe["filas"]}
+        pendientes = {str(sku).strip() for sku in self.inventario["SKU"] if str(sku).strip() not in aplicados}
+        self.assertEqual(pendientes, {
+            "PF 01", "PF 02", "PF 03", "EG 01", "EG 02", "EGC 01", "EGC 02",
+            "EMI 01", "EMI 02", "EMC 01", "EMC 02", "EPA 01", "AS 01",
+            "JNE 01", "M 01", "CD 01", "BD 01",
+        })
+        # Se conservan con su precio anterior: no se borran ni se ponen en cero.
+        guardado = self.inventario.set_index("SKU")
+        esperados = {"PF 01": 275.0, "EG 01": 65.0, "EMI 01": 470.0, "M 01": 190.0,
+                     "CD 01": 1915.0, "BD 01": 250.0, "JNE 01": 1590.0}
+        for sku, precio in esperados.items():
+            self.assertAlmostEqual(float(guardado.at[sku, "PrecioPublicoIVA"]), precio, places=2, msg=sku)
+
+    def test_27_solo_quedan_sin_destino_los_tramos_que_no_corresponden_a_ningun_bulto(self):
+        """`Epo Deep 7 KG` (4.3-7.099) y `Epo Deep ULTRA 13 KG` (6.7-13.299) no aplican:
+        el bote de 7.1 kg y el de 13.3 kg caen en el tramo siguiente de la lista."""
+        self.assertEqual(len(self.informe["plantilla_sin_usar"]), 2)
+        for texto in self.informe["plantilla_sin_usar"]:
+            self.assertIn("·", texto)
+        self.assertTrue(any("Epo Deep 7 KG" in t for t in self.informe["plantilla_sin_usar"]))
+        self.assertTrue(any("Epo Deep ULTRA 13 KG" in t for t in self.informe["plantilla_sin_usar"]))
+
+
 class TestHojaCotizadorDelExcel(unittest.TestCase):
     """La hoja `Cotizador_Rendimientos` del libro tiene que abarcar todo `Cat_Productos`."""
 
