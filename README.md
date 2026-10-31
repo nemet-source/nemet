@@ -10,7 +10,7 @@ las cuentas y el acceso.
 | Menú | Descripción | Roles con acceso |
 |---|---|---|
 | 📊 Dashboard & Resumen | Métricas generales (SKUs, clientes, valor del inventario, SKUs por reabastecer). | Admin · Editor · Usuario |
-| 📦 Control de Inventario y Edición | Edición directa de la hoja `Inventario`. `StockActual`, `AlertaStock`, `PrecioBaseSinIVA`, `IVA 16%` y `ValorInventario` se calculan automáticamente al guardar, y **cualquier producto sin `SKU` recibe uno automáticamente** (ver *SKUs automáticos*). | Admin · Editor |
+| 📦 Control de Inventario y Edición | Edición directa de la hoja `Inventario` (88 fichas, con `PrecioCompra` del proveedor y `Línea` de producto). `StockActual`, `AlertaStock`, `PrecioBaseSinIVA`, `IVA 16%` y `ValorInventario` se calculan automáticamente al guardar, y **cualquier producto sin `SKU` recibe uno automáticamente** (ver *SKUs automáticos*). | Admin · Editor |
 | 👥 Gestión de Clientes | Alta/edición de clientes en la hoja `Clientes`. | Admin · Editor |
 | 🎯 Prospección Comercial | **NEMET PROSPECTOR:** búsqueda OSM con respaldo DENUE (INEGI), mapa, puntuación explicable, borrador de WhatsApp y agenda comercial en la hoja `Prospectos`; también admite CSV. | Admin · Editor |
 | 📏 Cotizador por Área y Milimétrico | Calcula el material necesario —resinas por espesor (`m² × mm × rendimiento`) y **pigmentos por dosificación** (`m² × Dosis_g_m2`), ambas de `Cat_Productos`, con la proporción A:B— y recomienda la presentación más económica. | Admin · Editor · Usuario |
@@ -68,6 +68,39 @@ Esto cubre el incidente del 31-oct-2026: se subió al repositorio una plantilla 
 (`respaldos/Sistema_Inventario_2026-10-31_sin_SKU.xlsx`) con la columna `SKU` vacía y la app
 mostraba *NONE* en todo el inventario. El detalle y la lista de datos que se recuperaron están
 en `skus_automaticos.md`.
+
+### Precios, márgenes y la plantilla del proveedor (`migracion_plantilla.py`)
+
+La plantilla del proveedor no usa el formato de la app: trae el nombre del producto reescrito
+(`Epoxy pisos 5K`), el **precio por kg/L en tramos** (`0 - 5.999 KG`, `+ 20 kg`) y una columna
+`Línea` corrida. `herramientas/migrar_plantilla.py` la convierte de forma reproducible:
+
+```bash
+python herramientas/migrar_plantilla.py --revisar   # reporte de cambios, sin escribir
+python herramientas/migrar_plantilla.py             # actualiza Inventario, Cat_Productos y Escalas
+```
+
+| Qué hace | Ejemplo |
+|---|---|
+| Amarra cada renglón al nombre de `Cat_Productos` | `Epoxy pisos 5K` → `EPOXY PISOS (A Y B) TRANSPARENTE` |
+| Lee los precios como **$/kg del tramo** y multiplica por el bulto | 1.5 kg × $480/kg = **$720**; 19 L × $440/L = **$8 360** |
+| Llena `PrecioCompra` con el costo del mismo tramo | `EPT 06` cuesta $6 029 y se vende en $8 000 (24.6 %) |
+| Recalcula `Línea` por familia | Cáscara de Naranja y Estuco Veneciano → **Acabado**, no *Herramienta* |
+| Conserva los SKU históricos y solo genera los faltantes | 88 códigos, ninguno repetido |
+| Ajusta los rangos de la hoja `Cotizador_Rendimientos` | las fórmulas abarcan las 57 filas del catálogo |
+
+También cierra los huecos del catálogo: `Cat_Productos` gana las 13 familias que no tenían
+`Rendimiento` ni `Dosis_g_m2` (hojuela, grano, mica, cuarzo, cáscara, estuco, grano wall, veins,
+arena sílica, EPO-PAINT) y `Escalas_Precios_KG` las escalas del proveedor que solo vivían en la
+plantilla (poliuretano, estuco y grano wall). Los consumos sin respaldo del manual quedan
+marcados «Criterio NEMET … ajustable» en `Fuente_Dosis`.
+
+El inventario conserva **88 fichas** aunque la lista del proveedor traiga 70 renglones: las 17
+fichas que la lista nueva todavía no cubre (fotoluminiscentes, grano, mica, jalador nivelador,
+mezclador, copa diamante, báscula) se quedan con su precio anterior hasta que se agreguen, y
+`EPA 01` / `AS 01` siguen sin presentación ni precio en ninguna fuente. La conciliación renglón
+por renglón contra el archivo subido se prueba en `tests_migracion.py`; el detalle —con la tabla
+de precios convertidos y la lista de pendientes— está en `skus_automaticos.md` §7.
 
 ## 🎯 NEMET PROSPECTOR
 
@@ -179,6 +212,7 @@ repositorio público, cambiarlo a privado no borra el acceso histórico a copias
 |---|---|
 | No aparece **🎯 Prospección Comercial** | Comprueba que el cambio esté incorporado en la **rama que despliega Streamlit** y que ese despliegue terminó sin errores. Si se usa `main`, fusiona primero el PR de la funcionalidad. El rol **Usuario** no ve el CRM; accede como Admin/Editor. |
 | Solo aparece el login o falta administrador | Configura `[auth]` en los **Secrets privados** del despliegue. Nunca compartas contraseñas o tokens en un issue, chat o commit. |
+| El menú desplegable (línea de producto, cliente…) no se mueve con la rueda del mouse | Corregido en `tema_nemet.py`: la regla de `[role="listbox"]` traía `overflow: hidden`, así que la lista se recortaba y solo se recorría con el teclado. Ahora scrollea, se limita a la mitad del alto de la ventana y contiene el scroll para no arrastrar la página. Se prueba en `tests_bateria.py` (`TestHojaDeEstilo`). |
 | Al pulsar **Entrar** sale un cuadro rojo `sqlite3.OperationalError` y nadie puede pasar | La app **ya no se queda ahí**: repara sola el esquema (columnas que falten), el ingreso nunca depende de la bitácora y, si `nemet_usuarios.db` no admite escritura, avisa en pantalla y sigue con una **copia temporal** para que puedas entrar. El **motivo exacto** aparece ahora dentro de la app (Streamlit censura el mensaje del traceback) y con más detalle en *Manage app* → *Logs*. Si el aviso persiste, corrige permisos del despliegue o define `[auth] db` con una ruta escribible. |
 | La búsqueda devuelve error o no encuentra negocios | **No es necesariamente el radio**: la app prueba varios servidores públicos de Overpass y, si fallan o no hay fichas, usa DENUE (INEGI) cuando está configurado. DENUE necesita el token privado `[inegi].denue_token` y su API permite hasta 5 km por consulta; si aún no tienes token, solicita uno en <https://www.inegi.org.mx/servicios/api_denue.html> y agrégalo a Secrets. Revisa **🔎 Qué contestó cada fuente** para distinguir fallos y pulsa **Reintentar**. Si ambos servicios están caídos, importa un CSV de negocios públicos o **Agrega manualmente**. Ninguna ficha se inventa cuando falla una fuente. |
 | Guarda, pero desaparece tras reiniciar | El archivo `Prospectos` se crea en el Excel **del servidor**, no en el teléfono; el disco de Streamlit Cloud es efímero. Exporta CSV regularmente y configura respaldo **solo en un repositorio privado verificable**, con la misma rama/historial. |
@@ -340,18 +374,21 @@ cp .streamlit/secrets.toml.ejemplo .streamlit/secrets.toml   # y captura [auth] 
 streamlit run app.py
 
 # Baterías de pruebas
-python tests_bateria.py        #  29/29  identidad de marca (assets, tema)
+python tests_bateria.py        #  31/31  identidad de marca (assets, tema y hoja de estilo)
 python tests_autenticacion.py  #  55/55  hashes, roles, sesiones, bases dañadas o de solo lectura, asistente CLI
 python tests_prospeccion.py    #  41/41  giros, Google Maps, CSV, alta manual y privacidad (sin red)
 python tests_flujo_app.py      #  18/18  acceso + CRM y alta manual (AppTest, copia temporal)
 python tests_cotizador.py      #  20/20  dosificación de pigmentos vs. rendimiento por espesor (sin Streamlit)
-python tests_cotizador_app.py  #    9/9  el cotizador por área manejado como lo hace una persona (AppTest)
-python tests_sku.py            #  18/18  prefijos, consecutivos y relleno de SKUs faltantes (sin Streamlit)
-python tests_sku_app.py        #    4/4  el alta automática de SKUs en la interfaz (AppTest)
+python tests_cotizador_app.py  #  11/11  el cotizador por área manejado como lo hace una persona (AppTest)
+python tests_sku.py            #  21/21  prefijos, consecutivos y relleno de SKUs faltantes (sin Streamlit)
+python tests_sku_app.py        #    7/7  el alta automática de SKUs en la interfaz (AppTest)
+python tests_migracion.py      #  27/27  plantilla migrada: nombres, precios, costos, línea y conciliación
 ```
 
 > El cotizador se apoya en `cotizador_calculo.py` (lógica pura, sin Streamlit) para que la
 > misma aritmética se pruebe sola y en la interfaz. Ver `correccion_pigmentos_cotizador.md`.
+> La migración de la plantilla del proveedor vive en `migracion_plantilla.py` y se aplica con
+> `herramientas/migrar_plantilla.py`; sus pruebas son `tests_migracion.py`.
 
 Sin `[auth]` en los Secrets la app arranca, pero muestra la pantalla de acceso y avisa que no hay
 administrador configurado: nadie puede entrar hasta definir `admin_usuario` y `admin_password`.

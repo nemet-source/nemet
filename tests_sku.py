@@ -9,7 +9,9 @@ que un producto nuevo reciba un código coherente con su familia:
 * numeración de la presentación más chica a la más grande, con unidades reales
   (20 ml antes que 1 L, 200 g antes que 1 kg);
 * los SKUs ya capturados **nunca** se tocan ni se reenumeran;
-* las filas vacías de la hoja se quedan vacías.
+* las filas vacías de la hoja se quedan vacías;
+* la plantilla del proveedor —con los nombres reescritos («Epoxy pisos 5K»)— produce los
+  mismos códigos que el catálogo histórico, para que la migración no invente prefijos.
 
 Uso:  python tests_sku.py     →  "N/N OK" si todo pasa.
 """
@@ -180,6 +182,44 @@ class TestAsignacion(unittest.TestCase):
                            "Presentacion": ["1 kg", "1/2 kg"],
                            "SKU": ["EMI 01", "EMI 01"]})
         self.assertEqual(sk.skus_duplicados(df), ["EMI 01"])
+
+
+class TestPlantillaMigrada(unittest.TestCase):
+    """Caso del 31-oct-2026: la plantilla reescrita debe caer en los SKUs de siempre."""
+
+    @classmethod
+    def setUpClass(cls):
+        import migracion_plantilla as mp     # import local: no depende de pandas al cargar
+        cls.mp = mp
+        cls.plantilla = mp.leer_plantilla(os.path.join(BASE, "respaldos",
+                                                       "Sistema_Inventario_2026-10-31_sin_SKU.xlsx"))
+        cls.inventario = leer_inventario()
+
+    def test_la_plantilla_reproduce_el_prefijo_de_cada_familia(self):
+        """Ningún renglón de la plantilla estrena prefijo: todos heredan el histórico."""
+        prefijos = {f.prefijo for f in self.mp.FAMILIAS}
+        for fila in self.plantilla:
+            prefijo = sk.prefijo_de_sku(fila["prefijo"] + " 01")
+            self.assertIn(prefijo, prefijos, f"{fila['producto']}: prefijo {prefijo}")
+            self.assertEqual(prefijo, sk.prefijo_para(fila["producto"]), fila["producto"])
+
+    def test_el_inventario_migrado_se_recodifica_con_los_mismos_skus(self):
+        """Si se borraran los SKU, `sku_nemet` devolvería el mismo juego por familia."""
+        df = self.inventario.copy()
+        historicos = list(df["SKU"])
+        df["SKU"] = ""
+        resultado, asignados = sk.asignar_skus_faltantes(df, "Descripcion", "Presentacion", "SKU")
+        self.assertEqual(len(asignados), len(df))
+        self.assertEqual(sk.skus_duplicados(resultado), [])
+        self.assertEqual(sorted(resultado["SKU"]), sorted(historicos))
+
+    def test_los_skus_de_la_plantilla_no_se_repiten_entre_familias(self):
+        por_familia = {}
+        for fila in self.plantilla:
+            por_familia.setdefault(fila["prefijo"], set()).add(fila["clave"])
+        # Sólo dos prefijos agrupan dos familias con nombre propio (combinaciones).
+        for prefijo, claves in por_familia.items():
+            self.assertEqual(len(claves), 1, f"{prefijo} agrupa {sorted(claves)}")
 
 
 if __name__ == "__main__":

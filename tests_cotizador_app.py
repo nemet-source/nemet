@@ -6,13 +6,17 @@ una persona: elegir la línea de producto, capturar el área y agregar el rengl�
 Así se comprueba lo mismo que ve el usuario, no solo la aritmética:
 
 * Las **pastas** y **tintas** se dosifican en g/m² (espesor deshabilitado): 16 m² de pasta
-  son 160 g (dos bolsas de 100 g = $224) y la tinta cabe en 1 L ($550). Antes el sistema
+  son 160 g (dos bolsas de 100 g = $240 con la lista migrada) y la tinta cabe en 1 L
+  ($550). Antes el sistema
   cotizaba 16 kg y 16 L ($22,240).
 * Las **resinas** siguen por espesor: PRIMER 5.33 kg y PISOS 19.2 kg (una cubeta de 20 kg).
+* Las familias que estaban fuera de `Cat_Productos` ya cotizan con su consumo: la
+  **cáscara de naranja** a 100 g/m² (1 600 g para 16 m²) y el **estuco veneciano** a
+  1 kg/m²·mm (16 kg = 4 cubetas de 4 L), sin caer al rendimiento por defecto.
 * Las medidas inician en cero; con área cero o espesor cero para resinas no aparece una cotización.
 
 Corre sobre una **copia temporal** del proyecto (Excel y base de usuarios propios), así que
-nunca toca los datos reales.  Uso:  python tests_cotizador_app.py  →  "9/9 OK".
+nunca toca los datos reales.  Uso:  python tests_cotizador_app.py  →  "11/11 OK".
 """
 import os
 import shutil
@@ -40,6 +44,8 @@ PASTA = "EPOXY PASTA COLORES SÓLIDOS"
 TINTA = "EPOXY TINTA TRASLÚCIDOS LÍQUIDOS"
 PISOS = "EPOXY PISOS (A Y B) TRANSPARENTE"
 PRIMER = "EPOXY PRIMER (A Y B) TRANSPARENTE"
+CASCARA = "CÁSCARA DE NARANJA"
+ESTUCO = "ESTUCO VENECIANO"
 AREA_LADO = 4.0     # 4 m × 4 m = 16 m²
 
 
@@ -157,7 +163,7 @@ class TestCotizadorPorArea(unittest.TestCase):
         self.assertTrue(all(b.disabled for b in self.at.button if b.key is None and "Kilo Exacto" in b.label),
                         "los pigmentos no se cotizan a granel por kg")
 
-    def test_03_la_pasta_entra_al_carrito_con_224_pesos_y_sin_mm(self):
+    def test_03_la_pasta_entra_al_carrito_con_240_pesos_y_sin_mm(self):
         self.at.button(key="add_cubeta").click()
         self.at.run()
         carrito = self.at.session_state["carrito_area"]
@@ -165,7 +171,7 @@ class TestCotizadorPorArea(unittest.TestCase):
         fila = carrito.iloc[0]
         self.assertEqual(fila["SKU"], "EP 02")           # bolsa de 100 g
         self.assertEqual(int(fila["Cantidad"]), 2)
-        self.assertEqual(float(fila["Subtotal"]), 224.0)
+        self.assertEqual(float(fila["Subtotal"]), 240.0)   # 2 × $120 (plantilla migrada)
         self.assertEqual(float(fila["Espesor_mm"]), 0.0)
         self.assertEqual(float(fila["Kg_Necesarios"]), 0.16)
         self.assertIn("10 g/m²", fila["Detalle"])
@@ -189,7 +195,7 @@ class TestCotizadorPorArea(unittest.TestCase):
         pigmentos = carrito[carrito["Descripcion"].isin([PASTA, TINTA])]
         self.assertEqual(len(pigmentos), 2)
         subtotal = float(pigmentos["Subtotal"].sum())
-        self.assertAlmostEqual(subtotal, 224.0 + 550.0, places=2)
+        self.assertAlmostEqual(subtotal, 240.0 + 550.0, places=2)
         self.assertLess(subtotal, 1000.0,
                         "con el error anterior estos dos renglones costaban $22,240")
 
@@ -207,6 +213,23 @@ class TestCotizadorPorArea(unittest.TestCase):
         self.assertIn("5.33 kg", info)
         self.assertIn("0.3333", info)
 
+    def test_09_la_cascara_de_naranja_se_dosifica_con_su_dosis_del_catalogo(self):
+        self.ir_al_cotizador()
+        self.cotizar(CASCARA)
+        info = self.texto_infos()
+        self.assertIn("100 g/m²", info)
+        self.assertIn("1,600 g", info)
+        self.assertTrue(self.at.number_input(key="area_espesor").disabled,
+                        "la cáscara se dosifica por área: el espesor no aplica")
+        self.assertEqual(self.widget_dosis().value, 100.0)
+
+    def test_10_el_estuco_veneciano_ya_tiene_rendimiento_propio(self):
+        self.cotizar(ESTUCO, ancho=4.0, largo=4.0, espesor=1.0)
+        info = self.texto_infos()
+        self.assertIn("1 kg/m² por mm", info)      # ya no cae al rendimiento por defecto (1.2)
+        self.assertIn("16.00 kg", info)
+        self.assertIn("4 L × 4", [m.value for m in self.at.metric])
+
     def test_08_resinas_sin_espesor_no_muestran_cotizacion(self):
         self.ir_al_cotizador()
         self.cotizar(PISOS, ancho=4.0, largo=4.0)
@@ -220,8 +243,8 @@ class TestCotizadorPorArea(unittest.TestCase):
 if __name__ == "__main__":
     resultado = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__]))
     n = resultado.testsRun
-    if resultado.wasSuccessful() and n == 9:
+    if resultado.wasSuccessful() and n == 11:
         print(f"\n{n}/{n} OK — cotizador por área verificado en la interfaz")
         sys.exit(0)
-    print(f"\n{n - len(resultado.failures) - len(resultado.errors)}/{n} (esperadas 9/9)")
+    print(f"\n{n - len(resultado.failures) - len(resultado.errors)}/{n} (esperadas 11/11)")
     sys.exit(1)

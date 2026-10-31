@@ -9,6 +9,11 @@ todas las filas. Con `sku_nemet` la app debe:
 2. avisar cuántos generó y ofrecer el botón para fijarlos en el Excel;
 3. dejar el Excel con un SKU único por producto al pulsar ese botón.
 
+La segunda batería (`TestInventarioMigradoEnLaApp`) revisa el otro extremo: el libro **ya
+migrado** (plantilla del proveedor convertida a nombres de `Cat_Productos`, precios por
+presentación y `PrecioCompra`) entra a la app sin generar un solo SKU y sin renglones
+vacíos, repetidos ni sin línea de producto.
+
 Se ejecuta sobre una copia temporal: nunca toca el Excel ni la base de usuarios reales.
 
 Uso:  python tests_sku_app.py     →  "N/N OK" si todo pasa.
@@ -137,6 +142,69 @@ class TestSkuAutomaticoEnLaApp(unittest.TestCase):
                  if str(d).strip() == "EPOXY PISOS (A Y B) TRANSPARENTE"]
         self.assertEqual(pisos[:2], ["EPT 01", "EPT 02"])
         self.assertEqual(self.at.session_state["inv_skus_generados"], [])
+
+
+@unittest.skipIf(AppTest is None, "Streamlit no está instalado")
+class TestInventarioMigradoEnLaApp(unittest.TestCase):
+    """El libro migrado (31-oct-2026) se abre completo y sin SKUs que generar."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.app_dir = os.path.join(cls.tmp.name, "nemet")
+        os.makedirs(os.path.join(cls.app_dir, "assets"), exist_ok=True)
+        for nombre in ("app.py", "auth_nemet.py", "prospeccion.py", "cotizador_calculo.py",
+                       "sku_nemet.py", "tema_nemet.py", EXCEL_NOMBRE):
+            shutil.copy(os.path.join(BASE, nombre), os.path.join(cls.app_dir, nombre))
+        for nombre in os.listdir(os.path.join(BASE, "assets")):
+            shutil.copy(os.path.join(BASE, "assets", nombre), os.path.join(cls.app_dir, "assets", nombre))
+        cls.ruta_excel = os.path.join(cls.app_dir, EXCEL_NOMBRE)
+
+        os.environ["NEMET_DB_USUARIOS"] = os.path.join(cls.tmp.name, "usuarios.db")
+        os.environ["NEMET_ADMIN_USUARIO"] = "jefe"
+        os.environ["NEMET_ADMIN_PASSWORD"] = PASSWORD_SEMILLA
+        os.environ["NEMET_ADMIN_NOMBRE"] = "Jefe de Planta"
+
+        conn = auth.conectar(os.environ["NEMET_DB_USUARIOS"])
+        auth.inicializar_db(conn)
+        auth.sembrar_admin_inicial(conn, "jefe", PASSWORD_SEMILLA, nombre="Jefe de Planta")
+        admin = auth.obtener_por_login(conn, "jefe")
+        auth.cambiar_password_propia(conn, admin["id"], PASSWORD_SEMILLA, PASSWORD_ADMIN)
+        conn.close()
+
+        cls.at = AppTest.from_file(os.path.join(cls.app_dir, "app.py"), default_timeout=120)
+        cls.at.run()
+        cls.at.text_input(key="acceso_usuario").set_value("jefe")
+        cls.at.text_input(key="acceso_password").set_value(PASSWORD_ADMIN)
+        cls.at.button(key="acceso_entrar").click()
+        cls.at.run()
+
+    @classmethod
+    def tearDownClass(cls):
+        for variable in ("NEMET_DB_USUARIOS", "NEMET_ADMIN_USUARIO", "NEMET_ADMIN_PASSWORD",
+                         "NEMET_ADMIN_NOMBRE"):
+            os.environ.pop(variable, None)
+        cls.tmp.cleanup()
+
+    def test_01_carga_las_88_fichas_sin_generar_codigos(self):
+        self.assertFalse(self.at.exception, [e.value for e in self.at.exception])
+        inventario = self.at.session_state["inventario"]
+        self.assertEqual(len(inventario), 88)
+        self.assertEqual(self.at.session_state["inv_skus_generados"], [],
+                         "el libro migrado ya trae todos los SKU")
+        self.assertEqual(sk.skus_duplicados(inventario), [])
+
+    def test_02_la_migracion_dejo_el_costo_de_compra(self):
+        inventario = self.at.session_state["inventario"]
+        con_costo = pd.to_numeric(inventario["PrecioCompra"], errors="coerce").fillna(0) > 0
+        self.assertGreaterEqual(int(con_costo.sum()), 70,
+                                "casi todos los SKU deben traer el costo del proveedor")
+
+    def test_03_cada_ficha_tiene_su_linea_de_producto(self):
+        inventario = self.at.session_state["inventario"]
+        self.assertIn("Línea", inventario.columns)
+        self.assertTrue(all(str(l).strip() for l in inventario["Línea"]))
+        self.assertEqual(set(inventario["Línea"]), {"Resina", "Acabado", "Complemento", "Herramienta"})
 
 
 if __name__ == "__main__":

@@ -550,13 +550,31 @@ button:focus-visible, input:focus-visible {
   background: transparent !important; border: none !important; outline: none !important;
   font-family: var(--nm-font) !important; font-weight: 600 !important; color: var(--nm-ink) !important;
 }
+/* Desplegables (selectbox, multiselect): la lista debe poder recorrerse con la rueda
+   del mouse. Antes esta regla traía `overflow: hidden`, así que la lista se recortaba y
+   solo se podía navegar con las flechas del teclado: con 36 líneas de producto nadie
+   encontraba las últimas. Ahora scrollea, se limita al 50% del alto de la ventana y
+   contiene el scroll para que la rueda no arrastre la página al llegar al final. */
 [role="listbox"] {
   border-radius: var(--nm-r) !important;
   border: 1px solid var(--nm-line) !important;
   box-shadow: var(--nm-shadow-lg) !important;
-  overflow: hidden !important;
   background: var(--nm-card) !important;
+  overflow-y: auto !important;
+  overflow-x: hidden !important;
+  max-height: min(50vh, 26rem) !important;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(180, 85, 45, .55) rgba(38, 35, 31, .06);
 }
+[role="listbox"]::-webkit-scrollbar { width: 10px; }
+[role="listbox"]::-webkit-scrollbar-track { background: rgba(38, 35, 31, .06); border-radius: var(--nm-r-pill); }
+[role="listbox"]::-webkit-scrollbar-thumb {
+  background: rgba(180, 85, 45, .5);
+  border: 2px solid transparent; background-clip: content-box;
+  border-radius: var(--nm-r-pill);
+}
+[role="listbox"]::-webkit-scrollbar-thumb:hover { background: rgba(154, 69, 38, .75); background-clip: content-box; }
 [role="option"] { border-radius: 8px !important; margin: 2px 6px !important; font-weight: 500 !important; }
 [role="option"][aria-selected="true"],
 [role="option"][data-selected="true"] {

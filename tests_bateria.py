@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Batería de pruebas del sistema de marca NEMET (29 pruebas).
+"""Batería de pruebas del sistema de marca NEMET (30 pruebas).
 
 Cubre la herramienta de procesado (herramientas/procesar_logo.py), los 3 assets
-generados, la integración de marca en app.py y la configuración del repo.
+generados, la integración de marca en app.py, la hoja de estilo del tema (incluido el
+scroll de los desplegables) y la configuración del repo.
 
 Uso:  python tests_bateria.py     →  "24/24 OK" si todo pasa.
 """
@@ -342,11 +343,73 @@ class TestConfig(unittest.TestCase):
         self.assertIn("herramientas/procesar_logo.py", readme)
 
 
+# ============================================================ hoja de estilo del tema
+def bloques_css(selectores):
+    """Declaraciones de las reglas de `tema_nemet.CSS` cuyo selector contiene alguno de esos textos.
+
+    Se lee el archivo como texto (sin importar Streamlit) para poder revisar la hoja tal
+    como llega al navegador; los `@media` anidados se recorren igual porque se buscan las
+    llaves por su contenido.
+    """
+    with open(os.path.join(BASE, "tema_nemet.py"), encoding="utf-8") as fh:
+        fuente = fh.read()
+    inicio = fuente.index('CSS = """') + len('CSS = """')
+    css = fuente[inicio:fuente.index('"""', inicio)]
+    encontrados = []
+    for regla in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
+        selector, cuerpo = regla.group(1).strip(), regla.group(2)
+        if any(texto in selector for texto in selectores):
+            encontrados.append((selector, cuerpo))
+    return encontrados
+
+
+class TestHojaDeEstilo(unittest.TestCase):
+    """La hoja de estilo no puede romper la interacción (scroll, foco, clics)."""
+
+    def test_30_los_desplegables_se_pueden_recorrer_con_la_rueda(self):
+        """Regresión: `overflow: hidden` en [role="listbox"] dejaba la lista sin scroll.
+
+        Con 36 líneas de producto en el cotizador, la lista se recortaba y solo se podía
+        navegar con el teclado; la rueda del mouse no movía nada.
+        """
+        reglas = bloques_css(['[role="listbox"]'])
+        self.assertTrue(reglas, "falta la regla de [role=listbox] en tema_nemet.CSS")
+        declaraciones = [
+            (selector, cuerpo) for selector, cuerpo in reglas
+            if "::-webkit-scrollbar" not in selector   # los pseudo-elementos no scrollean
+        ]
+        self.assertTrue(declaraciones)
+        for selector, cuerpo in declaraciones:
+            self.assertNotRegex(
+                cuerpo, r"(?<![-\w])overflow\s*:\s*hidden",
+                f"{selector}: `overflow: hidden` recorta la lista; usa `overflow-y: auto`")
+            self.assertRegex(cuerpo, r"overflow-y\s*:\s*auto",
+                             f"{selector}: la lista debe declarar `overflow-y: auto`")
+            self.assertRegex(cuerpo, r"max-height\s*:", f"{selector}: falta limitar el alto")
+            self.assertRegex(cuerpo, r"overscroll-behavior\s*:\s*contain",
+                             f"{selector}: la rueda no debe arrastrar la página al llegar al final")
+
+    def test_31_la_rueda_no_se_bloquea_en_ninguna_regla(self):
+        """Ninguna regla del tema puede secuestrar el scroll vertical de la app."""
+        with open(os.path.join(BASE, "tema_nemet.py"), encoding="utf-8") as fh:
+            fuente = fh.read()
+        inicio = fuente.index('CSS = """') + len('CSS = """')
+        css = fuente[inicio:fuente.index('"""', inicio)]
+        for regla in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
+            selector, cuerpo = regla.group(1).strip(), regla.group(2)
+            if "::-webkit-scrollbar" in selector:
+                continue
+            self.assertNotRegex(cuerpo, r"(?<![-\w])overflow\s*:\s*hidden\s*!important",
+                                f"{selector}: `overflow: hidden !important` bloquea el scroll")
+            self.assertNotIn("pointer-events: none", cuerpo.replace(" ", ""),
+                             f"{selector}: `pointer-events: none` bloquea rueda y clics")
+
+
 if __name__ == "__main__":
     resultado = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__]))
     n = resultado.testsRun
-    if resultado.wasSuccessful() and n == 29:
+    if resultado.wasSuccessful() and n == 31:
         print(f"\n{ n }/{n} OK — sistema de marca NEMET verificado")
         sys.exit(0)
-    print(f"\n{ n - len(resultado.failures) - len(resultado.errors) }/{n} (esperadas 29/29)")
+    print(f"\n{ n - len(resultado.failures) - len(resultado.errors) }/{n} (esperadas 31/31)")
     sys.exit(1)

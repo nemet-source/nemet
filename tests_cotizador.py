@@ -96,10 +96,21 @@ class TestDatosCatalogo(unittest.TestCase):
                                f"{fila['Producto']}: la dosis debe ser mayor que cero")
 
     def test_02_las_dosis_son_de_pigmento_y_no_de_resina(self):
+        # Los agregados que se tiran al voleo (grano, cuarzo, arena sílica) consumen kilos
+        # por m², así que su dosis se mide en miles de g/m²; los pigmentos, en decenas.
+        agregados = ("GRANO", "CUARZO", "ARENA")
+        hojuelas = ("HOJUELA",)
         for _, fila in self.pigmentos.iterrows():
             dosis = float(fila["Dosis_g_m2"])
+            nombre = cc.normalizar_clave(fila["Producto"])
+            if any(clave in nombre for clave in agregados):
+                tope = 5000.0
+            elif any(clave in nombre for clave in hojuelas):
+                tope = 250.0
+            else:
+                tope = 100.0
             self.assertGreaterEqual(dosis, 1.0, f"{fila['Producto']}: dosis sospechosamente baja")
-            self.assertLessEqual(dosis, 100.0,
+            self.assertLessEqual(dosis, tope,
                                  f"{fila['Producto']}: {dosis} g/m² no es una dosis de pigmento; "
                                  "revisa que no se haya colado un rendimiento de resina (kg/m²)")
 
@@ -249,8 +260,8 @@ class TestCotizacion16m2(unittest.TestCase):
         self.assertAlmostEqual(pasta["gramos"], 160.0, places=6)
         mejor = self.cubetas(PASTA, pasta["kg_necesarios"])
         self.assertLessEqual(mejor["kg_cubiertos"], 0.3)                 # nunca 16 kg
-        self.assertLessEqual(mejor["precio"], 270.0)                     # ni la mitad de 1 kg ($840)
-        self.assertIn("100 g", [mejor["presentacion"]])                  # 2 × 100 g = $224
+        self.assertLessEqual(mejor["precio"], 270.0)                     # ni la mitad de 1 kg ($860)
+        self.assertIn("100 g", [mejor["presentacion"]])                  # 2 × 100 g = $240
 
     def test_17_la_tinta_se_cotiza_en_un_litro(self):
         tinta = self.material(TINTA_CATALOGO)
@@ -290,9 +301,10 @@ class TestCotizacion16m2(unittest.TestCase):
 
         # Lo que se cotizó con el error: 16 kg de pasta y 16 L de tinta.
         inflado = (min(opciones_primer) + min(opciones_pisos)
-                   + 16 * 840.0      # 16 × 1 kg de pasta
+                   + 16 * 860.0      # 16 × 1 kg de pasta (precio de la plantilla migrada)
                    + 16 * 550.0)     # 16 × 1 L de tinta
-        self.assertAlmostEqual(inflado - total, 22240.0 - 774.0, places=2)
+        # El total corregido son dos bolsas de 100 g ($240) y 1 L de tinta ($550).
+        self.assertAlmostEqual(inflado - total, 22560.0 - 790.0, places=2)
         self.assertGreaterEqual(inflado - total, 20000.0,
                                 "la corrección debe devolver más de $20,000 al cliente")
 
