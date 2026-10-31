@@ -10,7 +10,7 @@ las cuentas y el acceso.
 | Menú | Descripción | Roles con acceso |
 |---|---|---|
 | 📊 Dashboard & Resumen | Métricas generales (SKUs, clientes, valor del inventario, SKUs por reabastecer). | Admin · Editor · Usuario |
-| 📦 Control de Inventario y Edición | Edición directa de la hoja `Inventario`. `StockActual`, `AlertaStock`, `PrecioBaseSinIVA`, `IVA 16%` y `ValorInventario` se calculan automáticamente al guardar. | Admin · Editor |
+| 📦 Control de Inventario y Edición | Edición directa de la hoja `Inventario`. `StockActual`, `AlertaStock`, `PrecioBaseSinIVA`, `IVA 16%` y `ValorInventario` se calculan automáticamente al guardar, y **cualquier producto sin `SKU` recibe uno automáticamente** (ver *SKUs automáticos*). | Admin · Editor |
 | 👥 Gestión de Clientes | Alta/edición de clientes en la hoja `Clientes`. | Admin · Editor |
 | 🎯 Prospección Comercial | **NEMET PROSPECTOR:** búsqueda OSM con respaldo DENUE (INEGI), mapa, puntuación explicable, borrador de WhatsApp y agenda comercial en la hoja `Prospectos`; también admite CSV. | Admin · Editor |
 | 📏 Cotizador por Área y Milimétrico | Calcula el material necesario —resinas por espesor (`m² × mm × rendimiento`) y **pigmentos por dosificación** (`m² × Dosis_g_m2`), ambas de `Cat_Productos`, con la proporción A:B— y recomienda la presentación más económica. | Admin · Editor · Usuario |
@@ -42,6 +42,32 @@ la dosis de respaldo de su familia (pasta 10, metal 8, tinta 60 g/m²) avisando 
 los pigmentos no ofrecen «kilo exacto» a granel porque su venta es por presentación (g/L).
 La aritmética vive en `cotizador_calculo.py` y se prueba con `tests_cotizador.py` y
 `tests_cotizador_app.py`; el detalle del caso está en `correccion_pigmentos_cotizador.md`.
+
+### SKUs automáticos (`sku_nemet.py`)
+
+Todo renglón del inventario debe tener un código. El formato del catálogo es
+`PREFIJO NN` (`EPT 04`, `POLIU 02`, `CN 03`): un prefijo por familia y un consecutivo de dos
+dígitos por presentación, de la más chica a la más grande (con unidades reales: 20 ml antes
+que 1 L, 200 g antes que 1 kg).
+
+Al cargar la hoja `Inventario`, la app rellena en memoria cualquier `SKU` vacío —también los
+que llegan como `NONE`, `nan` o `-`— y avisa cuántos generó; con el botón
+**🔖 Guardar SKUs generados** quedan fijos en el Excel. Al guardar el inventario se aplica la
+misma regla, así que un renglón nuevo o un código borrado por accidente nunca deja el archivo
+sin SKU. Los códigos ya capturados **no se reescriben ni se reenumeran**.
+
+| Regla | Ejemplo |
+|---|---|
+| La familia conserva su prefijo histórico | `EPOXY PISOS (A Y B) TRANSPARENTE` → `EPT 01…06` |
+| Un nombre reescrito hereda el prefijo de su familia | `Epoxy pisos 5K` → `EPT` |
+| La presentación se numera por tamaño | `20 ml` → `ET 01`, `1 L` → `ET 06` |
+| Familia nueva: acrónimo de sus palabras | `SELLADOR POLIASPÁRTICO 5 L` → `SP 01` |
+| Filas de relleno vacías | se quedan sin SKU |
+
+Esto cubre el incidente del 31-oct-2026: se subió al repositorio una plantilla vieja del Excel
+(`respaldos/Sistema_Inventario_2026-10-31_sin_SKU.xlsx`) con la columna `SKU` vacía y la app
+mostraba *NONE* en todo el inventario. El detalle y la lista de datos que se recuperaron están
+en `skus_automaticos.md`.
 
 ## 🎯 NEMET PROSPECTOR
 
@@ -314,12 +340,14 @@ cp .streamlit/secrets.toml.ejemplo .streamlit/secrets.toml   # y captura [auth] 
 streamlit run app.py
 
 # Baterías de pruebas
-python tests_bateria.py        #  24/24  identidad de marca (assets, tema)
+python tests_bateria.py        #  29/29  identidad de marca (assets, tema)
 python tests_autenticacion.py  #  55/55  hashes, roles, sesiones, bases dañadas o de solo lectura, asistente CLI
-python tests_prospeccion.py    #  22/22 giros, Google Maps, CSV, alta manual y privacidad (sin red)
-python tests_flujo_app.py      #  17/17 acceso + CRM y alta manual (AppTest, copia temporal)
-python tests_cotizador.py      #  20/20 dosificación de pigmentos vs. rendimiento por espesor (sin Streamlit)
-python tests_cotizador_app.py  #    7/7 el cotizador por área manejado como lo hace una persona (AppTest)
+python tests_prospeccion.py    #  41/41  giros, Google Maps, CSV, alta manual y privacidad (sin red)
+python tests_flujo_app.py      #  18/18  acceso + CRM y alta manual (AppTest, copia temporal)
+python tests_cotizador.py      #  20/20  dosificación de pigmentos vs. rendimiento por espesor (sin Streamlit)
+python tests_cotizador_app.py  #    9/9  el cotizador por área manejado como lo hace una persona (AppTest)
+python tests_sku.py            #  18/18  prefijos, consecutivos y relleno de SKUs faltantes (sin Streamlit)
+python tests_sku_app.py        #    4/4  el alta automática de SKUs en la interfaz (AppTest)
 ```
 
 > El cotizador se apoya en `cotizador_calculo.py` (lógica pura, sin Streamlit) para que la

@@ -25,6 +25,7 @@ from fpdf.fonts import FontFace
 import auth_nemet as auth  # autenticación, roles y administración de usuarios (SQLite + scrypt)
 import cotizador_calculo as cocalc  # rendimiento por mm vs. dosificación g/m² de pigmentos
 import prospeccion as pros  # búsqueda pública, clasificación y deduplicación de prospectos
+import sku_nemet as skun  # SKUs: prefijo por familia y consecutivo por presentación
 import tema_nemet as tema  # sistema visual moderno: hoja de estilo y componentes de interfaz
 
 try:
@@ -483,6 +484,11 @@ def cargar_inventario():
         for col in ("SKU", "Descripcion", "Presentacion"):
             df[col] = df[col].fillna("").astype(str).str.strip()
 
+        # Ningún producto se queda sin código: si la hoja trae la columna SKU vacía (pasó
+        # al subir una plantilla vieja del Excel), se genera aquí y se avisa en pantalla.
+        df, skus_nuevos = skun.asignar_skus_faltantes(df, "Descripcion", "Presentacion", "SKU")
+        st.session_state["inv_skus_generados"] = skus_nuevos
+
         st.session_state["inv_base_hash"] = _hash_hoja(HOJA_INVENTARIO)
         return df.reset_index(drop=True)
     except Exception as e:
@@ -815,7 +821,13 @@ def guardar_inventario(df_editado, forzar=False):
         df_final = quitar_filas_vacias(df_editado, ["SKU", "Descripcion"])
         df_final = recalcular_columnas_derivadas(df_final)
         if "SKU" in df_final.columns:
-            df_final["SKU"] = df_final["SKU"].fillna("").astype(str).str.strip()
+            col_desc, col_sku, col_pres = columnas_inventario(df_final)
+            df_final[col_sku] = df_final[col_sku].fillna("").astype(str).str.strip()
+            # Si alguien borra un SKU en el editor (o agrega un renglón nuevo), se le asigna
+            # uno al guardar: el Excel nunca queda con la columna SKU vacía.
+            df_final, _ = skun.asignar_skus_faltantes(df_final, col_desc, col_pres, col_sku)
+            if col_sku != "SKU":
+                df_final = df_final.rename(columns={col_sku: "SKU"})
         escribir_hoja(df_final, HOJA_INVENTARIO, startrow=1, titulo=TITULO_INVENTARIO)
         st.session_state["inv_base_hash"] = _hash_hoja(HOJA_INVENTARIO)
 
@@ -2674,6 +2686,11 @@ if menu == "📊 Dashboard & Resumen":
         tema.kpi(f"{por_reabastecer:,}", "Por reabastecer", icono="🔔",
                  nota="SKU en o por debajo del mínimo", tono="barro")
 
+    if st.session_state.get("inv_skus_generados"):
+        st.info(f"🔖 {len(st.session_state['inv_skus_generados'])} productos del inventario no tenían SKU y "
+                "recibieron uno automáticamente. Entra a **📦 Control de Inventario y Edición** y pulsa "
+                "«Guardar SKUs generados» para dejarlos fijos en el Excel.")
+
     if "SKU" in df_inv.columns:
         duplicados = sorted(df_inv.loc[df_inv["SKU"].duplicated() & df_inv["SKU"].ne(""), "SKU"].unique())
         if duplicados:
@@ -2705,6 +2722,23 @@ elif menu == "📦 Control de Inventario y Edición":
         if respaldo:
             flash(respaldo[1], respaldo[0])
         st.rerun()
+
+    skus_pendientes = st.session_state.get("inv_skus_generados") or []
+    if skus_pendientes:
+        st.warning(f"🔖 Se generaron automáticamente **{len(skus_pendientes)} SKUs** para los productos "
+                   "que venían sin código (ya aparecen en la columna `SKU` del editor). "
+                   "Guárdalos para fijarlos en el Excel.")
+        with st.expander("Ver los SKUs generados"):
+            st.dataframe(pd.DataFrame(skus_pendientes, columns=["Descripcion", "SKU"]),
+                         width="stretch", hide_index=True)
+        if st.button("🔖 Guardar SKUs generados en Excel", type="primary"):
+            try:
+                _guardar_inv()
+            except ConflictoGuardado as e:
+                st.session_state["inv_conflicto"] = True
+                st.error(str(e))
+            except Exception as e:
+                st.error(f"Error al guardar: {e}")
 
     if st.button("💾 Guardar Cambios en Excel"):
         try:
