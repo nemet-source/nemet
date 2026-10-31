@@ -212,6 +212,7 @@ repositorio público, cambiarlo a privado no borra el acceso histórico a copias
 |---|---|
 | No aparece **🎯 Prospección Comercial** | Comprueba que el cambio esté incorporado en la **rama que despliega Streamlit** y que ese despliegue terminó sin errores. Si se usa `main`, fusiona primero el PR de la funcionalidad. El rol **Usuario** no ve el CRM; accede como Admin/Editor. |
 | Solo aparece el login o falta administrador | Configura `[auth]` en los **Secrets privados** del despliegue. Nunca compartas contraseñas o tokens en un issue, chat o commit. |
+| El menú desplegable (línea de producto, cliente…) no se mueve con la rueda del mouse | Corregido en `tema_nemet.py`: la regla de `[role="listbox"]` traía `overflow: hidden`, así que la lista se recortaba y solo se recorría con el teclado. Ahora scrollea, se limita a la mitad del alto de la ventana y contiene el scroll para no arrastrar la página. Se prueba en `tests_bateria.py` (`TestHojaDeEstilo`). |
 | Al pulsar **Entrar** sale un cuadro rojo `sqlite3.OperationalError` y nadie puede pasar | La app **ya no se queda ahí**: repara sola el esquema (columnas que falten), el ingreso nunca depende de la bitácora y, si `nemet_usuarios.db` no admite escritura, avisa en pantalla y sigue con una **copia temporal** para que puedas entrar. El **motivo exacto** aparece ahora dentro de la app (Streamlit censura el mensaje del traceback) y con más detalle en *Manage app* → *Logs*. Si el aviso persiste, corrige permisos del despliegue o define `[auth] db` con una ruta escribible. |
 | La búsqueda devuelve error o no encuentra negocios | **No es necesariamente el radio**: la app prueba varios servidores públicos de Overpass y, si fallan o no hay fichas, usa DENUE (INEGI) cuando está configurado. DENUE necesita el token privado `[inegi].denue_token` y su API permite hasta 5 km por consulta; si aún no tienes token, solicita uno en <https://www.inegi.org.mx/servicios/api_denue.html> y agrégalo a Secrets. Revisa **🔎 Qué contestó cada fuente** para distinguir fallos y pulsa **Reintentar**. Si ambos servicios están caídos, importa un CSV de negocios públicos o **Agrega manualmente**. Ninguna ficha se inventa cuando falla una fuente. |
 | Guarda, pero desaparece tras reiniciar | El archivo `Prospectos` se crea en el Excel **del servidor**, no en el teléfono; el disco de Streamlit Cloud es efímero. Exporta CSV regularmente y configura respaldo **solo en un repositorio privado verificable**, con la misma rama/historial. |
@@ -373,7 +374,7 @@ cp .streamlit/secrets.toml.ejemplo .streamlit/secrets.toml   # y captura [auth] 
 streamlit run app.py
 
 # Baterías de pruebas
-python tests_bateria.py        #  29/29  identidad de marca (assets, tema)
+python tests_bateria.py        #  31/31  identidad de marca (assets, tema y hoja de estilo)
 python tests_autenticacion.py  #  55/55  hashes, roles, sesiones, bases dañadas o de solo lectura, asistente CLI
 python tests_prospeccion.py    #  41/41  giros, Google Maps, CSV, alta manual y privacidad (sin red)
 python tests_flujo_app.py      #  18/18  acceso + CRM y alta manual (AppTest, copia temporal)
