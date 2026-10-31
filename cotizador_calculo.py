@@ -33,9 +33,16 @@ DOSIS_PIGMENTO_DEFAULT_G_M2 = 10.0
 #: Dosis de respaldo por familia (manual NEMET) cuando el catálogo no trae `Dosis_g_m2`.
 #: Sin esto, una tinta cotizada con la dosis de pasta saldría a 10 g/m² en vez de 60.
 _DOSIS_POR_FAMILIA_G_M2 = (
-    ("TINTA", 60.0),   # ≈1 L por cada 16 m²
-    ("METAL", 8.0),    # manual NEMET
-    ("MICA", 8.0),
+    ("TINTA", 60.0),    # ≈1 L por cada 16 m²
+    ("METAL", 8.0),     # manual NEMET
+    ("MICA", 8.0),      # manual NEMET
+    # Agregados que se tiran al voleo sobre la resina: el consumo va en kg/m², no en mm.
+    ("GRANO", 2500.0),  # ≈2.5 kg/m²
+    ("CUARZO", 2500.0), # ≈2.5 kg/m²
+    ("HOJUELA", 150.0), # ≈150 g/m²
+    ("CASCARA", 100.0), # texturizante ≈100 g/m²
+    ("VEINS", 20.0),    # vetas ≈20 g/m²
+    ("ARENA", 2000.0),  # arena sílica como carga ≈2 kg/m²
 )
 
 #: Familias que se dosifican por área (g/m²) y **nunca** por espesor.

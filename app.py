@@ -3115,7 +3115,9 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
         with col_a4:
             prod_familia = st.selectbox("Línea de Producto", familias_area if familias_area else familias_directas, key="area_prod")
         info_producto = buscar_en_catalogo(prod_familia, catalogo) or {}
-        es_dosificado = cocalc.es_familia_dosificada(prod_familia)
+        # Un producto con `Dosis_g_m2` en el catálogo se dosifica por área aunque su nombre
+        # no caiga en las familias pigmentadas de siempre (hojuela, grano, cuarzo, cáscara…).
+        es_dosificado = cocalc.es_familia_dosificada(prod_familia) or bool(info_producto.get("dosis_g_m2"))
         usa_dosis_catalogo = bool(info_producto.get("dosis_g_m2"))
         with col_a2:
             ancho = st.number_input("Ancho (metros)", min_value=0.0, value=0.0, step=0.1, key="area_ancho")
@@ -3177,7 +3179,8 @@ elif menu == "📏 Cotizador por Área y Milimétrico":
         c1, c2, c3 = st.columns([2, 1, 1])
         with c1:
             prod_familia = st.selectbox("Producto", familias_directas, key="direct_prod")
-        es_dosificado = cocalc.es_familia_dosificada(prod_familia)
+        es_dosificado = (cocalc.es_familia_dosificada(prod_familia)
+                         or bool((buscar_en_catalogo(prod_familia, catalogo) or {}).get("dosis_g_m2")))
         with c2:
             cantidad_solicitada_original = st.number_input("Cantidad que pide el cliente", min_value=0.01, value=1.0, step=0.1, format="%.3f", key="direct_cant")
         with c3:

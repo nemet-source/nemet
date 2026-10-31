@@ -10,7 +10,7 @@ las cuentas y el acceso.
 | Menú | Descripción | Roles con acceso |
 |---|---|---|
 | 📊 Dashboard & Resumen | Métricas generales (SKUs, clientes, valor del inventario, SKUs por reabastecer). | Admin · Editor · Usuario |
-| 📦 Control de Inventario y Edición | Edición directa de la hoja `Inventario`. `StockActual`, `AlertaStock`, `PrecioBaseSinIVA`, `IVA 16%` y `ValorInventario` se calculan automáticamente al guardar, y **cualquier producto sin `SKU` recibe uno automáticamente** (ver *SKUs automáticos*). | Admin · Editor |
+| 📦 Control de Inventario y Edición | Edición directa de la hoja `Inventario` (88 fichas, con `PrecioCompra` del proveedor y `Línea` de producto). `StockActual`, `AlertaStock`, `PrecioBaseSinIVA`, `IVA 16%` y `ValorInventario` se calculan automáticamente al guardar, y **cualquier producto sin `SKU` recibe uno automáticamente** (ver *SKUs automáticos*). | Admin · Editor |
 | 👥 Gestión de Clientes | Alta/edición de clientes en la hoja `Clientes`. | Admin · Editor |
 | 🎯 Prospección Comercial | **NEMET PROSPECTOR:** búsqueda OSM con respaldo DENUE (INEGI), mapa, puntuación explicable, borrador de WhatsApp y agenda comercial en la hoja `Prospectos`; también admite CSV. | Admin · Editor |
 | 📏 Cotizador por Área y Milimétrico | Calcula el material necesario —resinas por espesor (`m² × mm × rendimiento`) y **pigmentos por dosificación** (`m² × Dosis_g_m2`), ambas de `Cat_Productos`, con la proporción A:B— y recomienda la presentación más económica. | Admin · Editor · Usuario |
@@ -68,6 +68,36 @@ Esto cubre el incidente del 31-oct-2026: se subió al repositorio una plantilla 
 (`respaldos/Sistema_Inventario_2026-10-31_sin_SKU.xlsx`) con la columna `SKU` vacía y la app
 mostraba *NONE* en todo el inventario. El detalle y la lista de datos que se recuperaron están
 en `skus_automaticos.md`.
+
+### Precios, márgenes y la plantilla del proveedor (`migracion_plantilla.py`)
+
+La plantilla del proveedor no usa el formato de la app: trae el nombre del producto reescrito
+(`Epoxy pisos 5K`), el **precio por kg/L en tramos** (`0 - 5.999 KG`, `+ 20 kg`) y una columna
+`Línea` corrida. `herramientas/migrar_plantilla.py` la convierte de forma reproducible:
+
+```bash
+python herramientas/migrar_plantilla.py --revisar   # reporte de cambios, sin escribir
+python herramientas/migrar_plantilla.py             # actualiza Inventario, Cat_Productos y Escalas
+```
+
+| Qué hace | Ejemplo |
+|---|---|
+| Amarra cada renglón al nombre de `Cat_Productos` | `Epoxy pisos 5K` → `EPOXY PISOS (A Y B) TRANSPARENTE` |
+| Multiplica el tramo por el tamaño de la presentación | 1.5 kg × $480/kg = **$720**; 19 L × $440/L = **$8 360** |
+| Llena `PrecioCompra` con el costo del mismo tramo | `EPT 06` cuesta $6 029 y se vende en $8 000 (24.6 %) |
+| Recalcula `Línea` por familia | Cáscara de Naranja y Estuco Veneciano → **Acabado**, no *Herramienta* |
+| Conserva los SKU históricos y solo genera los faltantes | 88 códigos, ninguno repetido |
+| Ajusta los rangos de la hoja `Cotizador_Rendimientos` | las fórmulas abarcan las 57 filas del catálogo |
+
+También cierra los huecos del catálogo: `Cat_Productos` gana las 13 familias que no tenían
+`Rendimiento` ni `Dosis_g_m2` (hojuela, grano, mica, cuarzo, cáscara, estuco, grano wall, veins,
+arena sílica, EPO-PAINT) y `Escalas_Precios_KG` las escalas del proveedor que solo vivían en la
+plantilla (poliuretano, estuco y grano wall). Los consumos sin respaldo del manual quedan
+marcados «Criterio NEMET … ajustable» en `Fuente_Dosis`.
+
+Pendientes de captura: `EPA 01` y `AS 01` no tienen presentación ni precio en ninguna fuente
+(no se pueden cotizar) y 17 fichas siguen sin costo del proveedor. El detalle —con la tabla de
+precios convertidos— está en `skus_automaticos.md`.
 
 ## 🎯 NEMET PROSPECTOR
 
@@ -345,13 +375,16 @@ python tests_autenticacion.py  #  55/55  hashes, roles, sesiones, bases dañadas
 python tests_prospeccion.py    #  41/41  giros, Google Maps, CSV, alta manual y privacidad (sin red)
 python tests_flujo_app.py      #  18/18  acceso + CRM y alta manual (AppTest, copia temporal)
 python tests_cotizador.py      #  20/20  dosificación de pigmentos vs. rendimiento por espesor (sin Streamlit)
-python tests_cotizador_app.py  #    9/9  el cotizador por área manejado como lo hace una persona (AppTest)
-python tests_sku.py            #  18/18  prefijos, consecutivos y relleno de SKUs faltantes (sin Streamlit)
-python tests_sku_app.py        #    4/4  el alta automática de SKUs en la interfaz (AppTest)
+python tests_cotizador_app.py  #  11/11  el cotizador por área manejado como lo hace una persona (AppTest)
+python tests_sku.py            #  21/21  prefijos, consecutivos y relleno de SKUs faltantes (sin Streamlit)
+python tests_sku_app.py        #    7/7  el alta automática de SKUs en la interfaz (AppTest)
+python tests_migracion.py      #  24/24  plantilla migrada: nombres, precios por presentación, costos y línea
 ```
 
 > El cotizador se apoya en `cotizador_calculo.py` (lógica pura, sin Streamlit) para que la
 > misma aritmética se pruebe sola y en la interfaz. Ver `correccion_pigmentos_cotizador.md`.
+> La migración de la plantilla del proveedor vive en `migracion_plantilla.py` y se aplica con
+> `herramientas/migrar_plantilla.py`; sus pruebas son `tests_migracion.py`.
 
 Sin `[auth]` en los Secrets la app arranca, pero muestra la pantalla de acceso y avisa que no hay
 administrador configurado: nadie puede entrar hasta definir `admin_usuario` y `admin_password`.
