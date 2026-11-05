@@ -24,6 +24,7 @@ from fpdf.fonts import FontFace
 
 import auth_nemet as auth  # autenticación, roles y administración de usuarios (SQLite + scrypt)
 import cotizador_calculo as cocalc  # rendimiento por mm vs. dosificación g/m² de pigmentos
+import cotizador_general as cogen  # formato del presupuesto de catálogo (CSV/PDF, TOTAL GENERAL)
 import prospeccion as pros  # búsqueda pública, clasificación y deduplicación de prospectos
 import sku_nemet as skun  # SKUs: prefijo por familia y consecutivo por presentación
 import tema_nemet as tema  # sistema visual moderno: hoja de estilo y componentes de interfaz
@@ -1060,29 +1061,24 @@ def dibujar_cabecera_pdf(pdf):
 
 
 def descripcion_para_cliente(fila):
-    """Renglón «Descripcion / Sistema» de la cotización: producto y, si aplica, el área.
+    """Renglón «Ítem / Producto» del presupuesto: producto y, si aplica, el área.
 
-    Se arma con una lista blanca y jamás lee la columna «Detalle» del carrito: ahí se
+    Se arma con una lista blanca y jamás lee la columna de detalle del carrito: ahí se
     guardan el costo de compra y el margen para el desglose interno, y ese dato no debe
     salir de la empresa en el PDF que se descarga y se manda por correo.
     """
-    texto = str(valor_celda(fila, "Descripcion", "") or "")
-    area = valor_celda(fila, "Area_m2", None)
-    espesor = valor_celda(fila, "Espesor_mm", None)
-    if area is not None and float(area) > 0:
-        # Los pigmentos se dosifican por m² (g/m²): su renglón va sin espesor.
-        if espesor is not None and float(espesor) > 0:
-            texto += f" [{float(area):.2f} m² x {float(espesor):g} mm]"
-        else:
-            texto += f" [{float(area):.2f} m²]"
-    return texto
+    return cogen.etiqueta_item(dict(fila))
 
 
 def generar_pdf_cotizacion(folio, cliente, items, titulo_detalle):
-    """Genera el PDF de la cotización y devuelve sus bytes."""
+    """Genera el PDF del presupuesto y devuelve sus bytes.
+
+    El formato es el del CSV de catálogo: columnas Ítem / Unidad-Presentación /
+    Cantidad Requerida / Precio Unitario / Subtotal y cierre TOTAL GENERAL. Los
+    formatos de número y los totales viven en `cotizador_general`.
+    """
     total = float(items["Subtotal"].sum()) if not items.empty else 0.0
-    base = total / (1 + TASA_IVA)
-    iva = total - base
+    cantidad_total = float(pd.to_numeric(items["Cantidad"], errors="coerce").fillna(0).sum()) if not items.empty else 0.0
 
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
@@ -1098,26 +1094,35 @@ def generar_pdf_cotizacion(folio, cliente, items, titulo_detalle):
 
     pdf.set_font("helvetica", "", 9)
     pdf.set_text_color(50, 50, 50)
+    anchos = (50, 42, 26, 36, 36)
     estilo_encabezado = FontFace(emphasis="BOLD", color=(255, 255, 255), fill_color=(30, 58, 138))
-    with pdf.table(col_widths=(25, 75, 30, 20, 40), text_align=("CENTER", "LEFT", "CENTER", "CENTER", "RIGHT"),
+    with pdf.table(col_widths=anchos, text_align=("LEFT", "LEFT", "CENTER", "RIGHT", "RIGHT"),
                    headings_style=estilo_encabezado, line_height=5, padding=1.5) as tabla:
         encabezado = tabla.row()
-        for titulo in ("SKU", "Descripcion / Sistema", "Presentacion", "Cantidad", "Subtotal"):
-            encabezado.cell(titulo)
+        for titulo in cogen.COLUMNAS_PRESUPUESTO:
+            encabezado.cell(texto_pdf(titulo))
         for _, fila in items.iterrows():
+            cantidad = float(valor_celda(fila, "Cantidad", 1) or 0)
+            subtotal = float(valor_celda(fila, "Subtotal", 0) or 0)
+            unitario = subtotal / cantidad if cantidad else 0.0
             renglon = tabla.row()
-            renglon.cell(texto_pdf(valor_celda(fila, "SKU")))
             renglon.cell(texto_pdf(descripcion_para_cliente(fila)))
             renglon.cell(texto_pdf(valor_celda(fila, "Presentacion")))
-            renglon.cell(formato_cantidad(valor_celda(fila, "Cantidad", 1)))
-            renglon.cell(f"${float(valor_celda(fila, 'Subtotal', 0)):,.2f}")
+            renglon.cell(cogen.cantidad_txt(cantidad))
+            renglon.cell(cogen.importe_txt(unitario))
+            renglon.cell(cogen.importe_txt(subtotal))
 
-    pdf.ln(5)
-    pdf.set_font("helvetica", "B", 10)
+    # Fila TOTAL GENERAL, alineada con las columnas de la tabla.
+    pdf.ln(1)
+    pdf.set_font("helvetica", "B", 9)
     pdf.set_text_color(0, 0, 0)
-    pdf.cell(0, 6, f"Subtotal (sin IVA): ${base:,.2f} MXN", align="R", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(0, 6, f"IVA (16%): ${iva:,.2f} MXN", align="R", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(0, 6, f"Total General: ${total:,.2f} MXN", align="R", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.cell(anchos[0], 6, cogen.ETIQUETA_TOTAL, border="T", new_x=XPos.RIGHT, new_y=YPos.TOP)
+    pdf.cell(anchos[1], 6, "", border="T", new_x=XPos.RIGHT, new_y=YPos.TOP)
+    pdf.cell(anchos[2], 6, cogen.cantidad_txt(cantidad_total), border="T", align="C",
+             new_x=XPos.RIGHT, new_y=YPos.TOP)
+    pdf.cell(anchos[3], 6, "", border="T", new_x=XPos.RIGHT, new_y=YPos.TOP)
+    pdf.cell(anchos[4], 6, cogen.importe_txt(total), border="T", align="R",
+             new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     return bytes(pdf.output())
 
 
@@ -1207,11 +1212,11 @@ def registrar_si_es_necesario(clave, folio, cliente, items, total):
 
 
 def bloque_acciones_cotizacion(clave, items, cliente, correo, titulo_detalle):
-    """Totales, folio y botones Descargar PDF / Enviar por correo / Limpiar (compartido por ambos cotizadores)."""
+    """Presupuesto (formato del CSV), folio y botones PDF/CSV/correo/limpiar (compartido por ambos cotizadores)."""
     total = float(items["Subtotal"].sum()) if not items.empty else 0.0
-    base = total / (1 + TASA_IVA)
-    iva = total - base
-    st.markdown(f"**Subtotal (sin IVA):** ${base:,.2f} MXN | **IVA (16%):** ${iva:,.2f} MXN | **Total Final:** ${total:,.2f} MXN")
+    st.dataframe(cogen.presupuesto_dataframe(items), width="stretch", hide_index=True)
+    st.caption("Presupuesto en el formato del catálogo (Ítem / Unidad-Presentación / Cantidad Requerida / "
+               "Precio Unitario / Subtotal / TOTAL GENERAL). Precios en MXN con IVA incluido.")
 
     folio, ya_registrado = folio_para_carrito(clave, items, cliente)
     if ya_registrado:
@@ -1224,13 +1229,18 @@ def bloque_acciones_cotizacion(clave, items, cliente, correo, titulo_detalle):
         getattr(st, mensaje[0])(mensaje[1])
 
     pdf_bytes = generar_pdf_cotizacion(folio, cliente, items, titulo_detalle) if not items.empty else b""
+    csv_bytes = cogen.csv_presupuesto(items) if not items.empty else b""
 
-    col_b1, col_b2, col_b3, col_b4 = st.columns(4)
+    col_b1, col_b2, col_b3, col_b4, col_b5 = st.columns(5)
     with col_b1:
         st.download_button("📄 Descargar PDF", data=pdf_bytes, file_name=f"{folio}.pdf", mime="application/pdf",
                            disabled=items.empty, key=f"{clave}_pdf",
                            on_click=registrar_si_es_necesario, args=(clave, folio, cliente, items, total))
     with col_b2:
+        st.download_button("📥 Descargar CSV", data=csv_bytes, file_name=f"{folio}.csv", mime="text/csv",
+                           disabled=items.empty, key=f"{clave}_csv",
+                           on_click=registrar_si_es_necesario, args=(clave, folio, cliente, items, total))
+    with col_b3:
         if st.button("📧 Enviar por Correo", disabled=items.empty, key=f"{clave}_mail"):
             try:
                 # Primero se registra el folio y después se envía: si el registro falla,
@@ -1248,11 +1258,11 @@ def bloque_acciones_cotizacion(clave, items, cliente, correo, titulo_detalle):
                 st.success(f"¡Correo enviado exitosamente a {correo}!")
             except Exception as e:
                 st.error(f"Error al enviar correo: {e}")
-    with col_b3:
+    with col_b4:
         if st.button("🗑️ Limpiar Carrito", disabled=items.empty, key=f"{clave}_clear"):
             st.session_state[clave] = carrito_vacio(por_area=(clave == "carrito_area"))
             st.rerun()
-    with col_b4:
+    with col_b5:
         if st.button("🧾 Folio Nuevo", disabled=items.empty, key=f"{clave}_nuevo_folio",
                      help="Conserva el carrito pero fuerza un folio nuevo (p. ej. para una segunda cotización idéntica)."):
             st.session_state.pop(f"{clave}_emitido", None)
@@ -3550,24 +3560,57 @@ elif menu == "📝 Cotizador Comercial Profesional":
     col_desc, col_sku, col_pres = columnas_inventario(df_inv)
     cliente_comercial, correo_comercial = seleccionar_cliente("com")
 
-    def etiqueta_producto(indice):
-        fila = df_inv.loc[indice]
-        return f"{fila[col_sku]} - {fila[col_desc]} ({fila[col_pres]}) - ${float(valor_celda(fila, 'PrecioPublicoIVA', 0)):,.2f}"
+    fuente_comercial = st.radio(
+        "Fuente de productos", ["📦 Inventario (SKU)", "🧾 Catálogo de presupuestos"],
+        horizontal=True, key="com_fuente")
 
-    # Se selecciona por posición (no por SKU) para que los SKUs repetidos no agreguen el producto equivocado
-    indice_sel = st.selectbox("Seleccionar Producto", list(df_inv.index), format_func=etiqueta_producto)
-    cant = st.number_input("Cantidad", min_value=1, value=1)
+    if fuente_comercial.startswith("🧾"):
+        # Catálogo de presupuestos del proveedor: los ítems cotizan con su unidad/escala
+        # y el precio público sugerido tal cual (lista del proveedor, sin pisos de margen).
+        df_catalogo_pres = cogen.cargar_catalogo_presupuestos(EXCEL_FILE)
+        if df_catalogo_pres.empty:
+            st.info("Este libro no tiene la hoja Catalogo_Presupuestos todavía.")
+        else:
+            def etiqueta_catalogo(indice):
+                fila = df_catalogo_pres.loc[indice]
+                return (f"{valor_celda(fila, 'Producto / Item')} - {valor_celda(fila, 'Unidad de Venta')} - "
+                        f"${float(valor_celda(fila, 'Precio Público Sugerido (MXN)', 0)):,.2f}")
 
-    if st.button("Agregar al Carrito Comercial"):
-        fila = df_inv.loc[indice_sel]
-        agregar_al_carrito("carrito_comercial", {
-            "SKU": str(valor_celda(fila, col_sku)),
-            "Descripcion": str(fila[col_desc]),
-            "Presentacion": str(fila[col_pres]),
-            "Cantidad": int(cant),
-            "Subtotal": int(cant) * float(valor_celda(fila, "PrecioPublicoIVA", 0)),
-        })
-        st.rerun()
+            indice_cat = st.selectbox("Seleccionar Producto", list(df_catalogo_pres.index),
+                                      format_func=etiqueta_catalogo, key="com_cat_sel")
+            cant_cat = st.number_input("Cantidad", min_value=0.01, value=1.0, step=0.5, format="%.2f",
+                                       key="com_cat_cant")
+            if st.button("Agregar al Carrito Comercial", key="com_cat_add"):
+                fila = df_catalogo_pres.loc[indice_cat]
+                precio = float(valor_celda(fila, "Precio Público Sugerido (MXN)", 0))
+                cantidad = float(cant_cat)
+                agregar_al_carrito("carrito_comercial", {
+                    "SKU": "",
+                    "Descripcion": str(valor_celda(fila, "Producto / Item")),
+                    "Presentacion": str(valor_celda(fila, "Unidad de Venta")),
+                    "Cantidad": cantidad,
+                    "Subtotal": round(cantidad * precio, 2),
+                })
+                st.rerun()
+    else:
+        def etiqueta_producto(indice):
+            fila = df_inv.loc[indice]
+            return f"{fila[col_sku]} - {fila[col_desc]} ({fila[col_pres]}) - ${float(valor_celda(fila, 'PrecioPublicoIVA', 0)):,.2f}"
+
+        # Se selecciona por posición (no por SKU) para que los SKUs repetidos no agreguen el producto equivocado
+        indice_sel = st.selectbox("Seleccionar Producto", list(df_inv.index), format_func=etiqueta_producto)
+        cant = st.number_input("Cantidad", min_value=1, value=1)
+
+        if st.button("Agregar al Carrito Comercial"):
+            fila = df_inv.loc[indice_sel]
+            agregar_al_carrito("carrito_comercial", {
+                "SKU": str(valor_celda(fila, col_sku)),
+                "Descripcion": str(fila[col_desc]),
+                "Presentacion": str(fila[col_pres]),
+                "Cantidad": int(cant),
+                "Subtotal": int(cant) * float(valor_celda(fila, "PrecioPublicoIVA", 0)),
+            })
+            st.rerun()
 
     carrito_comercial = st.session_state["carrito_comercial"]
     if not carrito_comercial.empty:
