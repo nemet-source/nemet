@@ -14,11 +14,12 @@ las cuentas y el acceso.
 | 👥 Gestión de Clientes | Alta/edición de clientes en la hoja `Clientes`. | Admin · Editor |
 | 🎯 Prospección Comercial | **NEMET PROSPECTOR:** búsqueda OSM con respaldo DENUE (INEGI), mapa, puntuación explicable, borrador de WhatsApp y agenda comercial en la hoja `Prospectos`; también admite CSV. | Admin · Editor |
 | 📏 Cotizador por Área y Milimétrico | Calcula el material necesario —resinas por espesor (`m² × mm × rendimiento`) y **pigmentos por dosificación** (`m² × Dosis_g_m2`), ambas de `Cat_Productos`, con la proporción A:B— y recomienda la presentación más económica. | Admin · Editor · Usuario |
-| 📝 Cotizador Comercial Profesional | Carrito manual por SKU. | Admin · Editor · Usuario |
+| 📝 Cotizador Comercial Profesional | Carrito manual por SKU o por el **Catálogo de presupuestos** del proveedor (70 ítems con unidad/escala y precio sugerido, hoja `Catalogo_Presupuestos`). El presupuesto sale en el formato del CSV del proveedor —Ítem / Unidad-Presentación / Cantidad Requerida / Precio Unitario / Subtotal / **TOTAL GENERAL**— con exportación PDF y CSV. | Admin · Editor · Usuario |
 | 📋 Historial de Cotizaciones | Consulta, búsqueda y borrado (con confirmación) de folios `COT-AAAA-NNN`. El borrado total es solo para administradores. | Admin · Editor · Usuario |
 | 🛡️ Administración de Usuarios | Alta, edición, roles, desactivación, restablecimiento de contraseñas y bitácora de actividad. | Solo Admin |
 
-Ambos cotizadores generan el PDF, lo envían por correo y registran el folio en la hoja
+Ambos cotizadores generan el PDF, lo envían por correo, **exportan el CSV del presupuesto** en el
+formato del catálogo del proveedor y registran el folio en la hoja
 `Historial_Cotizaciones` (una sola vez por carrito, aunque se descargue o envíe varias veces).
 
 ### Dosificación de pigmentos (`Dosis_g_m2`)
@@ -42,6 +43,17 @@ la dosis de respaldo de su familia (pasta 10, metal 8, tinta 60 g/m²) avisando 
 los pigmentos no ofrecen «kilo exacto» a granel porque su venta es por presentación (g/L).
 La aritmética vive en `cotizador_calculo.py` y se prueba con `tests_cotizador.py` y
 `tests_cotizador_app.py`; el detalle del caso está en `correccion_pigmentos_cotizador.md`.
+
+### Cotizador General de Catálogo (formato del CSV del proveedor)
+
+Del par de archivos del proveedor (`Cotizador_Catalogo_Epoxy_Art_Completo.csv` + el `.xlsx`
+que era un `.xlsx` renombrado) nació el presupuesto por catálogo: se cotiza cualquier ítem de
+`Catalogo_Presupuestos` con su unidad/escala y el precio sugerido **tal cual** (sin pisos de
+margen: los flacos —EPRT 01 0.5 %, rodillos 2.6–4.2 %, jalador premium 4.45 %, cuarzo +60 kg
+2.2 %— se dejaron como vienen para que la muestra del proveedor cierre en **$1,800.00**).
+El PDF y el CSV salen en el formato de la muestra —la exportación CSV es **byte a byte** la del
+proveedor— y la aritmética vive en `cotizador_general.py`. El detalle y la decisión de márgenes
+están en `cotizador_general_catalogo.md`.
 
 ### SKUs automáticos (`sku_nemet.py`)
 
@@ -380,6 +392,7 @@ python tests_prospeccion.py    #  41/41  giros, Google Maps, CSV, alta manual y 
 python tests_flujo_app.py      #  18/18  acceso + CRM y alta manual (AppTest, copia temporal)
 python tests_cotizador.py      #  20/20  dosificación de pigmentos vs. rendimiento por espesor (sin Streamlit)
 python tests_cotizador_app.py  #  11/11  el cotizador por área manejado como lo hace una persona (AppTest)
+python tests_cotizador_general.py  # 13/13  presupuesto de catálogo: la muestra da $1,800.00 y el CSV coincide byte a byte
 python tests_sku.py            #  21/21  prefijos, consecutivos y relleno de SKUs faltantes (sin Streamlit)
 python tests_sku_app.py        #    7/7  el alta automática de SKUs en la interfaz (AppTest)
 python tests_migracion.py      #  27/27  plantilla migrada: nombres, precios, costos, línea y conciliación
